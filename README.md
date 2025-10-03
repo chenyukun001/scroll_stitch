@@ -199,11 +199,39 @@ sudo apt install libgtk-3-dev gir1.2-notify-0.7
 sudo apt install libgirepository-2.0-dev
 ```
 
-最后安装 `python` 包：
+请在虚拟环境中安装 `python` 包：
+
+如果没有 `venv` 包的话，先安装：
+
+```shell
+sudo apt install python3-venv
+```
+
+没有虚拟环境的话，需要创建一个（以 .venv 为例）：
+
+```shell
+python3 -m venv .venv
+```
+
+然后激活虚拟环境：
+
+```shell
+source .venv/bin/activate
+```
+
+最后在虚拟环境中安装 `python` 包：
 
 ```shell
 pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
 ```
+
+安装完成后可以在终端输入
+
+```shell
+deactivate
+```
+
+退出虚拟环境，启动脚本会自动处理激活
 
 如果安装 `libgirepository-2.0-dev` 时提示“无效的操作”，则改为：
 
@@ -230,11 +258,33 @@ pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' '
 sudo dnf install python3 python3-pip gcc python3-devel gtk3 python3-gobject
 ```
 
-然后安装 `python` 包：
+请在虚拟环境中安装 `python` 包：
+
+没有虚拟环境的话，需要创建一个（以 .venv 为例）：
+
+```shell
+python3 -m venv .venv
+```
+
+然后激活虚拟环境：
+
+```shell
+source .venv/bin/activate
+```
+
+最后在虚拟环境中安装 `python` 包：
 
 ```shell
 pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
 ```
+
+安装完成后可以在终端输入
+
+```shell
+deactivate
+```
+
+退出虚拟环境，启动脚本会自动处理激活
 
 </details>
 
@@ -261,11 +311,33 @@ sudo pacman -S --needed python python-pip
 sudo pacman -S --needed gcc pkgconf gtk3 libnotify
 ```
 
-最后安装 `python` 包：
+请在虚拟环境中安装 `python` 包：
+
+没有虚拟环境的话，需要创建一个（以 .venv 为例）：
+
+```shell
+python3 -m venv .venv
+```
+
+然后激活虚拟环境：
+
+```shell
+source .venv/bin/activate
+```
+
+最后在虚拟环境中安装 `python` 包：
 
 ```shell
 pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
 ```
+
+安装完成后可以在终端输入
+
+```shell
+deactivate
+```
+
+退出虚拟环境，启动脚本会自动处理激活
 
 如果需要 `PyGObject<3.51` 的话，还要安装：
 
@@ -300,11 +372,33 @@ sudo zypper install --no-recommends python313 python313-pip
 sudo zypper install --no-recommends python313-devel gcc cairo-devel typelib-1_0-Gtk-3_0 libnotify-devel
 ```
 
-最后安装 `python` 包：
+请在虚拟环境中安装 `python` 包：
+
+没有虚拟环境的话，需要创建一个（以 .venv 为例）：
+
+```shell
+python3 -m venv .venv
+```
+
+然后激活虚拟环境：
+
+```shell
+source .venv/bin/activate
+```
+
+最后在虚拟环境中安装 `python` 包：
 
 ```shell
 pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
 ```
+
+安装完成后可以在终端输入
+
+```shell
+deactivate
+```
+
+退出虚拟环境，启动脚本会自动处理激活
 
 如果需要 `PyGObject<3.51` 的话，还要安装：
 
@@ -401,7 +495,7 @@ echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput
 ### 运行程序
 
 依赖和权限都配置完成后，  
-可以直接下载仓库中的 `scroll_stitch.py` 文件或者
+可以直接下载仓库中的 `scroll_stitch.py` 文件和 `scroll_stitch.sh` 文件（需要保证两个文件在同一个目录下）或者
 
 ```shell
 git clone git@github.com:chenyukun001/scroll_stitch.git
@@ -409,20 +503,24 @@ git clone git@github.com:chenyukun001/scroll_stitch.git
 
 克隆项目到本地（下载 `config.ini` 文件并不是必须的，如果没有配置文件，程序会自动在 `~/.config/scroll_stitch` 目录下创建 `config.ini` 文件）  
 
+先赋予启动脚本执行权限：
+
+```shell
+chmod +x scroll_stitch.sh
+```
+
 然后在终端输入命令
 
 ```shell
-python3 scroll_stitch.py
+./scroll_stitch.sh
 ```
-
-（如果使用 `openSUSE`，命令中请用具体的 `python` 版本号，如 `python3.12 scroll_stitch.py` 等）  
 
 即可运行程序
 
-程序支持在命令行中用参数 `-c`（或 `--config`）传入配置文件路径，支持相对路径（家目录 `~`，当前目录 `.` 等），如：
+程序支持在命令行中用参数 `-c`（或 `--config`）传入配置文件路径以及 `-e`（或 `--venv`）传入虚拟环境路径（如果不传入该参数，则默认路径是启动脚本父目录下的 `.venv` 目录），支持相对路径（家目录 `~`，当前目录 `.` 等），如：
 
 ```shell
-python3 scroll_stitch.py -c ~/.config/scroll_stitch/config.ini
+./scroll_stitch.sh -e .venv -c ~/.config/scroll_stitch/config.ini
 ```
 
 如果没有传入配置文件目录，则默认会先检查当前目录下是否有配置文件，其次是 `~/.config/scroll_stitch` 目录。在配置窗口中修改的是传入的配置文件。
@@ -431,9 +529,9 @@ python3 scroll_stitch.py -c ~/.config/scroll_stitch/config.ini
 
 图形化界面设置自定义快捷键的大体流程是：设置->键盘->快捷键->自定义快捷键->添加->键入命令->按下快捷键（如果支持的话）。   
 
-键入的命令就是上面启动程序的命令，`scroll_stitch.py` 最好写成绝对路径的形式，`python` 可执行文件如果没有添加到环境变量里面也要用绝对路径的形式
+键入的命令就是上面启动程序的命令，`scroll_stitch.sh` 最好写成绝对路径的形式
 
-如果想用不同快捷键唤出不同配置的程序，可以在命令中传入不同配置文件的位置（如 `python3 scroll_stitch.py -c /home/用户名/.config/scroll_stitch/config.ini` 或 `python3 scroll_stitch.py -c /home/用户名/config.ini` ）  
+如果想用不同快捷键唤出不同配置的程序，可以在命令中传入不同配置文件的位置（如 `scroll_stitch.sh -c /home/用户名/.config/scroll_stitch/config.ini` 或 `scroll_stitch.sh -c /home/用户名/config.ini` ）  
 
 不同发行版和桌面环境之间设置自定义快捷键的方式可能有差异，可以查看下面的部分文档进行配置  
 [https://wiki.debian.org/Keyboard/MultimediaKeys](https://wiki.debian.org/Keyboard/MultimediaKeys)  
