@@ -1,7 +1,8 @@
- # Minimum requirements for scroll_stitch on Python 3.7.4+
 Pillow>=3.0.0
 pynput>=1.6.0
-PyGObject>=3.31.2,<3.51
+PyGObject>=3.31.2
+# 对于某些 Linux 发行版（如 Ubuntu22.04 等）可能需要限制 PyGObject 最高版本：
+# PyGObject>=3.31.2,<3.51
 pycairo>=1.13.1
 evdev>=0.6.0
 python-xlib>=0.17
