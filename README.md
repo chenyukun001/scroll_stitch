@@ -168,7 +168,7 @@ evdev>=0.6.0
 python-xlib>=0.17
 ```
 
-安装 `python` 包之前，需要先安装 `python` 包的系统依赖
+安装 `python` 包可以使用 Python 虚拟环境安装，也可以使用系统包管理器安装。
 
 #### `Ubuntu/Debian` `python` 依赖安装
 
@@ -187,6 +187,8 @@ sudo apt update
 sudo apt install python3 python3-pip
 ```
 
+**方法一：使用 Python 虚拟环境**
+
 先安装一部分 `PyGObject` 的系统依赖：
 
 ```shell
@@ -198,8 +200,6 @@ sudo apt install libgtk-3-dev gir1.2-notify-0.7
 ```shell
 sudo apt install libgirepository-2.0-dev
 ```
-
-请在虚拟环境中安装 `python` 包：
 
 如果没有 `venv` 包的话，先安装：
 
@@ -245,6 +245,16 @@ sudo apt install libgirepository1.0-dev
 pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
 ```
 
+---
+
+**方法二：使用系统包管理器安装**
+
+安装命令：
+
+```shell
+sudo apt install python3-pil python3-xlib python3-evdev python3-pynput python3-gi python3-gi-cairo libgtk-3-dev gir1.2-notify-0.7
+```
+
 </details>
 
 #### `Fedora` `python` 依赖安装
@@ -252,13 +262,19 @@ pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' '
 <details>
 <summary>安装命令</summary>
 
+如果没有 `python` 的话，安装 `python`：
+
+```shell
+sudo dnf install python3 python3-pip
+```
+
+**方法一：使用 Python 虚拟环境（推荐）**
+
 先安装系统依赖：
 
 ```shell
-sudo dnf install python3 python3-pip gcc python3-devel gtk3 python3-gobject
+sudo dnf install gcc python3-devel cairo-gobject-devel gtk3
 ```
-
-请在虚拟环境中安装 `python` 包：
 
 没有虚拟环境的话，需要创建一个（以 .venv 为例）：
 
@@ -286,6 +302,34 @@ deactivate
 
 退出虚拟环境，启动脚本会自动处理激活
 
+如果需要 `PyGObject<3.51` 的话，还要安装：
+
+```shell
+sudo dnf install gobject-introspection-devel
+```
+
+然后安装 `python` 包命令改为：
+
+```shell
+pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
+```
+
+---
+
+**方法二：使用系统包管理器安装**
+
+安装命令：
+
+```shell
+sudo dnf install python3-xlib python3-pillow python3-evdev gtk3 python3-gobject
+```
+
+由于 `pynput` 无官方包，仍然需要通过 `pip` 安装（故推荐使用方法一）：
+
+```shell
+pip install 'pynput>=1.6.0'
+```
+
 </details>
 
 #### `Arch Linux` `python` 依赖安装
@@ -305,13 +349,13 @@ sudo pacman -Syu --needed
 sudo pacman -S --needed python python-pip
 ```
 
-然后再安装系统依赖：
+**方法一：使用 Python 虚拟环境**
+
+安装系统依赖：
 
 ```shell
 sudo pacman -S --needed gcc pkgconf gtk3 libnotify
 ```
-
-请在虚拟环境中安装 `python` 包：
 
 没有虚拟环境的话，需要创建一个（以 .venv 为例）：
 
@@ -351,6 +395,30 @@ sudo pacman -S --needed gobject-introspection
 pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
 ```
 
+---
+
+**方法二：使用系统包管理器安装**
+
+安装命令：
+
+```shell
+sudo pacman -S --needed python-xlib python-pillow python-evdev python-gobject python-cairo gtk3 libnotify
+```
+
+由于 `pynput` 无官方包，需要从 AUR 中安装：
+
+如果没有安装 AUR 助手，先安装（以 `paru` 为例，如果用 `yay`，请将下面命令中的 `paru` 改为 `yay`）：
+
+```shell
+sudo pacman -S --needed git base-devel && git clone https://aur.archlinux.org/paru.git && cd paru && makepkg -si
+```
+
+然后用 AUR 助手安装 `pynput`：
+
+```shell
+paru -S python-pynput
+```
+
 </details>
 
 #### `openSUSE` `python` 依赖安装
@@ -366,13 +434,13 @@ pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' '
 sudo zypper install --no-recommends python313 python313-pip
 ```
 
-然后再安装系统依赖：
+**方法一：使用 Python 虚拟环境**
+
+安装系统依赖：
 
 ```shell
 sudo zypper install --no-recommends python313-devel gcc cairo-devel typelib-1_0-Gtk-3_0 libnotify-devel
 ```
-
-请在虚拟环境中安装 `python` 包：
 
 没有虚拟环境的话，需要创建一个（以 .venv 为例）：
 
@@ -410,6 +478,16 @@ sudo zypper install --no-recommends gobject-introspection-devel
 
 ```shell
 pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
+```
+
+---
+
+**方法二：使用系统包管理器安装**
+
+由于 `pynput` 在 Leap 中无官方包（Tumbleweed 中则有），仍然需要通过 `pip` 安装（故 openSUSE Leap 推荐使用方法一）：
+
+```shell
+sudo zypper install --no-recommends python313-python-xlib python313-Pillow python313-evdev python313-pynput python313-gobject python313-pycairo typelib-1_0-Gtk-3_0 libnotify-devel
 ```
 
 </details>
@@ -495,13 +573,16 @@ echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput
 ### 运行程序
 
 依赖和权限都配置完成后，  
-可以直接下载仓库中的 `scroll_stitch.py` 文件和 `scroll_stitch.sh` 文件（需要保证两个文件在同一个目录下）或者
+可以直接下载仓库中的 `scroll_stitch.py` 文件（如果是通过 Python 虚拟环境安装的依赖，还需要下载 `scroll_stitch.sh` 文件并保证两个文件在同一个目录下）或者
 
 ```shell
 git clone git@github.com:chenyukun001/scroll_stitch.git
 ```
 
 克隆项目到本地（下载 `config.ini` 文件并不是必须的，如果没有配置文件，程序会自动在 `~/.config/scroll_stitch` 目录下创建 `config.ini` 文件）  
+
+<details>
+<summary>虚拟环境运行方法</summary>
 
 先赋予启动脚本执行权限：
 
@@ -520,18 +601,41 @@ chmod +x scroll_stitch.sh
 程序支持在命令行中用参数 `-c`（或 `--config`）传入配置文件路径以及 `-e`（或 `--venv`）传入虚拟环境路径（如果不传入该参数，则默认路径是启动脚本父目录下的 `.venv` 目录），支持相对路径（家目录 `~`，当前目录 `.` 等），如：
 
 ```shell
-./scroll_stitch.sh -e .venv -c ~/.config/scroll_stitch/config.ini
+./scroll_stitch.sh -e ./.venv -c ~/.config/scroll_stitch/config.ini
 ```
 
 如果没有传入配置文件目录，则默认会先检查当前目录下是否有配置文件，其次是 `~/.config/scroll_stitch` 目录。在配置窗口中修改的是传入的配置文件。
+
+</details>
+
+<details>
+<summary>系统环境运行方法</summary>
+
+直接在终端输入命令
+
+```shell
+python3 scroll_stitch.py
+```
+
+即可运行程序
+
+程序支持在命令行中用参数 `-c`（或 `--config`）传入配置文件路径，支持相对路径（家目录 `~`，当前目录 `.` 等），如：
+
+```shell
+python3 scroll_stitch.py -c ~/.config/scroll_stitch/config.ini
+```
+
+如果没有传入配置文件目录，则默认会先检查当前目录下是否有配置文件，其次是 `~/.config/scroll_stitch` 目录。在配置窗口中修改的是传入的配置文件。
+
+</details>
 
 ### 设置快捷键
 
 图形化界面设置自定义快捷键的大体流程是：设置->键盘->快捷键->自定义快捷键->添加->键入命令->按下快捷键（如果支持的话）。   
 
-键入的命令就是上面启动程序的命令，`scroll_stitch.sh` 最好写成绝对路径的形式
+键入的命令就是上面启动程序的命令，`scroll_stitch.sh` 或者 `scroll_stitch.py` 最好写成绝对路径的形式。
 
-如果想用不同快捷键唤出不同配置的程序，可以在命令中传入不同配置文件的位置（如 `scroll_stitch.sh -c /home/用户名/.config/scroll_stitch/config.ini` 或 `scroll_stitch.sh -c /home/用户名/config.ini` ）  
+如果想用不同快捷键唤出不同配置的程序，可以在命令中传入不同配置文件的位置。
 
 不同发行版和桌面环境之间设置自定义快捷键的方式可能有差异，可以查看下面的部分文档进行配置  
 [https://wiki.debian.org/Keyboard/MultimediaKeys](https://wiki.debian.org/Keyboard/MultimediaKeys)  
@@ -576,8 +680,8 @@ chmod +x scroll_stitch.sh
 ## 贡献
 
 欢迎任何形式的贡献！
-- 如果您发现了 Bug 或有任何功能建议，请随时提交 Issue
-- 如果您想贡献代码，请 Fork 本仓库后提交 Pull Request
+- 如果您发现了 Bug 或有任何功能建议，请随时提交 [Issue](https://github.com/chenyukun001/scroll_stitch/issues)
+- 如果您想贡献代码，请 Fork 本仓库后提交 [Pull request](https://github.com/chenyukun001/scroll_stitch/pulls)
 
 ## 许可证
 
