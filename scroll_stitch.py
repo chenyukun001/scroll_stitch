@@ -36,6 +36,7 @@ config_window_instance = None
 are_hotkeys_enabled = True
 log_queue = None
 EVDEV_AVAILABLE = False
+active_notification = None
 
 class Config:
     def __init__(self, custom_path= None):
@@ -365,7 +366,7 @@ dialog_cancel = esc
             f.write(Config.get_default_config_string())
         logging.info(f"已在 {self.config_path} 目录下创建默认配置文件")
 
-    def get_scroll_unit(self, app_class: str) -> tuple[int, bool]:
+    def get_scroll_unit(self, app_class: str):
         """从配置中获取指定应用程序的滚动单位和模板匹配设置"""
         if self.parser.has_section('ApplicationScrollUnits'):
             value_str = self.parser.get('ApplicationScrollUnits', app_class, fallback='0,false')
@@ -660,7 +661,11 @@ def play_sound(sound_name: str, theme_name: str = None):
         logging.warning(f"播放命令 'paplay' 未找到，请确保已安装")
 
 def send_desktop_notification(title, message, sound_name=None, level="normal", action_path=None, controller=None, width=0, height=0):
+    global active_notification
     try:
+        if active_notification:
+            logging.info(f"正在关闭旧通知...")
+            active_notification.close()
         if sound_name:
             play_sound(sound_name)
         notification = Notify.Notification.new(title, message, "dialog-information")
@@ -722,11 +727,15 @@ def send_desktop_notification(title, message, sound_name=None, level="normal", a
         notification.set_urgency(urgency_map.get(level, Notify.Urgency.NORMAL))
         def on_closed(n):
             logging.info("通知已关闭，准备执行最终清理和退出程序")
+            global active_notification
+            if active_notification == n:
+                active_notification = None
             if controller:
                 controller.final_notification = None
                 GLib.idle_add(controller._perform_cleanup)
         notification.connect("closed", on_closed)
         notification.show()
+        active_notification = notification
         logging.info(f"已通过 libnotify 发送通知: '{title}' - '{message}'")
     except Exception as e:
         logging.error(f"使用 libnotify 发送通知失败: {e}")
@@ -809,12 +818,13 @@ def _find_overlap_pyramid(img_top, img_bottom, max_overlap_search):
 def stitch_images_in_memory(image_paths, session, progress_callback=None):
     if not image_paths:
         logging.warning("没有图片需要拼接")
-        return None
+        return None, 0.0
     try:
         images_pil = [Image.open(p) for p in image_paths]
     except Exception as e:
         logging.error(f"加载图片失败: {e}")
-        return None
+        return None, 0.0
+    total_matching_time = 0.0
     is_grid_mode_session = session.detected_app_class is not None
     is_grid_mode_matching = session.is_matching_enabled and is_grid_mode_session
     is_free_scroll_matching = not is_grid_mode_session and config.ENABLE_FREE_SCROLL_MATCHING
@@ -836,8 +846,9 @@ def stitch_images_in_memory(image_paths, session, progress_callback=None):
         img_bottom_pil = images_pil[i]
         overlap = 0
         if use_matching:
-            img_top = cv2.cvtColor(np.array(stitched_image.convert('RGB')), cv2.COLOR_RGB2BGR)
-            img_bottom = cv2.cvtColor(np.array(img_bottom_pil.convert('RGB')), cv2.COLOR_RGB2BGR)
+            match_start_time = time.perf_counter()
+            img_top = cv2.cvtColor(np.asarray(stitched_image.convert('RGB')), cv2.COLOR_RGB2BGR)
+            img_bottom = cv2.cvtColor(np.asarray(img_bottom_pil.convert('RGB')), cv2.COLOR_RGB2BGR)
             h1, _, _ = img_top.shape
             h2, _, _ = img_bottom.shape
             max_overlap_search = min(max_overlap_config, h1 - 1, h2 - 1)
@@ -847,6 +858,8 @@ def stitch_images_in_memory(image_paths, session, progress_callback=None):
                 found_overlap, best_match_score = _find_overlap_pyramid(
                     img_top, img_bottom, max_overlap_search
                 )
+            match_end_time = time.perf_counter()
+            total_matching_time += (match_end_time - match_start_time)
             QUALITY_THRESHOLD = 0.95
             if best_match_score >= QUALITY_THRESHOLD:
                 overlap = found_overlap
@@ -864,18 +877,21 @@ def stitch_images_in_memory(image_paths, session, progress_callback=None):
     logging.info(f"拼接完成，最终尺寸: {stitched_image.width}x{stitched_image.height}")
     for img in images_pil:
         img.close()
-    return stitched_image
+    return stitched_image, total_matching_time
 
 def copy_to_clipboard(image_path: Path) -> bool:
     """使用 Gtk.Clipboard 将图片复制到剪贴板"""
+    copy_start_time = time.perf_counter()
     try:
         pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(image_path))
         clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
         clipboard.set_image(pixbuf)
-        logging.info(f"图片 {image_path} 已通过 GTK 复制到剪贴板")
+        copy_duration = time.perf_counter() - copy_start_time
+        logging.info(f"图片 {image_path} 已通过 GTK 复制到剪贴板，耗时: {copy_duration:.3f} 秒")
         return True
     except GLib.Error as e:
-        logging.error(f"使用 GTK 复制到剪贴板失败: {e}")
+        copy_duration = time.perf_counter() - copy_start_time
+        logging.error(f"使用 GTK 复制到剪贴板失败: {e}，耗时: {copy_duration:.3f} 秒")
         return False
 
 def activate_window_with_xdotool(xid):
@@ -1385,6 +1401,7 @@ class ActionController:
 
     def _do_finalize_in_background(self, processing_window, progress_bar):
         """在后台线程中执行拼接和保存"""
+        finalize_start_time = time.perf_counter()
         label_widget = None
         try:
             main_vbox = processing_window.get_child()
@@ -1410,10 +1427,16 @@ class ActionController:
             final_filename = f"{base_filename}.{file_extension}"
             output_file = config.SAVE_DIRECTORY / final_filename
             output_file.parent.mkdir(parents=True, exist_ok=True)
-            stitched_image = stitch_images_in_memory(self.session.captures, self.session, progress_callback=update_progress)
+            stitch_start_time = time.perf_counter()
+            stitched_image, total_matching_time = stitch_images_in_memory(self.session.captures, self.session, progress_callback=update_progress)
+            stitch_duration = time.perf_counter() - stitch_start_time
+            logging.info(f"图片拼接总耗时: {stitch_duration:.3f} 秒")
+            if total_matching_time > 0:
+                logging.info(f"模板匹配总耗时: {total_matching_time:.3f} 秒")
             if stitched_image:
                 update_label_text("正在保存...")
                 GLib.idle_add(progress_bar.set_fraction, 1.0)
+                save_start_time = time.perf_counter()
                 if config.SAVE_FORMAT == 'JPEG':
                     logging.info(f"以 JPEG 格式保存，质量为 {config.JPEG_QUALITY}")
                     if stitched_image.mode == 'RGBA':
@@ -1422,13 +1445,16 @@ class ActionController:
                 else:
                     logging.info("以 PNG 格式保存")
                     stitched_image.save(str(output_file), 'PNG')
-                logging.info(f"图片成功使用 Pillow 拼接并保存到: {output_file}")
+                save_duration = time.perf_counter() - save_start_time
+                logging.info(f"图片成功使用 Pillow 拼接并保存到: {output_file}，保存耗时: {save_duration:.3f} 秒")
                 message = f"已保存到: {output_file}"
                 if config.COPY_TO_CLIPBOARD:
                     update_label_text("复制到剪贴板...")
                     logging.info("开始复制到剪贴板")
                     GLib.idle_add(_schedule_clipboard_task, output_file)
                     message += "\n并已复制到剪贴板"
+                total_finalize_duration = time.perf_counter() - finalize_start_time
+                logging.info(f"完成最终处理总耗时: {total_finalize_duration:.3f} 秒")
                 GLib.idle_add(
                     lambda: send_desktop_notification(
                         title="长截图制作成功",
@@ -3948,4 +3974,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
