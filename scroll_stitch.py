@@ -14,6 +14,8 @@ from pathlib import Path
 from datetime import datetime
 import time
 from PIL import Image
+import cv2
+import numpy as np
 import configparser
 import argparse
 # GTK3 与 Cairo 导入
@@ -145,6 +147,7 @@ class Config:
 
     def _load_settings(self):
         # Behavior
+        self.ENABLE_FREE_SCROLL_MATCHING = self.parser.getboolean('Behavior', 'enable_free_scroll_matching', fallback=True)
         self.SCROLL_METHOD = self.parser.get('Behavior', 'scroll_method', fallback='move_user_cursor')
         self.CAPTURE_WITH_CURSOR = self.parser.getboolean('Behavior', 'capture_with_cursor', fallback=False)
         self.FORWARD_ACTION = self.parser.get('Behavior', 'forward_action', fallback='scroll_capture')
@@ -168,8 +171,10 @@ class Config:
         self.PROCESSING_DIALOG_SPACING = self.parser.getint('Interface.Layout', 'processing_dialog_spacing', fallback=15)
         self.PROCESSING_DIALOG_BORDER_WIDTH = self.parser.getint('Interface.Layout', 'processing_dialog_border_width', fallback=20)
         # Interface.Theme
-        color_str = self.parser.get('Interface.Theme', 'border_color', fallback='0.73, 0.25, 0.25, 1.0')
+        color_str = self.parser.get('Interface.Theme', 'border_color', fallback='0.73, 0.25, 0.25, 1.00')
         self.BORDER_COLOR = tuple(float(c.strip()) for c in color_str.split(','))
+        indicator_color_str = self.parser.get('Interface.Theme', 'matching_indicator_color', fallback='0.60, 0.76, 0.95, 1.00')
+        self.MATCHING_INDICATOR_COLOR = tuple(float(c.strip()) for c in indicator_color_str.split(','))
         self.SLIDER_MARKS_PER_SIDE = self.parser.getint('Interface.Theme', 'slider_marks_per_side', fallback=4)
         self.SLIDER_MIN = -100
         self.SLIDER_MAX = 100
@@ -218,6 +223,9 @@ class Config:
         temp_dir_str = self.parser.get('System', 'temp_directory_base', fallback='/tmp/scroll_stitch_{pid}')
         self.TMP_DIR = Path(temp_dir_str.format(pid=os.getpid()))
         # Performance
+        self.GRID_MATCHING_MAX_OVERLAP = self.parser.getint('Performance', 'grid_matching_max_overlap', fallback=20)
+        self.FREE_SCROLL_MATCHING_MAX_OVERLAP = self.parser.getint('Performance', 'free_scroll_matching_max_overlap', fallback=200)
+        self.MATCHING_MAX_OVERLAP = self.parser.getint('Performance', 'matching_max_overlap', fallback=20)
         self.SLIDER_SENSITIVITY = self.parser.getfloat('Performance', 'slider_sensitivity', fallback=1.8)
         self.MOUSE_MOVE_TOLERANCE = self.parser.getint('Performance', 'mouse_move_tolerance', fallback=5)
         self.MAX_VIEWER_DIMENSION = self.parser.getint('Performance', 'max_viewer_dimension', fallback=32767)
@@ -253,6 +261,7 @@ class Config:
         """返回包含所有默认设置的配置字符串"""
         return """
 [Behavior]
+enable_free_scroll_matching = true
 scroll_method = move_user_cursor
 capture_with_cursor = false
 forward_action = scroll_capture
@@ -279,7 +288,8 @@ processing_dialog_spacing = 15
 processing_dialog_border_width = 20
 
 [Interface.Theme]
-border_color = 0.73, 0.25, 0.25, 1.0
+border_color = 0.73, 0.25, 0.25, 1.00
+matching_indicator_color = 0.60, 0.76, 0.95, 1.00
 slider_marks_per_side = 4
 slider_panel_css =
     scale { color: #c0c0c0; font-size: 26px; }
@@ -325,6 +335,8 @@ log_file = ~/.scroll_stitch.log
 temp_directory_base = /tmp/scroll_stitch_{pid}
 
 [Performance]
+grid_matching_max_overlap = 20
+free_scroll_matching_max_overlap = 200
 slider_sensitivity = 1.8
 mouse_move_tolerance = 5
 max_viewer_dimension = 32767
@@ -353,21 +365,29 @@ dialog_cancel = esc
             f.write(Config.get_default_config_string())
         logging.info(f"已在 {self.config_path} 目录下创建默认配置文件")
 
-    def get_scroll_unit(self, app_class: str) -> int:
-        """从配置中获取指定应用程序的滚动单位"""
+    def get_scroll_unit(self, app_class: str) -> tuple[int, bool]:
+        """从配置中获取指定应用程序的滚动单位和模板匹配设置"""
         if self.parser.has_section('ApplicationScrollUnits'):
-            return self.parser.getint('ApplicationScrollUnits', app_class, fallback=0)
-        return 0
+            value_str = self.parser.get('ApplicationScrollUnits', app_class, fallback='0,false')
+            parts = [p.strip() for p in value_str.split(',')]
+            try:
+                unit = int(parts[0])
+                enabled = parts[1].lower() == 'true' if len(parts) > 1 else False
+                return unit, enabled
+            except (ValueError, IndexError):
+                return 0, False
+        return 0, False
 
-    def save_scroll_unit(self, app_class: str, unit_value: int):
-        """将计算出的滚动单位保存到配置文件中"""
+    def save_scroll_unit(self, app_class: str, unit_value: int, matching_enabled: bool):
+        """将计算出的滚动单位和匹配设置保存到配置文件中"""
         try:
             if not self.parser.has_section('ApplicationScrollUnits'):
                 self.parser.add_section('ApplicationScrollUnits')
-            self.parser.set('ApplicationScrollUnits', app_class, str(unit_value))
+            value_to_save = f"{unit_value},{str(matching_enabled).lower()}"
+            self.parser.set('ApplicationScrollUnits', app_class, value_to_save)
             with open(self.config_path, 'w') as configfile:
                 self.parser.write(configfile)
-            logging.info(f"成功将配置 '{app_class} = {unit_value}' 写入 {self.config_path}")
+            logging.info(f"成功将配置 '{app_class} = {value_to_save}' 写入 {self.config_path}")
             return True
         except Exception as e:
             logging.error(f"写入配置文件失败: {e}")
@@ -749,37 +769,102 @@ def capture_area(x: int, y: int, w: int, h: int, filepath: Path) -> bool:
         logging.error(f"使用 GDK 截图失败: {e}")
         return False
 
-def stitch_images_in_memory(image_paths, progress_callback=None):
-    """使用 Pillow 库将多张图片垂直拼接"""
+def _find_overlap_brute_force(img_top, img_bottom, min_h, max_h):
+    h1, _, _ = img_top.shape
+    best_match_score = -1.0
+    found_overlap = 0
+    for h in range(max_h, min_h - 1, -1):
+        region_top = img_top[h1 - h:, :]
+        template_bottom = img_bottom[0:h, :]
+        result = cv2.matchTemplate(region_top, template_bottom, cv2.TM_CCOEFF_NORMED)
+        score = result[0][0]
+        if score > best_match_score:
+            best_match_score = score
+            found_overlap = h
+        if score > 0.98:
+            break
+    return found_overlap, best_match_score
+
+def _find_overlap_pyramid(img_top, img_bottom, max_overlap_search):
+    PYRAMID_CUTOFF_THRESHOLD = 50
+    if max_overlap_search < PYRAMID_CUTOFF_THRESHOLD:
+        return _find_overlap_brute_force(img_top, img_bottom, 1, max_overlap_search)
+    scale_factor = (2.0 / max_overlap_search)**0.5
+    scale_factor = max(0.04, min(scale_factor, 0.5))
+    search_radius = max(3, int(0.8 / scale_factor))
+    small_top = cv2.resize(img_top, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
+    small_bottom = cv2.resize(img_bottom, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
+    max_overlap_scaled = int(max_overlap_search * scale_factor)
+    coarse_overlap_scaled, _ = _find_overlap_brute_force(small_top, small_bottom, 1, max_overlap_scaled)
+    estimated_overlap = int(coarse_overlap_scaled / scale_factor)
+    h1, _, _ = img_top.shape
+    h2, _, _ = img_bottom.shape
+    min_fine_search = max(1, estimated_overlap - search_radius)
+    max_fine_search = min(max_overlap_search, estimated_overlap + search_radius, h1 - 1, h2 - 1)
+    if max_fine_search <= min_fine_search:
+        logging.warning(f"搜索的精确范围无效 [{min_fine_search}, {max_fine_search}]，可能匹配失败")
+        return estimated_overlap, 0.0
+    return _find_overlap_brute_force(img_top, img_bottom, min_fine_search, max_fine_search)
+
+def stitch_images_in_memory(image_paths, session, progress_callback=None):
     if not image_paths:
         logging.warning("没有图片需要拼接")
-        return False
-    images = []
-    num_images = len(image_paths)
+        return None
     try:
-        images = [Image.open(p) for p in image_paths]
-        total_width = images[0].width
-        total_height = sum(img.height for img in images)
-        logging.info(f"开始拼接图片，最终尺寸: {total_width}x{total_height}")
-        stitched_image = Image.new('RGBA', (total_width, total_height))
-        current_height = 0
-        for i, img in enumerate(images):
-            stitched_image.paste(img, (0, current_height))
-            current_height += img.height
-            if progress_callback:
-                fraction = (i + 1) / num_images
-                progress_callback(fraction)
-        logging.info("内存中图片拼接完成")
-        return stitched_image
+        images_pil = [Image.open(p) for p in image_paths]
     except Exception as e:
-        logging.error(f"使用 Pillow 拼接图片失败: {e}")
-        return False
-    finally:
-        for img in images:
-            try:
-                img.close()
-            except:
-                pass
+        logging.error(f"加载图片失败: {e}")
+        return None
+    is_grid_mode_session = session.detected_app_class is not None
+    is_grid_mode_matching = session.is_matching_enabled and is_grid_mode_session
+    is_free_scroll_matching = not is_grid_mode_session and config.ENABLE_FREE_SCROLL_MATCHING
+    use_matching = is_grid_mode_matching or is_free_scroll_matching
+    max_overlap_config = 0
+    if use_matching:
+        if is_grid_mode_matching:
+            max_overlap_config = config.GRID_MATCHING_MAX_OVERLAP
+            mode_str = f"整格模式 (应用: {session.detected_app_class})"
+        else:
+            max_overlap_config = config.FREE_SCROLL_MATCHING_MAX_OVERLAP
+            mode_str = "自由模式"
+        logging.info(f"在 {mode_str} 下启用模板匹配进行拼接 (最大搜索范围: {max_overlap_config}px)...")
+    else:
+        logging.info("使用简单粘贴模式进行拼接...")
+    stitched_image = images_pil[0].copy()
+    num_images = len(images_pil)
+    for i in range(1, num_images):
+        img_bottom_pil = images_pil[i]
+        overlap = 0
+        if use_matching:
+            img_top = cv2.cvtColor(np.array(stitched_image.convert('RGB')), cv2.COLOR_RGB2BGR)
+            img_bottom = cv2.cvtColor(np.array(img_bottom_pil.convert('RGB')), cv2.COLOR_RGB2BGR)
+            h1, _, _ = img_top.shape
+            h2, _, _ = img_bottom.shape
+            max_overlap_search = min(max_overlap_config, h1 - 1, h2 - 1)
+            best_match_score = -1.0
+            found_overlap = 0
+            if max_overlap_search > 0:
+                found_overlap, best_match_score = _find_overlap_pyramid(
+                    img_top, img_bottom, max_overlap_search
+                )
+            QUALITY_THRESHOLD = 0.95
+            if best_match_score >= QUALITY_THRESHOLD:
+                overlap = found_overlap
+                logging.info(f"图片 {i}/{i+1} 匹配成功：重叠 {overlap}px, 相似度 {best_match_score:.3f}")
+            else:
+                logging.warning(f"图片 {i}/{i+1} 匹配失败 (最高相似度 {best_match_score:.3f} < {QUALITY_THRESHOLD})，将直接拼接。")
+                overlap = 0
+        new_height = stitched_image.height + img_bottom_pil.height - overlap
+        new_stitched_image = Image.new('RGBA', (stitched_image.width, new_height))
+        new_stitched_image.paste(stitched_image, (0, 0))
+        new_stitched_image.paste(img_bottom_pil, (0, stitched_image.height - overlap))
+        stitched_image = new_stitched_image
+        if progress_callback:
+            progress_callback((i + 1) / num_images)
+    logging.info(f"拼接完成，最终尺寸: {stitched_image.width}x{stitched_image.height}")
+    for img in images_pil:
+        img.close()
+    return stitched_image
 
 def copy_to_clipboard(image_path: Path) -> bool:
     """使用 Gtk.Clipboard 将图片复制到剪贴板"""
@@ -818,6 +903,7 @@ class CaptureSession:
         self.total_height: int = 0
         self.image_width: int = 0
         self.detected_app_class: str = None
+        self.is_matching_enabled: bool = False
 
     def _parse_geometry(self, geometry_str: str):
         """从 "WxH+X+Y" 格式的字符串中解析出几何信息"""
@@ -945,7 +1031,10 @@ class GridModeController:
         if self.is_active:
             self.is_active = False
             self.grid_unit = 0
+            self.session.detected_app_class = None
+            self.session.is_matching_enabled = False
             self.view.side_panel.button_panel.set_scroll_buttons_visible(config.ENABLE_FREE_SCROLL)
+            self.view.queue_draw()
             logging.info("整格模式已关闭")
             send_desktop_notification("整格模式已关闭", "边框拖动已恢复自由模式")
             return
@@ -954,14 +1043,16 @@ class GridModeController:
         if not app_class:
             send_desktop_notification("模式切换失败", "无法检测到底层应用程序")
             return
-        grid_unit_from_config = config.get_scroll_unit(app_class)
+        grid_unit_from_config, matching_enabled = config.get_scroll_unit(app_class)
         if grid_unit_from_config > 0:
             self.is_active = True
             self.grid_unit = grid_unit_from_config
             self.session.detected_app_class = app_class
+            self.session.is_matching_enabled = matching_enabled
             self.view.side_panel.button_panel.set_scroll_buttons_visible(True)
-            logging.info(f"为应用 '{app_class}' 启用整格模式，单位: {self.grid_unit}px")
-            send_desktop_notification("整格模式已启用", f"应用: {app_class}\n滚动单位: {self.grid_unit}px")
+            match_status = "启用" if matching_enabled else "禁用"
+            logging.info(f"为应用 '{app_class}' 启用整格模式，单位: {self.grid_unit}px, 模板匹配: {match_status}")
+            send_desktop_notification("整格模式已启用", f"应用: {app_class}\n滚动单位: {self.grid_unit}px\n误差修正: {match_status}")
             self._snap_current_height()
         else:
             logging.warning(f"应用 '{app_class}' 未在配置中找到滚动单位，无法启用整格模式")
@@ -1319,7 +1410,7 @@ class ActionController:
             final_filename = f"{base_filename}.{file_extension}"
             output_file = config.SAVE_DIRECTORY / final_filename
             output_file.parent.mkdir(parents=True, exist_ok=True)
-            stitched_image = stitch_images_in_memory(self.session.captures, progress_callback=update_progress)
+            stitched_image = stitch_images_in_memory(self.session.captures, self.session, progress_callback=update_progress)
             if stitched_image:
                 update_label_text("正在保存...")
                 GLib.idle_add(progress_bar.set_fraction, 1.0)
@@ -1705,9 +1796,10 @@ class ConfigWindow(Gtk.Window):
             ('Interface.Components', 'enable_free_scroll'), ('Interface.Components', 'enable_slider'),
             ('Interface.Components', 'show_capture_count'), ('Interface.Components', 'show_total_dimensions'),
             ('Interface.Components', 'show_instruction_notification'),
-            ('Behavior', 'capture_with_cursor'), ('Behavior', 'scroll_method'),
+            ('Behavior', 'enable_free_scroll_matching'), ('Behavior', 'capture_with_cursor'), ('Behavior', 'scroll_method'),
             ('Behavior', 'forward_action'), ('Behavior', 'backward_action'),
-            ('Interface.Theme', 'border_color'), ('Interface.Theme', 'slider_marks_per_side'),
+            ('Interface.Theme', 'border_color'), ('Interface.Theme', 'matching_indicator_color'),
+            ('Interface.Theme', 'slider_marks_per_side'),
             ('Interface.Layout', 'border_width'),
             ('Interface.Layout', 'handle_height'), ('Interface.Layout', 'slider_panel_width'),
             ('Interface.Layout', 'side_panel_width'), ('Interface.Layout', 'button_spacing'),
@@ -1718,7 +1810,7 @@ class ConfigWindow(Gtk.Window):
             ('System', 'copy_to_clipboard_on_finish'), ('System', 'notification_click_action'),
             ('System', 'large_image_opener'), ('System', 'sound_theme'),
             ('System', 'capture_sound'), ('System', 'undo_sound'), ('System', 'finalize_sound'),
-            ('Performance', 'slider_sensitivity'), ('Performance', 'mouse_move_tolerance'),
+            ('Performance', 'grid_matching_max_overlap'), ('Performance', 'free_scroll_matching_max_overlap'), ('Performance', 'slider_sensitivity'), ('Performance', 'mouse_move_tolerance'),
             ('Performance', 'free_scroll_distance_px'), ('Performance', 'max_viewer_dimension'),
             ('System', 'log_file'), ('System', 'temp_directory_base'),
         ]
@@ -2326,6 +2418,7 @@ class ConfigWindow(Gtk.Window):
             ("enable_slider", "启用左侧滑块条", "是否在截图区域左侧显示一个用于平滑滚动的拖动条"),
             ("show_capture_count", "显示已截图数量", "是否在侧边栏信息面板中显示当前已截取的图片数量"),
             ("show_total_dimensions", "显示最终图片总尺寸", "是否在侧边栏信息面板中显示拼接后图片的总宽度和总高度"),
+            ("enable_free_scroll_matching", "自由模式启用滚动误差修正", "在<b>自由模式</b>下，使用模板匹配来修正滚动误差，此功能会增加拼接处理时间\n启用后，请确保每次滚动有重叠部分，否则修正无效"),
             ("show_instruction_notification", "启动时显示操作说明", "每次启动截图会话时，是否弹出一个包含基本操作指南的通知")
         ]
         self.component_checkboxes = {}
@@ -2410,6 +2503,7 @@ class ConfigWindow(Gtk.Window):
         scrolled.add(vbox)
         theme_layout_settings = [
             ('Interface.Theme', 'border_color'),
+            ('Interface.Theme', 'matching_indicator_color'),
             ('Interface.Layout', 'border_width'),
             ('Interface.Theme', 'slider_marks_per_side'),
             ('Interface.Layout', 'handle_height'),
@@ -2445,6 +2539,13 @@ class ConfigWindow(Gtk.Window):
         self.border_color_button = Gtk.ColorButton()
         grid1.attach(label, 0, 0, 1, 1)
         grid1.attach(self.border_color_button, 1, 0, 1, 1)
+        # 指示器颜色
+        label_ind = Gtk.Label(label="匹配指示器颜色:", xalign=0)
+        label_ind.set_tooltip_markup("误差修正功能启用时，在边框上标记区域的颜色")
+        self.indicator_color_button = Gtk.ColorButton()
+        self.indicator_color_button.set_tooltip_markup(label_ind.get_tooltip_markup())
+        grid1.attach(label_ind, 0, 1, 1, 1)
+        grid1.attach(self.indicator_color_button, 1, 1, 1, 1)
         # 边框宽度
         label = Gtk.Label(label="边框宽度:", xalign=0)
         self.border_width_spin = Gtk.SpinButton()
@@ -2453,8 +2554,8 @@ class ConfigWindow(Gtk.Window):
         self.border_width_spin.set_range(1, 25)
         self.border_width_spin.set_increments(1, 5)
         self.border_width_spin.set_halign(Gtk.Align.START)
-        grid1.attach(label, 0, 1, 1, 1)
-        grid1.attach(self.border_width_spin, 1, 1, 1, 1)
+        grid1.attach(label, 0, 2, 1, 1)
+        grid1.attach(self.border_width_spin, 1, 2, 1, 1)
         # 滑块刻度数量
         label = Gtk.Label(label="滑块刻度数量:", xalign=0)
         self.slider_marks_spin = Gtk.SpinButton()
@@ -2463,8 +2564,8 @@ class ConfigWindow(Gtk.Window):
         self.slider_marks_spin.set_range(0, 20)
         self.slider_marks_spin.set_increments(1, 2)
         self.slider_marks_spin.set_halign(Gtk.Align.START)
-        grid1.attach(label, 0, 2, 1, 1)
-        grid1.attach(self.slider_marks_spin, 1, 2, 1, 1)
+        grid1.attach(label, 0, 3, 1, 1)
+        grid1.attach(self.slider_marks_spin, 1, 3, 1, 1)
         # 布局微调
         frame2 = Gtk.Frame(label="布局微调（像素）")
         vbox.pack_start(frame2, False, False, 0)
@@ -2720,6 +2821,8 @@ class ConfigWindow(Gtk.Window):
         grid3.attach(label, 0, 0, 1, 1)
         grid3.attach(self.sensitivity_spin, 1, 0, 1, 1)
         performance_configs = [
+            ("grid_matching_max_overlap", "整格模式误差修正范围", 10, 20, "<b>整格模式</b>下的误差修正设置最大搜索范围"),
+            ("free_scroll_matching_max_overlap", "自由模式误差修正范围", 20, 300, "<b>自由模式</b>下的误差修正设置最大搜索范围\n值越大，处理用时越长"),
             ("mouse_move_tolerance", "鼠标容差", 0, 50, "在使用“移动用户光标”方式滚动后，若用户鼠标的移动距离超过此像素值，程序将不会把光标移回原位"),
             ("free_scroll_distance_px", "自由滚动步长", 10, 500, "在<b>自由模式</b>下，“前进”/“后退”滚动的相对距离"),
             ("max_viewer_dimension", "图片尺寸阈值", -1, 131071, "最终图片长或宽超过此值时，会使用上面的“大尺寸图片打开命令”\n设为 <b>-1</b> 禁用此功能，总是用系统默认方式打开图片\n设为 <b>0</b> 总是用自定义命令打开图片")
@@ -2797,7 +2900,7 @@ class ConfigWindow(Gtk.Window):
         self.grid_calibration_page = vbox
         self.stack.add_titled(vbox, "grid", "整格模式校准")
 
-    def _add_grid_row(self, app_class="", unit=0):
+    def _add_grid_row(self, app_class="", unit=0, matching_enabled=False):
         """向整格校准列表框中添加一行"""
         row = Gtk.ListBoxRow()
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -2819,8 +2922,13 @@ class ConfigWindow(Gtk.Window):
         spin.set_range(1, 300)
         spin.set_increments(1, 10)
         spin.set_value(unit)
+        check = Gtk.CheckButton(label="修正误差")
+        check.set_tooltip_markup("启用模板匹配修正滚动误差\n启用后，请确保滚动距离小于截图区高度，否则修正无效")
+        check.connect("button-press-event", self._on_grid_row_child_clicked)
+        check.set_active(matching_enabled)
         hbox.pack_start(entry, True, True, 0)
         hbox.pack_start(spin, False, False, 0)
+        hbox.pack_start(check, False, False, 0)
         self.grid_listbox.add(row)
         row.show_all()
 
@@ -2945,6 +3053,7 @@ class ConfigWindow(Gtk.Window):
             'filename_template': self.filename_entry,
             'filename_timestamp_format': self.timestamp_entry,
             'border_color': self.border_color_button,
+            'matching_indicator_color': self.indicator_color_button,
            'border_width': self.border_width_spin,
             'slider_marks_per_side': self.slider_marks_spin,
             'slider_sensitivity': self.sensitivity_spin,
@@ -3006,8 +3115,14 @@ class ConfigWindow(Gtk.Window):
         if isinstance(widget, Gtk.Switch) or isinstance(widget, Gtk.CheckButton):
             widget.set_active(value.lower() == 'true')
         elif isinstance(widget, Gtk.ColorButton):
-            r, g, b, a = [float(c.strip()) for c in value.split(',')]
-            widget.set_rgba(Gdk.RGBA(r, g, b, a))
+            if value and value.count(',') == 3:
+                try:
+                    r, g, b, a = [float(c.strip()) for c in value.split(',')]
+                    widget.set_rgba(Gdk.RGBA(r, g, b, a))
+                except ValueError:
+                    logging.warning(f"配置文件中的颜色值 '{value}' 包含非数字内容，无法解析")
+            elif value:
+                logging.warning(f"配置文件中的颜色值 '{value}' 格式错误，应为 'r, g, b, a'。跳过设置")
         elif isinstance(widget, (Gtk.Entry, Gtk.Button)):
             if key == 'save_directory':
                 widget.set_text(str(Path(value).expanduser()))
@@ -3045,8 +3160,14 @@ class ConfigWindow(Gtk.Window):
                 widget.set_active_id(value)
         self.grid_listbox.foreach(lambda child: self.grid_listbox.remove(child))
         if p.has_section('ApplicationScrollUnits'):
-            for app, unit in p.items('ApplicationScrollUnits'):
-                self._add_grid_row(app, int(unit))
+            for app, value_str in p.items('ApplicationScrollUnits'):
+                parts = [p.strip() for p in value_str.split(',')]
+                try:
+                    unit = int(parts[0])
+                    enabled = parts[1].lower() == 'true' if len(parts) > 1 else False
+                    self._add_grid_row(app, unit, enabled)
+                except (ValueError, IndexError):
+                    self._add_grid_row(app, 0, False)
         self._update_filename_preview()
         self._on_format_changed(self.format_combo)
 
@@ -3064,11 +3185,13 @@ class ConfigWindow(Gtk.Window):
         p.add_section('ApplicationScrollUnits')
         for row in self.grid_listbox.get_children():
             hbox = row.get_child()
-            entry, spin = hbox.get_children()
-            app_class = entry.get_text().strip()
+            entry, spin, check = hbox.get_children()
+            app_class = entry.get_text().strip().lower()
             if app_class:
                 unit = spin.get_value_as_int()
-                p.set('ApplicationScrollUnits', app_class, str(unit))
+                enabled = check.get_active()
+                value_to_save = f"{unit},{str(enabled).lower()}"
+                p.set('ApplicationScrollUnits', app_class, value_to_save)
         try:
             with open(self.config.config_path, 'w') as configfile:
                 p.write(configfile)
@@ -3368,15 +3491,68 @@ class CaptureOverlay(Gtk.Window):
         cr.set_operator(cairo.OPERATOR_SOURCE)
         cr.paint()
         cr.set_operator(cairo.OPERATOR_OVER)
-        r, g, b, a = config.BORDER_COLOR
-        cr.set_source_rgba(r, g, b, a)
-        cr.set_line_width(config.BORDER_WIDTH)
-        _, height = self.get_size()
-        rect_x = self.left_panel_w + config.BORDER_WIDTH / 2
-        rect_y = config.BORDER_WIDTH / 2
-        rect_w = self.session.geometry['w'] + config.BORDER_WIDTH
-        rect_h = height - config.BORDER_WIDTH
-        cr.rectangle(rect_x, rect_y, rect_w, rect_h)
+        main_r, main_g, main_b, main_a = config.BORDER_COLOR
+        ind_r, ind_g, ind_b, ind_a = config.MATCHING_INDICATOR_COLOR
+        border_width = config.BORDER_WIDTH
+        cr.set_line_width(border_width)
+        win_w, win_h = self.get_size()
+        capture_h = win_h - 2 * border_width
+        capture_w = self.session.geometry['w']
+        rect_x = self.left_panel_w + border_width / 2
+        rect_y = border_width / 2
+        rect_w = capture_w + border_width
+        rect_h = capture_h + border_width
+        is_grid_mode_matching = self.session.is_matching_enabled and self.session.detected_app_class is not None
+        is_free_scroll_matching = not is_grid_mode_matching and config.ENABLE_FREE_SCROLL_MATCHING
+        draw_indicator = use_matching = is_grid_mode_matching or is_free_scroll_matching
+        if not draw_indicator:
+            cr.set_source_rgba(main_r, main_g, main_b, main_a)
+            cr.rectangle(rect_x, rect_y, rect_w, rect_h)
+            cr.stroke()
+            return
+        if is_grid_mode_matching:
+            overlap_height = config.GRID_MATCHING_MAX_OVERLAP
+        else:
+            overlap_height = config.FREE_SCROLL_MATCHING_MAX_OVERLAP
+        overlap_height = min(overlap_height, capture_h / 2)
+        cr.set_source_rgba(main_r, main_g, main_b, main_a)
+        cr.move_to(rect_x - border_width/2, rect_y)
+        cr.line_to(rect_x + rect_w + border_width/2, rect_y)
+        cr.stroke()
+        cr.move_to(rect_x - border_width/2, rect_y + rect_h)
+        cr.line_to(rect_x + rect_w + border_width/2, rect_y + rect_h)
+        cr.stroke()
+        y_vertical_start = border_width
+        y_vertical_end = win_h - border_width
+        y_top_end = y_vertical_start + overlap_height
+        y_bottom_start = y_vertical_end - overlap_height
+        if y_top_end > y_bottom_start:
+            y_top_end = y_bottom_start = y_vertical_start + (y_vertical_end - y_vertical_start) / 2
+        left_x = rect_x
+        cr.set_source_rgba(ind_r, ind_g, ind_b, ind_a)
+        cr.move_to(left_x, rect_y)
+        cr.line_to(left_x, y_top_end)
+        cr.stroke()
+        cr.set_source_rgba(main_r, main_g, main_b, main_a)
+        cr.move_to(left_x, y_top_end)
+        cr.line_to(left_x, y_bottom_start)
+        cr.stroke()
+        cr.set_source_rgba(ind_r, ind_g, ind_b, ind_a)
+        cr.move_to(left_x, y_bottom_start)
+        cr.line_to(left_x, rect_y + rect_h)
+        cr.stroke()
+        right_x = rect_x + rect_w
+        cr.set_source_rgba(ind_r, ind_g, ind_b, ind_a)
+        cr.move_to(right_x, rect_y)
+        cr.line_to(right_x, y_top_end)
+        cr.stroke()
+        cr.set_source_rgba(main_r, main_g, main_b, main_a)
+        cr.move_to(right_x, y_top_end)
+        cr.line_to(right_x, y_bottom_start)
+        cr.stroke()
+        cr.set_source_rgba(ind_r, ind_g, ind_b, ind_a)
+        cr.move_to(right_x, y_bottom_start)
+        cr.line_to(right_x, rect_y + rect_h)
         cr.stroke()
 
     def on_size_allocate(self, widget, allocation):
@@ -3398,8 +3574,9 @@ class CaptureOverlay(Gtk.Window):
         border_full_region = cairo.Region(
             cairo.RectangleInt(border_area_x_start, 0, border_area_width, win_h)
         )
+        inner_height = win_h - 2 * config.BORDER_WIDTH
         inner_transparent_region = cairo.Region(
-            cairo.RectangleInt(border_area_x_start + config.BORDER_WIDTH, config.BORDER_WIDTH, self.session.geometry['w'], self.session.geometry['h'])
+            cairo.RectangleInt(border_area_x_start + config.BORDER_WIDTH, config.BORDER_WIDTH, self.session.geometry['w'], inner_height)
         )
         border_full_region.subtract(inner_transparent_region)
         final_input_region.union(border_full_region)
@@ -3771,3 +3948,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
