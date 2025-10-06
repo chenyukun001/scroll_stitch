@@ -7,6 +7,7 @@ import shlex
 import shutil
 import re
 import subprocess
+import multiprocessing
 import logging
 import queue
 import threading
@@ -817,64 +818,81 @@ def _find_overlap_pyramid(img_top, img_bottom, max_overlap_search):
 
 def stitch_images_in_memory(image_paths, session, progress_callback=None):
     if not image_paths:
-        logging.warning("没有图片需要拼接")
         return None, 0.0
     try:
         images_pil = [Image.open(p) for p in image_paths]
     except Exception as e:
         logging.error(f"加载图片失败: {e}")
         return None, 0.0
-    total_matching_time = 0.0
+    num_images = len(images_pil)
+    if num_images <= 1:
+        return images_pil[0].copy() if images_pil else None, 0.0
+    images_np = [cv2.cvtColor(np.asarray(img.convert('RGB')), cv2.COLOR_RGB2BGR) for img in images_pil]
     is_grid_mode_session = session.detected_app_class is not None
     is_grid_mode_matching = session.is_matching_enabled and is_grid_mode_session
     is_free_scroll_matching = not is_grid_mode_session and config.ENABLE_FREE_SCROLL_MATCHING
     use_matching = is_grid_mode_matching or is_free_scroll_matching
-    max_overlap_config = 0
-    if use_matching:
-        if is_grid_mode_matching:
-            max_overlap_config = config.GRID_MATCHING_MAX_OVERLAP
-            mode_str = f"整格模式 (应用: {session.detected_app_class})"
-        else:
-            max_overlap_config = config.FREE_SCROLL_MATCHING_MAX_OVERLAP
-            mode_str = "自由模式"
-        logging.info(f"在 {mode_str} 下启用模板匹配进行拼接 (最大搜索范围: {max_overlap_config}px)...")
-    else:
+    total_matching_time = 0.0
+    overlaps = [0] * (num_images - 1)
+    if not use_matching:
         logging.info("使用简单粘贴模式进行拼接...")
-    stitched_image = images_pil[0].copy()
-    num_images = len(images_pil)
-    for i in range(1, num_images):
-        img_bottom_pil = images_pil[i]
-        overlap = 0
-        if use_matching:
-            match_start_time = time.perf_counter()
-            img_top = cv2.cvtColor(np.asarray(stitched_image.convert('RGB')), cv2.COLOR_RGB2BGR)
-            img_bottom = cv2.cvtColor(np.asarray(img_bottom_pil.convert('RGB')), cv2.COLOR_RGB2BGR)
-            h1, _, _ = img_top.shape
-            h2, _, _ = img_bottom.shape
-            max_overlap_search = min(max_overlap_config, h1 - 1, h2 - 1)
-            best_match_score = -1.0
-            found_overlap = 0
-            if max_overlap_search > 0:
+    else:
+        match_start_time = time.perf_counter()
+        max_overlap_config = (config.GRID_MATCHING_MAX_OVERLAP if is_grid_mode_matching 
+                              else config.FREE_SCROLL_MATCHING_MAX_OVERLAP)
+        for i in range(num_images - 1):
+            img_top_np = images_np[i]
+            img_bottom_np = images_np[i+1]
+            h1, _, _ = img_top_np.shape
+            h2, _, _ = img_bottom_np.shape
+            prediction_successful = False
+            if session.known_scroll_distances:
+                for s_known in session.known_scroll_distances:
+                    predicted_overlap = h2 - s_known
+                    if 1 <= predicted_overlap < min(h1, h2):
+                        _, score = _find_overlap_brute_force(img_top_np, img_bottom_np, predicted_overlap, predicted_overlap)
+                        PREDICTION_THRESHOLD = 0.995
+                        if score > PREDICTION_THRESHOLD:
+                            overlaps[i] = predicted_overlap
+                            prediction_successful = True
+                            logging.info(f"图片对 {i+1}/{i+2} 预测成功：重叠 {predicted_overlap}px, 相似度 {score:.3f}")
+                            break
+            if prediction_successful:
+                if progress_callback: GLib.idle_add(progress_callback, (i + 1) / (num_images - 1))
+                continue
+            logging.info(f"图片对 {i+1}/{i+2} 预测失败，执行全范围搜索...")
+            effective_search_range = min(max_overlap_config, h1 - 1, h2 - 1)
+            overlap_value = 0
+            if effective_search_range > 0:
                 found_overlap, best_match_score = _find_overlap_pyramid(
-                    img_top, img_bottom, max_overlap_search
+                    img_top_np, img_bottom_np, effective_search_range
                 )
-            match_end_time = time.perf_counter()
-            total_matching_time += (match_end_time - match_start_time)
-            QUALITY_THRESHOLD = 0.95
-            if best_match_score >= QUALITY_THRESHOLD:
-                overlap = found_overlap
-                logging.info(f"图片 {i}/{i+1} 匹配成功：重叠 {overlap}px, 相似度 {best_match_score:.3f}")
-            else:
-                logging.warning(f"图片 {i}/{i+1} 匹配失败 (最高相似度 {best_match_score:.3f} < {QUALITY_THRESHOLD})，将直接拼接。")
-                overlap = 0
-        new_height = stitched_image.height + img_bottom_pil.height - overlap
-        new_stitched_image = Image.new('RGBA', (stitched_image.width, new_height))
-        new_stitched_image.paste(stitched_image, (0, 0))
-        new_stitched_image.paste(img_bottom_pil, (0, stitched_image.height - overlap))
-        stitched_image = new_stitched_image
-        if progress_callback:
-            progress_callback((i + 1) / num_images)
-    logging.info(f"拼接完成，最终尺寸: {stitched_image.width}x{stitched_image.height}")
+                QUALITY_THRESHOLD = 0.95
+                if best_match_score >= QUALITY_THRESHOLD:
+                    overlap_value = found_overlap
+                    logging.info(f"图片对 {i+1}/{i+2} 搜索匹配成功：重叠 {overlap_value}px, 相似度 {best_match_score:.3f}")
+                else:
+                    logging.warning(f"图片对 {i+1}/{i+2} 搜索匹配失败 (最高相似度 {best_match_score:.3f} < {QUALITY_THRESHOLD})")
+            overlaps[i] = overlap_value
+            if overlap_value > 0:
+                s_new = h2 - overlap_value
+                if s_new > 0 and s_new not in session.known_scroll_distances:
+                    session.known_scroll_distances.append(s_new)
+                    logging.info(f"学习到新滚动距离: {s_new}px，可用于下次预测")
+            if progress_callback: GLib.idle_add(progress_callback, (i + 1) / (num_images - 1))
+        total_matching_time = time.perf_counter() - match_start_time
+        logging.info(f"模板匹配总耗时: {total_matching_time:.3f} 秒")
+    final_width = images_pil[0].width
+    final_height = sum(img.height for img in images_pil) - sum(overlaps)
+    logging.info(f"计算完成，最终尺寸: {final_width}x{final_height}")
+    stitched_image = Image.new('RGBA', (final_width, final_height))
+    y_offset = 0
+    for i, img in enumerate(images_pil):
+        stitched_image.paste(img, (0, y_offset))
+        if i < num_images - 1:
+            y_offset += img.height - overlaps[i]
+    if session.known_scroll_distances:
+        logging.info(f"本次会话学习到的滚动距离列表: {sorted(session.known_scroll_distances)}")
     for img in images_pil:
         img.close()
     return stitched_image, total_matching_time
@@ -920,6 +938,7 @@ class CaptureSession:
         self.image_width: int = 0
         self.detected_app_class: str = None
         self.is_matching_enabled: bool = False
+        self.known_scroll_distances = []
 
     def _parse_geometry(self, geometry_str: str):
         """从 "WxH+X+Y" 格式的字符串中解析出几何信息"""
