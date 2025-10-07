@@ -27,7 +27,7 @@ from gi.repository import Gtk, Gdk, GLib, GObject, Notify, Pango, GdkPixbuf
 import cairo
 # Pynput 用于全局热键与鼠标控制
 from pynput import keyboard, mouse
-from Xlib import display, X
+from Xlib import display, X, protocol
 # 全局实例
 hotkey_listener = None
 mouse_controller = mouse.Controller() # pynput 鼠标控制器
@@ -911,21 +911,56 @@ def copy_to_clipboard(image_path: Path) -> bool:
         logging.error(f"使用 GTK 复制到剪贴板失败: {e}，耗时: {copy_duration:.3f} 秒")
         return False
 
-def activate_window_with_xdotool(xid):
-    """使用 xdotool 激活一个窗口"""
+def get_active_window_xid():
+    disp = None
+    try:
+        disp = display.Display()
+        root = disp.screen().root
+        active_window_atom = disp.intern_atom('_NET_ACTIVE_WINDOW')
+        prop = root.get_full_property(active_window_atom, X.AnyPropertyType)
+        if prop and prop.value:
+            active_xid = prop.value[0]
+            logging.debug(f"通过 python-xlib 获取到活动窗口 XID: {active_xid}")
+            return active_xid
+        else:
+            logging.warning("无法通过 _NET_ACTIVE_WINDOW 获取活动窗口")
+            return None
+    except Exception as e:
+        logging.error(f"使用 python-xlib 获取活动窗口时出错: {e}")
+        return None
+    finally:
+        if disp:
+            disp.close()
+
+def activate_window_with_xlib(xid):
     if not xid:
         logging.warning("无法激活窗口：XID 不可用")
         return False
+    disp = None
     try:
-        subprocess.run(
-            ["xdotool", "windowactivate", "--sync", str(xid)],
-            check=True, capture_output=True, timeout=0.5
+        disp = display.Display()
+        root = disp.screen().root
+        window_obj = disp.create_resource_object('window', xid)
+        if not window_obj:
+            logging.error(f"无法为 XID {xid} 创建资源对象，窗口可能不存在。")
+            return False
+        active_window_atom = disp.intern_atom('_NET_ACTIVE_WINDOW')
+        event = protocol.event.ClientMessage(
+            window=window_obj,
+            client_type=active_window_atom,
+            data=(32, [2, X.CurrentTime, xid, 0, 0])
         )
-        logging.info(f"已使用 xdotool 成功激活窗口 XID {xid}")
+        mask = (X.SubstructureRedirectMask | X.SubstructureNotifyMask)
+        root.send_event(event, event_mask=mask)
+        disp.sync()
+        logging.info(f"已通过 python-xlib 成功请求激活窗口 XID {xid}")
         return True
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        logging.error(f"使用 xdotool 激活窗口 {xid} 失败: {e}")
+    except Exception as e:
+        logging.error(f"使用 python-xlib 激活窗口 {xid} 失败: {e}")
         return False
+    finally:
+        if disp:
+            disp.close()
 
 def create_feedback_dialog(parent_window, text, show_progress_bar=False, position=None):
     win = Gtk.Window(type=Gtk.WindowType.POPUP)
@@ -3488,6 +3523,7 @@ class CaptureOverlay(Gtk.Window):
     def on_realize(self, widget):
         try:
             self.window_xid = widget.get_window().get_xid()
+            activate_window_with_xlib(self.window_xid)
         except Exception as e:
             logging.error(f"获取 xid 失败: {e}")
 
@@ -3872,7 +3908,7 @@ def toggle_config_window():
         global config_window_instance
         # 如果窗口已存在且可见，则将其带到前台
         if config_window_instance:
-            activate_window_with_xdotool(config_window_instance.xid)
+            activate_window_with_xlib(config_window_instance.xid)
             return
         # 如果窗口不存在，则创建一个新的
         config_window_instance = ConfigWindow(config)
@@ -3900,19 +3936,13 @@ def setup_hotkey_listener(overlay):
         """检查截图覆盖层窗口当前是否拥有焦点"""
         if not overlay_widget.window_xid:
             return False
-        try:
-            result = subprocess.run(
-                ['xdotool', 'getactivewindow'],
-                capture_output=True, text=True, check=True, timeout=0.2
-            )
-            focused_xid = int(result.stdout.strip())
-            is_focused = (focused_xid == overlay_widget.window_xid)
-            if is_focused:
-                logging.debug(f"焦点检查: 成功，焦点在覆盖层窗口 (XID: {focused_xid})")
-            return is_focused
-        except (FileNotFoundError, subprocess.CalledProcessError, ValueError, subprocess.TimeoutExpired) as e:
-            logging.warning(f"检查窗口焦点失败: {e}。将假定覆盖层未获得焦点")
+        focused_xid = get_active_window_xid()
+        if focused_xid is None:
             return False
+        is_focused = (focused_xid == overlay_widget.window_xid)
+        if is_focused:
+            logging.info(f"焦点检查: 成功，焦点在覆盖层窗口 (XID: {focused_xid})")
+        return is_focused
 
     def activate_and_send(hotkey_config):
         def task():
@@ -3930,7 +3960,7 @@ def setup_hotkey_listener(overlay):
                 if not key_to_press:
                     logging.error(f"无法为 '{main_key_str}' 确定要模拟的 pynput 按键对象")
                     return
-                if not activate_window_with_xdotool(overlay.window_xid):
+                if not activate_window_with_xlib(overlay.window_xid):
                     return
                 time.sleep(0.05)
                 modifiers_to_press = []
@@ -3942,7 +3972,7 @@ def setup_hotkey_listener(overlay):
                 keyboard_controller.release(key_to_press)
                 for mod in reversed(modifiers_to_press): keyboard_controller.release(mod)
             except Exception as e:
-                logging.error(f"xdotool 执行 'activate and send key' 失败: {e}")
+                logging.error(f"执行 'activate and send key' 失败: {e}")
         threading.Thread(target=task, daemon=True).start()
 
     def create_hotkey_callback(action_func, requires_activation=False, hotkey_config=None):
@@ -4027,7 +4057,6 @@ def check_dependencies():
         'slop': '用于启动时选择截图区域的核心工具'
     }
     optional_deps = {
-        'xdotool': '用于在窗口无焦点时激活窗口',
         'paplay': '用于播放截图、撤销和完成时的音效',
         'xdg-open': '用于在截图完成后从通知中打开文件或目录',
         'xinput': '用于“隐形光标”滚动模式，提供无干扰的滚动体验'
@@ -4054,7 +4083,7 @@ def check_dependencies():
         logging.warning("\n建议安装以获得完整体验")
 
 def main():
-    parser = argparse.ArgumentParser(description="一个手动滚动截图并拼接的工具")
+    parser = argparse.ArgumentParser(description="一个辅助滚动截图并拼接的工具")
     parser.add_argument(
         '-c', '--config',
         type=Path,
