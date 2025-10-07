@@ -7,7 +7,6 @@ import shlex
 import shutil
 import re
 import subprocess
-import multiprocessing
 import logging
 import queue
 import threading
@@ -800,7 +799,7 @@ def _find_overlap_pyramid(img_top, img_bottom, max_overlap_search):
     if max_overlap_search < PYRAMID_CUTOFF_THRESHOLD:
         return _find_overlap_brute_force(img_top, img_bottom, 1, max_overlap_search)
     scale_factor = (2.0 / max_overlap_search)**0.5
-    scale_factor = max(0.04, min(scale_factor, 0.5))
+    scale_factor = max(0.08, min(scale_factor, 0.5))
     search_radius = max(3, int(0.8 / scale_factor))
     small_top = cv2.resize(img_top, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
     small_bottom = cv2.resize(img_bottom, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
@@ -927,6 +926,38 @@ def activate_window_with_xdotool(xid):
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         logging.error(f"使用 xdotool 激活窗口 {xid} 失败: {e}")
         return False
+
+def create_feedback_dialog(parent_window, text, show_progress_bar=False, position=None):
+    win = Gtk.Window(type=Gtk.WindowType.POPUP)
+    win.set_transient_for(parent_window)
+    win.set_modal(True)
+    win.set_decorated(False)
+    main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=config.PROCESSING_DIALOG_SPACING // 2)
+    main_vbox.get_style_context().add_class("background")
+    css_provider = Gtk.CssProvider()
+    css = config.PROCESSING_DIALOG_CSS
+    css_provider.load_from_data(css.encode('utf-8'))
+    main_vbox.get_style_context().add_provider(css_provider, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+    win.add(main_vbox)
+    top_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=config.PROCESSING_DIALOG_SPACING)
+    spinner = Gtk.Spinner()
+    spinner.start()
+    label = Gtk.Label(label=text)
+    top_hbox.pack_start(spinner, True, True, 0)
+    top_hbox.pack_start(label, True, True, 0)
+    main_vbox.set_border_width(config.PROCESSING_DIALOG_BORDER_WIDTH)
+    main_vbox.pack_start(top_hbox, True, True, 0)
+    progress_bar = None
+    if show_progress_bar:
+        progress_bar = Gtk.ProgressBar()
+        progress_bar.set_fraction(0.0)
+        main_vbox.pack_start(progress_bar, True, True, 5)
+    win.set_default_size(config.PROCESSING_DIALOG_WIDTH, config.PROCESSING_DIALOG_HEIGHT)
+    if position:
+        win.move(position[0], position[1])
+    else:
+        win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+    return win, progress_bar
 
 class CaptureSession:
     """管理一次滚动截图会话的数据和状态"""
@@ -1108,7 +1139,7 @@ class GridModeController:
             logging.info(f"高度已自动对齐到 {snapped_h}px")
 
     def start_calibration(self):
-        """启动交互式配置流程"""
+        """启动自动滚动单位校准流程"""
         if self.is_active:
             send_desktop_notification("操作无效", "请先按 Shift 键退出整格模式再进行配置")
             return
@@ -1116,17 +1147,131 @@ class GridModeController:
         if not app_class:
             send_desktop_notification("配置失败", "无法检测到底层应用程序")
             return
-        logging.info(f"为应用 '{app_class}' 启动交互式配置...")
-        num_ticks = self.view.show_scroll_config_dialog()
-        if num_ticks > 0:
-            region_height = self.session.geometry['h']
-            pixels_per_tick = region_height / num_ticks
-            rounded_unit = round(pixels_per_tick)
-            logging.info(f"计算结果: 区域高度={region_height}px, 格数={num_ticks}, 每格像素≈{pixels_per_tick:.2f}, 取整为 {rounded_unit}px")
-            if config.save_scroll_unit(app_class, rounded_unit):
-                send_desktop_notification("配置成功", f"已为 '{app_class}' 保存滚动单位: {rounded_unit}px")
+        logging.info(f"为应用 '{app_class}' 启动自动校准...")
+        screen_rect = self.view.screen_rect
+        dialog_w = config.PROCESSING_DIALOG_WIDTH
+        dialog_h = config.PROCESSING_DIALOG_HEIGHT
+        padding = 20
+        dialog_y = screen_rect.y + padding
+        dialog_x = screen_rect.x + padding
+        dialog_text = f"正在为 {app_class} 自动校准...\n请勿操作"
+        dialog, _ = create_feedback_dialog(
+            parent_window=self.view,
+            text=dialog_text,
+            show_progress_bar=False,
+            position=(dialog_x, dialog_y)
+        )
+        self.calibration_state = {
+            "app_class": app_class,
+            "step": 0,
+            "num_samples": 4,
+            "measured_units": [],
+            "dialog": dialog
+        }
+        self.calibration_state["dialog"].show_all()
+        GLib.idle_add(self._run_calibration_step)
+
+    def _run_calibration_step(self):
+        state = self.calibration_state
+        step = state["step"]
+        h = self.session.geometry['h']
+        w = self.session.geometry['w']
+        win_x, win_y = self.view.get_position()
+        shot_x = win_x + self.view.left_panel_w + config.BORDER_WIDTH
+        shot_y = win_y + config.BORDER_WIDTH
+        ticks_to_scroll = max(1, int(h / 150))
+        if step == 0:
+            logging.info(f"校准参数: 截图区高度={h}px, 每次滚动格数={ticks_to_scroll}, 采样次数={state['num_samples']}")
+            state['ticks_to_scroll'] = ticks_to_scroll
+            state["filepath_before"] = config.TMP_DIR / "cal_before.png"
+            if not capture_area(shot_x, shot_y, w, h, state["filepath_before"]):
+                self._finalize_calibration(success=False)
+                return False
+            self.view.controller.scroll_manager.scroll_discrete(-ticks_to_scroll)
+            state["step"] += 1
+            GLib.timeout_add(400, self._run_calibration_step)
+            return False
+        if 0 < step <= state["num_samples"]:
+            filepath_after = config.TMP_DIR / "cal_after.png"
+            if not capture_area(shot_x, shot_y, w, h, filepath_after):
+                logging.warning(f"第 {step} 次采样截图失败，跳过")
             else:
-                send_desktop_notification("配置失败", "写入配置文件时发生错误，请查看日志")
+                img_top = cv2.imread(str(state["filepath_before"]))
+                img_bottom = cv2.imread(str(filepath_after))
+                if img_top is not None and img_bottom is not None:
+                    found_overlap, score = _find_overlap_pyramid(img_top, img_bottom, h - ticks_to_scroll*30)
+                    if score > 0.95:
+                        scroll_dist_px = h - found_overlap
+                        unit = scroll_dist_px / state['ticks_to_scroll']
+                        MIN_SCROLL_PER_TICK = 30
+                        if unit < MIN_SCROLL_PER_TICK:
+                            logging.warning(f"检测到滚动距离过小({unit:.2f}px/格)，已到达页面末端。提前中止采样")
+                            self._finalize_calibration(success=True)
+                            return False
+                        state["measured_units"].append(unit)
+                        logging.info(f"采样 {step}: 成功，单位距离 ≈ {unit:.2f}px/格，相似度 {score:.3f}")
+                    else:
+                        logging.warning(f"采样 {step}: 匹配失败（相似度 {score:.3f}）")
+            if os.path.exists(state["filepath_before"]):
+                os.remove(state["filepath_before"])
+            if os.path.exists(filepath_after):
+                os.rename(filepath_after, state["filepath_before"])
+            if step < state["num_samples"]:
+                self.view.controller.scroll_manager.scroll_discrete(-state['ticks_to_scroll'])
+                state["step"] += 1
+                GLib.timeout_add(400, self._run_calibration_step)
+            else:
+                self._finalize_calibration(success=True)
+            return False
+    
+    def _finalize_calibration(self, success):
+        """分析数据、通过聚类剔除离群值、保存结果并清理"""
+        state = self.calibration_state
+        state["dialog"].destroy()
+        if os.path.exists(state.get("filepath_before", "")):
+            os.remove(state["filepath_before"])
+        MIN_VALID_SAMPLES = 2
+        if not success or not state["measured_units"] or len(state["measured_units"]) < MIN_VALID_SAMPLES:
+            msg = f"为 '{state['app_class']}' 校准失败\n有效采样数据不足，请在内容更丰富的区域操作或确保界面有足够的滚动空间"
+            send_desktop_notification("配置失败", msg)
+            logging.error(msg.replace('\n', ' '))
+            return
+        units = sorted(state["measured_units"])
+        logging.info(f"开始聚类分析，原始数据: {units}")
+        if not units:
+            self._finalize_calibration(success=False)
+            return
+        TOLERANCE = 5
+        clusters = []
+        for unit in units:
+            placed = False
+            for cluster in clusters:
+                if abs(unit - np.mean(cluster)) < TOLERANCE:
+                    cluster.append(unit)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([unit])
+        if not clusters:
+            self._finalize_calibration(success=False)
+            return
+        largest_cluster = max(clusters, key=len)
+        logging.info(f"聚类结果: {clusters}。选择的最大集群: {largest_cluster}")
+        if len(largest_cluster) < MIN_VALID_SAMPLES:
+            msg = f"为 '{state['app_class']}' 校准失败。\n采样数据一致性过差，无法找到共识值"
+            send_desktop_notification("配置失败", msg)
+            logging.error(msg.replace('\n', ' '))
+            return
+        final_avg_unit = round(np.mean(largest_cluster))
+        final_std_dev = np.std(largest_cluster)
+        matching_enabled = final_std_dev >= 0.05
+        logging.info(f"最终分析: 平均单位={final_avg_unit}, 标准差={final_std_dev:.3f}, 决策:开启误差修正={matching_enabled}")
+        if config.save_scroll_unit(state["app_class"], final_avg_unit, matching_enabled):
+            status_str = "启用" if matching_enabled else "禁用"
+            msg = f"已为 '{state['app_class']}' 保存滚动单位: {final_avg_unit}px\n误差修正已<b>{status_str}</b>"
+            send_desktop_notification("配置成功", msg)
+        else:
+            send_desktop_notification("配置失败", "写入配置文件时发生错误")
 
 class ScrollManager:
     def __init__(self, config: Config, session: CaptureSession, view: 'CaptureOverlay'):
@@ -3493,41 +3638,17 @@ class CaptureOverlay(Gtk.Window):
         return False
 
     def _create_processing_window(self):
-        """创建一个显示“正在处理”且带有进度条的模态窗口"""
-        win = Gtk.Window(type=Gtk.WindowType.POPUP)
-        win.set_transient_for(self)
-        win.set_modal(True)
-        win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
-        win.set_decorated(False)
-        win.set_default_size(config.PROCESSING_DIALOG_WIDTH, config.PROCESSING_DIALOG_HEIGHT)
-        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=config.PROCESSING_DIALOG_SPACING // 2)
-        main_vbox.get_style_context().add_class("background")
-        css_provider = Gtk.CssProvider()
-        css = config.PROCESSING_DIALOG_CSS
-        css_provider.load_from_data(css.encode('utf-8'))
-        main_vbox.get_style_context().add_provider(css_provider, Gtk.STYLE_PROVIDER_PRIORITY_USER)
-        win.add(main_vbox)
-        top_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=config.PROCESSING_DIALOG_SPACING)
-        spinner = Gtk.Spinner()
-        spinner.start()
-        label = Gtk.Label(label=config.STR_PROCESSING_TEXT)
-        top_hbox.pack_start(spinner, True, True, 0)
-        top_hbox.pack_start(label, True, True, 0)
-        progress_bar = Gtk.ProgressBar()
-        progress_bar.set_fraction(0.0)
-        main_vbox.set_border_width(config.PROCESSING_DIALOG_BORDER_WIDTH)
-        main_vbox.pack_start(top_hbox, True, True, 0)
-        main_vbox.pack_start(progress_bar, True, True, 5)
+        win, progress_bar = create_feedback_dialog(
+            parent_window=self,
+            text=config.STR_PROCESSING_TEXT,
+            show_progress_bar=True
+        )
         win_x, win_y = self.get_position()
-        # 计算捕获区域的中心点
         capture_center_x = win_x + self.left_panel_w + config.BORDER_WIDTH + self.session.geometry['w'] // 2
         capture_center_y = win_y + config.BORDER_WIDTH + self.session.geometry['h'] // 2
-        # 将处理窗口居中显示在捕获区域
-        processing_win_w = config.PROCESSING_DIALOG_WIDTH
+        processing_win_w, _ = win.get_size()
         processing_win_h = config.PROCESSING_DIALOG_HEIGHT
-        processing_x = capture_center_x - processing_win_w // 2
-        processing_y = capture_center_y - processing_win_h // 2
-        win.move(processing_x, processing_y)
+        win.move(capture_center_x - processing_win_w // 2, capture_center_y - processing_win_h // 2)
         win.show_all()
         return win, progress_bar
 
