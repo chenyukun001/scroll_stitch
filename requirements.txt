@@ -1,7 +1,6 @@
 Pillow>=3.0.0
-python-xlib>=0.17
+python-xlib>=0.16
 evdev>=0.6.0
-pynput>=1.6.0
 numpy>=1.14.5
 opencv-python>=3.4.2.17
 pycairo>=1.13.1

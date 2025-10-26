@@ -14,16 +14,8 @@
 - [快速开始](#快速开始)
 - [限制](#限制)
 - [安装](#安装)
-    - [`python` 依赖](#python-依赖)
-        - [`Ubuntu/Debian` `python` 依赖安装](#ubuntudebian-python-依赖安装)
-        - [`Fedora` `python` 依赖安装](#fedora-python-依赖安装)
-        - [`Arch Linux` `python` 依赖安装](#arch-linux-python-依赖安装)
-        - [`openSUSE` `python` 依赖安装](#opensuse-python-依赖安装)
+    - [python 依赖](#python-依赖)
     - [外部依赖](#外部依赖)
-        - [`Ubuntu/Debian` 外部依赖安装](#ubuntudebian-外部依赖安装)
-        - [`Fedora` 外部依赖安装](#fedora-外部依赖安装)
-        - [`Arch Linux` 外部依赖安装](#arch-linux-外部依赖安装)
-        - [`openSUSE` 外部依赖安装](#opensuse-外部依赖安装)
     - [权限要求](#权限要求)
     - [运行程序](#运行程序)
     - [设置快捷键](#设置快捷键)
@@ -123,12 +115,12 @@
 	  ![配置滚动单位](assets/配置滚动单位.png)
 	  
 	  配置前，请确保界面内容丰富且有足够的滚动空间，配置时，程序会自动滚动界面，请不要移动鼠标
-	* 打开/激活配置窗口：`g`  
+	* 激活/隐藏配置窗口：`g`  
 	  
-	  若配置窗口不存在则创建配置窗口，若已存在则将配置窗口激活
+	  若配置窗口未获得焦点则激活配置窗口（不存在则创建），若配置窗口有焦点则隐藏配置窗口
 	* `f4`: 启用/禁用全局热键  
 	  
-	  程序开始时全局热键默认启用，禁用全局热键不包括其本身和打开/激活配置窗口（当主窗口本身拥有焦点时，所有快捷键还是会生效）。
+	  程序开始时全局热键默认启用，禁用全局热键不包括其本身（当主窗口本身拥有焦点时，所有快捷键还是会生效）。
 
 ### 配置介绍
 
@@ -168,9 +160,8 @@ echo $XDG_SESSION_TYPE
 
 ```txt
 Pillow>=3.0.0
-python-xlib>=0.17
+python-xlib>=0.16
 evdev>=0.6.0
-pynput>=1.6.0
 numpy>=1.14.5
 opencv-python>=3.4.2.17
 pycairo>=1.13.1
@@ -196,12 +187,6 @@ sudo apt update
 
 ```shell
 sudo apt install python3 python3-pip
-```
-
-可选：
-
-```shell
-pip install --upgrade pip
 ```
 
 **方法一：使用 Python 虚拟环境**
@@ -236,10 +221,16 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
+可选：
+
+```shell
+pip install --upgrade pip
+```
+
 最后在虚拟环境中安装 `python` 包：
 
 ```shell
-pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
+pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
 ```
 
 安装完成后可以在终端输入
@@ -259,7 +250,7 @@ sudo apt install libgirepository1.0-dev
 并保证 `PyGObject>=3.31.2,<3.51`
 
 ```shell
-pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
+pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
 ```
 
 ---
@@ -269,7 +260,7 @@ pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' '
 安装命令：
 
 ```shell
-sudo apt install python3-pil python3-xlib python3-evdev python3-pynput python3-numpy python3-opencv python3-gi python3-gi-cairo libgtk-3-dev gir1.2-notify-0.7
+sudo apt install python3-pil python3-xlib python3-evdev python3-numpy python3-opencv python3-gi python3-gi-cairo libgtk-3-dev gir1.2-notify-0.7
 ```
 
 </details>
@@ -285,13 +276,7 @@ sudo apt install python3-pil python3-xlib python3-evdev python3-pynput python3-n
 sudo dnf install python3 python3-pip
 ```
 
-可选：
-
-```shell
-pip install --upgrade pip
-```
-
-**方法一：使用 Python 虚拟环境（推荐）**
+**方法一：使用 Python 虚拟环境**
 
 先安装系统依赖：
 
@@ -311,10 +296,16 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
+可选：
+
+```shell
+pip install --upgrade pip
+```
+
 最后在虚拟环境中安装 `python` 包：
 
 ```shell
-pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
+pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
 ```
 
 安装完成后可以在终端输入
@@ -334,7 +325,7 @@ sudo dnf install gobject-introspection-devel
 然后安装 `python` 包命令改为：
 
 ```shell
-pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
+pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
 ```
 
 ---
@@ -345,12 +336,6 @@ pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' '
 
 ```shell
 sudo dnf install python3-xlib python3-pillow python3-evdev python3-numpy python3-opencv gtk3 python3-gobject
-```
-
-由于 `pynput` 无官方包，仍然需要通过 `pip` 安装（故推荐使用方法一）：
-
-```shell
-pip install 'pynput>=1.6.0'
 ```
 
 </details>
@@ -370,12 +355,6 @@ sudo pacman -Syu --needed
 
 ```shell
 sudo pacman -S --needed python python-pip
-```
-
-可选：
-
-```shell
-pip install --upgrade pip
 ```
 
 **方法一：使用 Python 虚拟环境**
@@ -398,10 +377,16 @@ python3 -m venv .venv
 source .venv/bin/activate
 ```
 
+可选：
+
+```shell
+pip install --upgrade pip
+```
+
 最后在虚拟环境中安装 `python` 包：
 
 ```shell
-pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
+pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
 ```
 
 安装完成后可以在终端输入
@@ -422,20 +407,6 @@ deactivate
 sudo pacman -S --needed python-xlib python-pillow python-evdev python-numpy python-opencv python-gobject python-cairo gtk3 libnotify
 ```
 
-由于 `pynput` 无官方包，需要从 AUR 中安装：
-
-如果没有安装 AUR 助手，先安装（以 `paru` 为例，如果用 `yay`，请将下面命令中的 `paru` 改为 `yay`）：
-
-```shell
-sudo pacman -S --needed git base-devel && git clone https://aur.archlinux.org/paru.git && cd paru && makepkg -si
-```
-
-然后用 AUR 助手安装 `pynput`：
-
-```shell
-paru -S python-pynput
-```
-
 </details>
 
 #### `openSUSE` `python` 依赖安装
@@ -451,12 +422,6 @@ paru -S python-pynput
 sudo zypper install --no-recommends python313 python313-pip
 ```
 
-可选：
-
-```shell
-python3.13 -m pip install --upgrade pip
-```
-
 **方法一：使用 Python 虚拟环境**
 
 安装系统依赖：
@@ -464,6 +429,23 @@ python3.13 -m pip install --upgrade pip
 ```shell
 sudo zypper install --no-recommends python313-devel gcc cairo-devel typelib-1_0-Gtk-3_0 libnotify-devel Mesa-libGL1
 ```
+
+> [!NOTE]
+> 
+> 在安装 `cairo-devel` 或 `libnotify-devel` 的过程中会因为依赖而安装系统默认的 `python` 版本，并且在 `/usr/bin/` 下创建 `python3` 的链接（如果原来有则会被覆盖）
+> 
+> 如果不想这样的话，可以删除这个链接：
+> 
+> ```shell
+> sudo rm /usr/bin/python3
+> ```
+> 
+> 或者将这个链接指向 `python3.1x`（以 `python3.12` 举例）：
+> 
+> ```shell
+> sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 100
+> ```
+
 
 没有虚拟环境的话，需要创建一个（以 .venv 为例）：
 
@@ -477,10 +459,16 @@ python3.13 -m venv .venv
 source .venv/bin/activate
 ```
 
+可选：
+
+```shell
+python3.13 -m pip install --upgrade pip
+```
+
 最后在虚拟环境中安装 `python` 包：
 
 ```shell
-python3.13 -m pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
+python3.13 -m pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
 ```
 
 安装完成后可以在终端输入
@@ -500,7 +488,7 @@ sudo zypper install --no-recommends gobject-introspection-devel
 然后安装 `python` 包命令改为：
 
 ```shell
-python3.13 -m pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
+python3.13 -m pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
 ```
 
 ---
@@ -510,7 +498,7 @@ python3.13 -m pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'py
 `python31x-numpy1` 是指 `numpy` 版本 1.x，`python31x-numpy` 是指 `numpy` 版本 2.x（但是官方仓库里 `python313` 只有 `numpy`，没有 `numpy1`），可以根据 numpy 版本需要安装
 
 ```shell
-sudo zypper install --no-recommends python313-python-xlib python313-Pillow python313-evdev python313-pynput python313-numpy python313-opencv python313-gobject python313-pycairo typelib-1_0-Gtk-3_0 libnotify-devel
+sudo zypper install --no-recommends python313-python-xlib python313-Pillow python313-evdev python313-numpy python313-opencv python313-gobject python313-pycairo typelib-1_0-Gtk-3_0 libnotify-devel
 ```
 
 </details>
@@ -518,7 +506,7 @@ sudo zypper install --no-recommends python313-python-xlib python313-Pillow pytho
 <details>
 <summary>Leap 安装命令</summary>
 
-由于 Leap 官方仓库中没有 `pynput` 包，故通过虚拟环境安装
+**方法一：使用 Python 虚拟环境**
 
 （这里的安装命令用 `python312` 举例，如果需要安装别的 `python` 版本的则更换安装命令中的 `python` 版本号）  
 
@@ -534,8 +522,6 @@ sudo zypper install --no-recommends python312 python312-pip
 python3.12 -m pip install --upgrade pip
 ```
 
-**使用 Python 虚拟环境**
-
 安装系统依赖：
 
 ```shell
@@ -544,7 +530,7 @@ sudo zypper install --no-recommends python312-devel gcc cairo-devel typelib-1_0-
 
 > [!NOTE]
 > 
-> 在安装 `cairo-devel` 或 `libnotify-devel` 的过程中会因为依赖而安装 `python3.6`，并且在 `/usr/bin/` 下面创建 `python3` 指向 `python3.6` 的链接
+> 在安装 `cairo-devel` 或 `libnotify-devel` 的过程中会因为依赖而安装系统默认的 `python` 版本（Leap 15.x 系列默认版本为 `python3.6`），并且在 `/usr/bin/` 下创建 `python3` 的链接（如果原来有则会被覆盖）
 > 
 > 如果不想这样的话，可以删除这个链接：
 > 
@@ -570,10 +556,16 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 ```
 
+可选：
+
+```shell
+python3.12 -m pip install --upgrade pip
+```
+
 最后在虚拟环境中安装 `python` 包：
 
 ```shell
-python3.12 -m pip install 'Pillow>=3.0.0' 'python-xlib>=0.17' 'evdev>=0.6.0' 'pynput>=1.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
+python3.12 -m pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
 ```
 
 安装完成后可以在终端输入
@@ -584,13 +576,29 @@ deactivate
 
 退出虚拟环境，启动脚本会自动处理激活
 
+---
+
+**方法二：使用系统包管理器安装**
+
+如果没有 `python` 的话，先安装 `python`：
+
+```shell
+sudo zypper install --no-recommends python3 python3-pip
+```
+
+Leap 15.4 以下 `python3-pycairo` 在仓库里叫 `python3-cairo`，但是不影响实际安装
+
+```shell
+sudo zypper install --no-recommends python3-python-xlib python3-Pillow python3-evdev python3-numpy python3-opencv python3-gobject python3-pycairo typelib-1_0-Gtk-3_0 libnotify-devel
+```
+
 </details>
 
 ### 外部依赖
 
 程序的外部依赖有 `slop`、`xdg-open`、`paplay` 、`xinput` ，可以先检查一下是否安装了这些命令行工具（`command -v` 后面跟命令行工具名字，有输出就是存在）。  
 
-`slop` 是核心依赖，必须安装，`xdg-open` 用来打开文件或目录，`paplay` 播放音效 ，`xinput` 启用隐形光标模式，可以根据需要安装。
+`slop` 是核心依赖，必须安装，`xdg-open` 用来打开文件或目录，`paplay` 播放音效（`sound-theme-freedesktop` 提供音效），`xinput` 启用隐形光标模式，可以根据需要安装。
 
 #### `Ubuntu/Debian` 外部依赖安装
 
@@ -738,21 +746,25 @@ python3 scroll_stitch.py -c ~/.config/scroll_stitch/config.ini
 
 ## 常见问题
 
-1. 拖动主窗口左边框到屏幕左边缘后向右拖拽时左边框可能会卡住不动，继续向右拖拽可能导致窗口位置向右大幅度跳跃  
+- 拖动主窗口左边框到屏幕左边缘后向右拖拽时左边框可能会卡住不动，继续向右拖拽可能导致窗口位置向右大幅度跳跃  
    
    向右缓慢拖动可缓解问题，或者干脆不启用滑块条
-2. 连续快速切换整格模式和自由模式时，边框颜色可能没有切换
-3. 如果误差范围内图片特征元素较少，可能导致部分内容（如纯色区域等）被压缩
-4. 如果图片非常大的话，点击通知后因为渲染时间过长导致等待超时了，可能不会打开图片，需要自行在保存目录中查看
-5. 主窗口始终都是在屏幕内的，在选择截图区域的时候若通过点击窗口来选取截图区域，窗口如果有部分在屏幕外，所以会不能截取屏外的这一部分窗口内容，同时主窗口位置也会有所偏差
-6. 如果用户在自由模式下“前进/后退”滚动的过程中移动了鼠标，可能导致移动距离很小，整格模式下的“前进/后退”基本不受影响
-7. 在部分应用中自由模式下“前进/后退”无效  
+- 切换整格模式和自由模式时，边框颜色可能没有切换（或者需要等一会）
+- 如果误差范围内图片特征元素较少，可能导致部分内容（如纯色区域等）被压缩
+- 配置窗口最小化的时候动画有重影
+- 快捷键 `<super>` 加主键，第一次按可能无效
+   
+   按住 `<super>` 键，连按两次才能生效，不建议将快捷键设置为 `<super>` 加主键的形式
+- 如果图片非常大的话，点击通知后因为渲染时间过长导致等待超时了，可能不会打开图片，需要自行在保存目录中查看
+- 主窗口始终都是在屏幕内的，在选择截图区域的时候若通过点击窗口来选取截图区域，窗口如果有部分在屏幕外，所以会不能截取屏外的这一部分窗口内容，同时主窗口位置也会有所偏差
+- 如果用户在自由模式下“前进/后退”滚动的过程中移动了鼠标，可能导致移动距离很小，整格模式下的“前进/后退”基本不受影响
+- 在部分应用中自由模式下“前进/后退”无效  
    
    这是因为默认自由滚动步长较小，增大到合适的步长即可
-8. 隐形光标模式下程序退出时整个系统界面会卡顿较久  
+- 隐形光标模式下程序退出时整个系统界面会卡顿较久  
    
    这是因为在程序退出时会删除另一个鼠标主设备，可以使用默认的移动用户光标
-9. （以防万一）如果启用了隐形光标模式，并且程序中途崩溃退出，屏幕右下角留下一个光标  
+- （以防万一）如果启用了隐形光标模式，并且程序中途崩溃退出，屏幕右下角留下一个光标  
    
    重启之后会自然消失，也可以终端输入 
 
@@ -767,8 +779,8 @@ python3 scroll_stitch.py -c ~/.config/scroll_stitch/config.ini
    ```
 
    后面跟刚刚记下的 `id`，然后回车
-10. 如果很快地按快捷键很多下，可能会引发一些 bug
-11. 本项目为个人开发和维护，虽经测试，仍可能存在未发现的错误。
+- 如果很快地按快捷键很多下，可能会引发一些 bug
+- 本项目为个人开发和维护，虽经测试，仍可能存在未发现的错误。
 
 ## 贡献
 

@@ -18,20 +18,16 @@ import cv2
 import numpy as np
 import configparser
 import argparse
-# GTK3 与 Cairo 导入
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 gi.require_version('Notify', '0.7')
 from gi.repository import Gtk, Gdk, GLib, GObject, Notify, Pango, GdkPixbuf
 import cairo
-# Pynput 用于全局热键与鼠标控制
-from pynput import keyboard, mouse
-from Xlib import display, X, protocol
+from Xlib import display, X, protocol, XK
+from Xlib.ext import xtest
 # 全局实例
 hotkey_listener = None
-mouse_controller = mouse.Controller() # pynput 鼠标控制器
-keyboard_controller = keyboard.Controller() # pynput 键盘控制器
 config_window_instance = None
 are_hotkeys_enabled = True
 log_queue = None
@@ -53,35 +49,23 @@ class Config:
 
         if path_to_load:
             self.config_path = path_to_load
-            self.parser.read(self.config_path)
+            self.parser.read(self.config_path, encoding='utf-8')
         else:
             self.config_path = default_config_path
             self._create_default_config()
-            self.parser.read(self.config_path)
-        self._pynput_modifier_map = {
-            'ctrl': keyboard.Key.ctrl, 'control': keyboard.Key.ctrl,
-            'shift': keyboard.Key.shift,
-            'alt': keyboard.Key.alt,
-        }
+            self.parser.read(self.config_path, encoding='utf-8')
         self._gtk_modifier_map = {
             'ctrl': Gdk.ModifierType.CONTROL_MASK, 'control': Gdk.ModifierType.CONTROL_MASK,
             'shift': Gdk.ModifierType.SHIFT_MASK,
             'alt': Gdk.ModifierType.MOD1_MASK,
+            'super': Gdk.ModifierType.SUPER_MASK, 'win': Gdk.ModifierType.SUPER_MASK,
         }
         self.GTK_MODIFIER_MASK = (
             Gdk.ModifierType.CONTROL_MASK | 
             Gdk.ModifierType.SHIFT_MASK | 
-            Gdk.ModifierType.MOD1_MASK
+            Gdk.ModifierType.MOD1_MASK |
+            Gdk.ModifierType.SUPER_MASK
         )
-        self._key_map_pynput_special = {
-            'space': keyboard.Key.space, 'enter': keyboard.Key.enter,
-            'backspace': keyboard.Key.backspace, 'esc': keyboard.Key.esc,
-            'up': keyboard.Key.up, 'down': keyboard.Key.down,
-            'left': keyboard.Key.left, 'right': keyboard.Key.right,
-            'f1': keyboard.Key.f1, 'f2': keyboard.Key.f2, 'f3': keyboard.Key.f3, 'f4': keyboard.Key.f4,
-            'f5': keyboard.Key.f5, 'f6': keyboard.Key.f6, 'f7': keyboard.Key.f7, 'f8': keyboard.Key.f8,
-            'f9': keyboard.Key.f9, 'f10': keyboard.Key.f10, 'f11': keyboard.Key.f11, 'f12': keyboard.Key.f12,
-        }
         self._key_map_gtk_special = {
             'space': Gdk.KEY_space, 'enter': Gdk.KEY_Return,
             'backspace': Gdk.KEY_BackSpace, 'esc': Gdk.KEY_Escape,
@@ -95,12 +79,13 @@ class Config:
             'shift': (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R),
             'ctrl': (Gdk.KEY_Control_L, Gdk.KEY_Control_R), 'control': (Gdk.KEY_Control_L, Gdk.KEY_Control_R),
             'alt': (Gdk.KEY_Alt_L, Gdk.KEY_Alt_R),
+            'super': (Gdk.KEY_Super_L, Gdk.KEY_Super_R), 'win': (Gdk.KEY_Super_L, Gdk.KEY_Super_R),
         }
         self._load_settings()
 
     def _parse_hotkey_string(self, hotkey_str: str):
         if not hotkey_str:
-            return {'pynput_str': '', 'gtk_keys': tuple(), 'gtk_mask': 0, 'main_key_str': None}
+            return {'gtk_keys': tuple(), 'gtk_mask': 0, 'main_key_str': None}
         original_str = hotkey_str
         parts = [p.strip() for p in hotkey_str.lower().split('+') if p.strip()]
         clean_parts = [p.replace('<', '').replace('>', '') for p in parts]
@@ -131,16 +116,7 @@ class Config:
                     gtk_keys_tuple = (gtk_key_val,)
             elif not gtk_mask:
                  logging.error(f"快捷键 '{original_str}' 无效")
-        pynput_str_parts = []
-        for part in clean_parts:
-            key_name = part
-            if key_name in self._pynput_modifier_map or key_name in self._key_map_pynput_special:
-                pynput_str_parts.append(f"<{key_name}>")
-            else:
-                pynput_str_parts.append(key_name)
-        pynput_str = "+".join(pynput_str_parts)
         return {
-            'pynput_str': pynput_str,
             'gtk_keys': gtk_keys_tuple,
             'gtk_mask': gtk_mask,
             'main_key_str': main_key_str
@@ -362,7 +338,7 @@ dialog_cancel = esc
 
     def _create_default_config(self):
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.config_path, 'w') as f:
+        with open(self.config_path, 'w', encoding='utf-8') as f:
             f.write(Config.get_default_config_string())
         logging.info(f"已在 {self.config_path} 目录下创建默认配置文件")
 
@@ -386,7 +362,7 @@ dialog_cancel = esc
                 self.parser.add_section('ApplicationScrollUnits')
             value_to_save = f"{unit_value},{str(matching_enabled).lower()}"
             self.parser.set('ApplicationScrollUnits', app_class, value_to_save)
-            with open(self.config_path, 'w') as configfile:
+            with open(self.config_path, 'w', encoding='utf-8') as configfile:
                 self.parser.write(configfile)
             logging.info(f"成功将配置 '{app_class} = {value_to_save}' 写入 {self.config_path}")
             return True
@@ -399,7 +375,7 @@ dialog_cancel = esc
             if not self.parser.has_section(section):
                 self.parser.add_section(section)
             self.parser.set(section, key, str(value))
-            with open(self.config_path, 'w') as configfile:
+            with open(self.config_path, 'w', encoding='utf-8') as configfile:
                 self.parser.write(configfile)
             logging.info(f"成功将配置 '{key} = {value}' 写入 [{section}]")
             return True
@@ -712,10 +688,10 @@ def send_desktop_notification(title, message, sound_name=None, level="normal", a
             if target_path and action_label:
                 # 添加动作按钮
                 notification.add_action(
-                    "open_action",       # 动作的唯一 ID
-                    action_label,        # 按钮上显示的文本
-                    on_action_clicked,   # 回调函数
-                    target_path          # 传递给回调函数的数据
+                    "open_action",
+                    action_label,
+                    on_action_clicked,
+                    target_path
                 )
                 notification.add_action(
                     "default",
@@ -749,7 +725,7 @@ def select_area():
         color_str = ",".join(map(str, config.BORDER_COLOR))
         logging.info(f"正在使用配置调用 slop: border={border_width_str}, color={color_str}")
         cmd = ["slop", "-b", border_width_str, "-c", color_str ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True)
         geometry = result.stdout.strip()
         return geometry if geometry else None
     except FileNotFoundError:
@@ -920,7 +896,7 @@ def get_active_window_xid():
         prop = root.get_full_property(active_window_atom, X.AnyPropertyType)
         if prop and prop.value:
             active_xid = prop.value[0]
-            logging.debug(f"通过 python-xlib 获取到活动窗口 XID: {active_xid}")
+            logging.info(f"通过 python-xlib 获取到活动窗口 XID: {active_xid}")
             return active_xid
         else:
             logging.warning("无法通过 _NET_ACTIVE_WINDOW 获取活动窗口")
@@ -935,7 +911,6 @@ def get_active_window_xid():
 def activate_window_with_xlib(xid):
     if not xid:
         logging.warning("无法激活窗口：XID 不可用")
-        return False
     disp = None
     try:
         disp = display.Display()
@@ -943,7 +918,6 @@ def activate_window_with_xlib(xid):
         window_obj = disp.create_resource_object('window', xid)
         if not window_obj:
             logging.error(f"无法为 XID {xid} 创建资源对象，窗口可能不存在。")
-            return False
         active_window_atom = disp.intern_atom('_NET_ACTIVE_WINDOW')
         event = protocol.event.ClientMessage(
             window=window_obj,
@@ -954,13 +928,12 @@ def activate_window_with_xlib(xid):
         root.send_event(event, event_mask=mask)
         disp.sync()
         logging.info(f"已通过 python-xlib 成功请求激活窗口 XID {xid}")
-        return True
     except Exception as e:
         logging.error(f"使用 python-xlib 激活窗口 {xid} 失败: {e}")
-        return False
     finally:
         if disp:
             disp.close()
+    return False
 
 def create_feedback_dialog(parent_window, text, show_progress_bar=False, position=None):
     win = Gtk.Window(type=Gtk.WindowType.POPUP)
@@ -1314,16 +1287,39 @@ class ScrollManager:
         self.session = session
         self.view = view
         self.is_fine_scrolling = False
+        self.gdk_display = Gdk.Display.get_default()
+        self.gdk_seat = self.gdk_display.get_default_seat()
+        self.gdk_pointer = self.gdk_seat.get_pointer()
+        self.gdk_screen = self.gdk_display.get_default_screen()
+
+    def _get_pointer_position(self):
+        """使用 GDK 获取当前鼠标指针位置"""
+        try:
+            _, x, y = self.gdk_pointer.get_position()
+            return (x, y)
+        except Exception as e:
+            logging.error(f"GDK 获取鼠标位置失败: {e}")
+            return (0, 0)
+
+    def _set_pointer_position(self, x, y):
+        """使用 GDK 设置鼠标指针位置"""
+        try:
+            self.gdk_pointer.warp(self.gdk_screen, x, y)
+            self.gdk_display.flush()
+            time.sleep(0.01)
+        except Exception as e:
+            logging.error(f"GDK warp 失败: {e}")
 
     def scroll_smooth(self, scroll_distance):
         win_x, win_y = self.view.get_position()
         _, win_h = self.view.get_size()
         center_x = win_x + self.view.left_panel_w + self.config.BORDER_WIDTH + self.session.geometry['w'] / 2
         center_y = win_y + self.config.BORDER_WIDTH + (win_h - 2 * self.config.BORDER_WIDTH) / 2
+        center_x_int, center_y_int = int(center_x), int(center_y)
         if self.config.SCROLL_METHOD == 'invisible_cursor' and self.view.invisible_scroller.is_ready:
             scroller = self.view.invisible_scroller
             try:
-                scroller.move(int(center_x), int(center_y))
+                scroller.move(center_x_int, center_y_int)
                 time.sleep(0.05)
                 logging.info(f"触发高级滚动，距离: {scroll_distance}")
                 scroller.scroll(scroll_distance)
@@ -1334,14 +1330,15 @@ class ScrollManager:
                 scroller.park()
         elif self.view.touchpad_controller:
             logging.info("使用'移动用户光标'模式执行滚动...")
-            origin_pos = mouse_controller.position
-            scroll_exec_pos = (int(center_x), int(center_y))
+            origin_pos = self._get_pointer_position()
+            scroll_exec_pos = (center_x_int, center_y_int)
             time.sleep(0.08)
-            mouse_controller.position = scroll_exec_pos
+            self._set_pointer_position(*scroll_exec_pos)
             time.sleep(0.05) # 等待鼠标位置生效
             logging.info(f"触发高级滚动，距离: {scroll_distance}")
             self.view.touchpad_controller.scroll(scroll_distance)
-            current_pos_after_scroll = mouse_controller.position
+            time.sleep(0.1)
+            current_pos_after_scroll = self._get_pointer_position()
             tolerance = self.config.MOUSE_MOVE_TOLERANCE 
             user_intervened = (
                 abs(current_pos_after_scroll[0] - scroll_exec_pos[0]) > tolerance or
@@ -1349,7 +1346,7 @@ class ScrollManager:
             )
             if not user_intervened:
                 logging.info("用户未移动鼠标，恢复原始鼠标位置")
-                mouse_controller.position = origin_pos
+                self._set_pointer_position(*origin_pos)
             else:
                 logging.info("检测到用户在滚动期间手动移动鼠标，放弃恢复原始鼠标位置")
 
@@ -1373,12 +1370,30 @@ class ScrollManager:
                 scroller.park()
         else:
             logging.info(f"使用用户光标执行离散滚动: {ticks} 格")
-            original_pos = mouse_controller.position
-            mouse_controller.position = (center_x, center_y)
+            original_pos = self._get_pointer_position()
+            self._set_pointer_position(center_x, center_y)
             time.sleep(0.05)
-            mouse_controller.scroll(0, ticks)
+            try:
+                disp = display.Display()
+                button_code = 4 if ticks > 0 else 5
+                num_clicks = abs(ticks)
+                for i in range(num_clicks):
+                    xtest.fake_input(disp, X.ButtonPress, button_code)
+                    disp.sync()
+                    time.sleep(0.005)
+                    xtest.fake_input(disp, X.ButtonRelease, button_code)
+                    disp.sync()
+                    if i < num_clicks - 1:
+                         time.sleep(0.015)
+                logging.debug("XTest: Scroll simulation finished.")
+                disp.close()
+            except Exception as e:
+                logging.error(f"使用 XTest 模拟滚动失败: {e}")
+                try: disp.close()
+                except: pass
             time.sleep(0.05)
-            mouse_controller.position = original_pos
+            current_pos_after_scroll = self._get_pointer_position()
+            self._set_pointer_position(*original_pos)
 
     def handle_slider_press(self, event):
         event_x_root, event_y_root = event.get_root_coords()
@@ -1428,22 +1443,6 @@ class ActionController:
         self.drag_start_y_root = 0
         self.scroll_manager = ScrollManager(self.config, self.session, self.view)
         self.grid_mode_controller = GridModeController(self.config, self.session, self.view)
-
-    def _do_scroll_by_region(self, num_ticks: int, direction_sign: int):
-        if num_ticks == 0:
-            return
-        original_pos = mouse_controller.position
-        win_x, win_y = self.view.get_position()
-        shot_x = win_x + self.view.left_panel_w + config.BORDER_WIDTH
-        shot_y = win_y + config.BORDER_WIDTH
-        center_x = int(shot_x + self.session.geometry['w'] / 2)
-        center_y = int(shot_y + self.session.geometry['h'] / 2)
-        mouse_controller.position = (center_x, center_y)
-        time.sleep(0.05)
-        logging.info(f"使用 pynput 滚动 {num_ticks} 格，方向: {direction_sign}")
-        mouse_controller.scroll(0, num_ticks * direction_sign)
-        time.sleep(0.05)
-        mouse_controller.position = original_pos
 
     def handle_movement_action(self, direction: str):
         """根据配置文件处理前进/后退动作 (滚动, 截图, 删除). """
@@ -1529,13 +1528,10 @@ class ActionController:
                 logging.info("截图操作完成，已释放指针抓取，恢复默认光标")
 
     def _hide_cursor_if_needed(self, x, y, w, h):
-        """
-        如果光标在截图区域内且配置为隐藏，则执行指针抓取来全局隐藏光标
-        返回抓取成功的 seat 对象，如果失败或无需操作则返回 None
-        """
+        """如果光标在截图区域内且配置为隐藏，则执行指针抓取来全局隐藏光标"""
         if config.CAPTURE_WITH_CURSOR:
             return None
-        mouse_pos = mouse_controller.position
+        mouse_pos = self.scroll_manager._get_pointer_position()
         mouse_is_inside = (x <= mouse_pos[0] < x + w) and (y <= mouse_pos[1] < y + h)
         if mouse_is_inside:
             logging.info("配置为隐藏鼠标，且检测到鼠标在截图区域内。执行指针抓取")
@@ -1700,8 +1696,9 @@ class ActionController:
             logging.info("InvisibleCursorScroller.cleanup() 正在后台线程中执行")
         global config_window_instance
         if config_window_instance:
-            logging.info("检测到配置窗口仍然打开，正在强制保存所有更改...")
-            config_window_instance._save_all_configs()
+            logging.info("检测到配置窗口仍然打开，正在销毁它...")
+            config_window_instance.destroy()
+            config_window_instance = None
         self.session.cleanup()
         Gtk.main_quit()
 
@@ -2051,6 +2048,7 @@ class ConfigWindow(Gtk.Window):
         self.connect("destroy", self._on_destroy)
         self.connect("realize", self._on_realize)
         self.connect("delete-event", self._on_delete_event)
+        self.connect("map-event", self._on_map_event)
         self.log_queue = log_queue
         self.log_text_buffer = None
         self.log_timer_id = None
@@ -2072,9 +2070,21 @@ class ConfigWindow(Gtk.Window):
         except Exception as e:
             logging.error(f"ConfigWindow: 获取 XID 失败: {e}")
 
+    def _on_map_event(self, widget, event):
+        logging.info("ConfigWindow map-event 触发，正在请求激活")
+        if self.xid:
+            GLib.idle_add(activate_window_with_xlib, self.xid)
+        else:
+            logging.warning("_on_map_event: self.xid 尚未设置，无法激活")
+        return False
+
     def _on_delete_event(self, widget, event):
         """窗口关闭时保存所有配置"""
         self._save_all_configs()
+        global hotkey_listener
+        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and are_hotkeys_enabled:
+            hotkey_listener.set_normal_keys_grabbed(True)
+            logging.info("配置窗口关闭，全局热键已恢复")
         return False
 
     def _on_destroy(self, widget):
@@ -2083,15 +2093,22 @@ class ConfigWindow(Gtk.Window):
             GLib.source_remove(self.log_timer_id)
             self.log_timer_id = None
             logging.info("配置窗口的日志更新定时器已成功移除")
+        self._save_all_configs()
 
     def _on_input_focus_in(self, widget, event):
         self.input_has_focus = True
         logging.info(f"输入控件 {type(widget).__name__} 获得焦点，全局热键暂停")
+        global hotkey_listener
+        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor):
+            hotkey_listener.set_normal_keys_grabbed(False)
         return False
 
     def _on_input_focus_out(self, widget, event):
         self.input_has_focus = False
         logging.info(f"输入控件 {type(widget).__name__} 失去焦点，全局热键恢复")
+        global hotkey_listener
+        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and not self.capturing_hotkey_button and are_hotkeys_enabled:
+            hotkey_listener.set_normal_keys_grabbed(True)
         return False
 
     def _connect_focus_handlers(self, widget):
@@ -2200,18 +2217,29 @@ class ConfigWindow(Gtk.Window):
             mods.append('<alt>')
         if state & Gdk.ModifierType.SHIFT_MASK:
             mods.append('<shift>')
+        if state & Gdk.ModifierType.SUPER_MASK:
+            mods.append('<super>')
         key_name_lower = Gdk.keyval_name(keyval).lower()
-        is_modifier_only_release = key_name_lower in ('shift_l', 'shift_r', 'control_l', 'control_r', 'alt_l', 'alt_r')
+        is_modifier_only_release = key_name_lower in (
+            'shift_l', 'shift_r', 'control_l', 'control_r', 'alt_l', 'alt_r', 'super_l', 'super_r'
+        )
         if is_modifier_only_release:
-             if 'shift' in key_name_lower and '<ctrl>' not in mods and '<alt>' not in mods: return '<shift>'
-             if 'control' in key_name_lower and '<shift>' not in mods and '<alt>' not in mods: return '<ctrl>'
-             if 'alt' in key_name_lower and '<shift>' not in mods and '<ctrl>' not in mods: return '<alt>'
+             if 'shift' in key_name_lower and '<ctrl>' not in mods and '<alt>' not in mods and '<super>' not in mods:
+                 return '<shift>'
+             if 'control' in key_name_lower and '<shift>' not in mods and '<alt>' not in mods and '<super>' not in mods:
+                 return '<ctrl>'
+             if 'alt' in key_name_lower and '<shift>' not in mods and '<ctrl>' not in mods and '<super>' not in mods:
+                 return '<alt>'
+             if 'super' in key_name_lower and '<shift>' not in mods and '<ctrl>' not in mods and '<alt>' not in mods:
+                 return '<super>'
         rev_map = {v: k for k, v in self.config._key_map_gtk_special.items()}
+        print(keyval)
         main_key_str = ""
         if keyval in rev_map:
             main_key_str = rev_map[keyval]
         else:
             codepoint = Gdk.keyval_to_unicode(keyval)
+            print(codepoint)
             if codepoint != 0:
                 char = chr(codepoint)
                 if char.isprintable():
@@ -2234,6 +2262,10 @@ class ConfigWindow(Gtk.Window):
         button.original_label = button.get_label()
         self.capturing_hotkey_button = button
         button.set_label("请按下快捷键…")
+        global hotkey_listener
+        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor):
+            hotkey_listener.set_normal_keys_grabbed(False)
+            logging.info("开始捕获快捷键，全局热键暂停")
 
     def _on_config_window_key_press(self, widget, event):
         if self.capturing_hotkey_button:
@@ -2246,6 +2278,15 @@ class ConfigWindow(Gtk.Window):
         hotkey_str = self._key_event_to_string(event)
         current_key = self.capturing_hotkey_button.get_name()
         original_label = self.capturing_hotkey_button.original_label
+        global hotkey_listener
+        if hotkey_str == "无效组合":
+            logging.warning(f"捕获到无效的按键释放 {event.keyval} (state={event.state})，取消本次捕获")
+            self.capturing_hotkey_button.set_label(original_label)
+            self.capturing_hotkey_button = None
+            if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and not self.input_has_focus and are_hotkeys_enabled:
+                hotkey_listener.set_normal_keys_grabbed(True)
+                logging.info("无效捕获，全局热键恢复")
+            return True
         dialog_scope = ['dialog_confirm', 'dialog_cancel']
         is_dialog_key = current_key in dialog_scope
         conflict_found = False
@@ -2277,6 +2318,9 @@ class ConfigWindow(Gtk.Window):
         else:
             self.capturing_hotkey_button.set_label(hotkey_str)
         self.capturing_hotkey_button = None
+        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and not self.input_has_focus and are_hotkeys_enabled:
+            hotkey_listener.set_normal_keys_grabbed(True)
+            logging.info("快捷键捕获结束，全局热键恢复")
         return True
 
     def _setup_ui(self):
@@ -2574,7 +2618,7 @@ class ConfigWindow(Gtk.Window):
             ("undo", "撤销"), ("cancel", "取消"),
             ("scroll_up", "后退"), ("scroll_down", "前进"),
             ("configure_scroll_unit", "配置滚动单位"), ("toggle_grid_mode", "切换整格模式"),
-            ("open_config_editor", "打开/激活配置窗口"), ("toggle_hotkeys_enabled", "启用/禁用全局热键"), ("dialog_confirm", "退出对话框确认"),
+            ("open_config_editor", "激活/隐藏配置窗口"), ("toggle_hotkeys_enabled", "启用/禁用全局热键"), ("dialog_confirm", "退出对话框确认"),
             ("dialog_cancel", "退出对话框取消")
         ]
         self.managed_settings.extend([('Hotkeys', key) for key, _ in self.hotkey_configs])
@@ -3523,7 +3567,7 @@ class CaptureOverlay(Gtk.Window):
     def on_realize(self, widget):
         try:
             self.window_xid = widget.get_window().get_xid()
-            activate_window_with_xlib(self.window_xid)
+            GLib.idle_add(activate_window_with_xlib, self.window_xid)
         except Exception as e:
             logging.error(f"获取 xid 失败: {e}")
 
@@ -3540,7 +3584,12 @@ class CaptureOverlay(Gtk.Window):
 
     def show_quit_confirmation_dialog(self):
         """显示退出确认对话框并返回用户的响应"""
+        GLib.idle_add(activate_window_with_xlib, self.window_xid)
         self.is_dialog_open = True
+        global hotkey_listener
+        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor):
+            logging.info("打开退出对话框，暂停普通全局热键")
+            hotkey_listener.set_normal_keys_grabbed(False)
         dialog = Gtk.MessageDialog(
             transient_for=self,
             modal=True,
@@ -3560,6 +3609,9 @@ class CaptureOverlay(Gtk.Window):
         response = dialog.run()
         self.is_dialog_open = False
         dialog.destroy()
+        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and are_hotkeys_enabled:
+            logging.info("关闭退出对话框，恢复普通全局热键")
+            hotkey_listener.set_normal_keys_grabbed(True)
         return response
 
     def _show_instruction_dialog(self):
@@ -3901,30 +3953,198 @@ class CaptureOverlay(Gtk.Window):
                 if self.get_window():
                     self.get_window().set_cursor(cursor)
 
+class XlibHotkeyInterceptor(threading.Thread):
+    """使用 Xlib (XGrabKey) 在后台线程中拦截全局热键，并支持动态启用/禁用"""
+    def __init__(self, overlay, handlers, keymap_tuples):
+        super().__init__(daemon=True)
+        self.overlay = overlay
+        self.handlers = handlers
+        self.keymap_tuples = keymap_tuples
+        self.running = False
+        self.disp = None
+        self.root = None
+        self.lock = threading.Lock()
+        self.debug_key_map = {}
+        for kc, mod, _, name in keymap_tuples:
+            key_id = (kc, mod)
+            if key_id not in self.debug_key_map:
+                 self.debug_key_map[key_id] = name
+
+    def set_normal_keys_grabbed(self, grab_state: bool):
+        with self.lock:
+            if not self.running:
+                logging.warning("set_normal_keys_grabbed: 监听器未运行，跳过。")
+                return
+            if not are_hotkeys_enabled:
+                logging.info(f"set_normal_keys_grabbed({grab_state}): 全局热键已禁用，跳过。")
+                return
+        normal_keys = [k for k in self.keymap_tuples if not k[2]]
+        if normal_keys:
+            logging.info(f"XlibHotkeyInterceptor: 正在将普通热键的抓取状态设置为 {grab_state}")
+            threading.Thread(
+                target=self._grab_ungrab_keys, 
+                args=(grab_state, normal_keys), 
+                daemon=True
+            ).start()
+
+    def _grab_ungrab_keys(self, grab: bool, keys_to_process):
+        with self.lock:
+            if not self.disp or not self.root:
+                logging.warning(f"Grab/Ungrab 失败：线程 display 未准备好")
+                return
+            action_name = "GrabKey" if grab else "UngrabKey"
+            logging.info(f"XlibHotkeyInterceptor: 正在执行 {action_name} All...")
+            for (keycode, modifier_mask, _, *_) in keys_to_process:
+                masks_to_process = [
+                    modifier_mask,
+                    modifier_mask | X.Mod2Mask,
+                    modifier_mask | X.LockMask,
+                    modifier_mask | X.Mod2Mask | X.LockMask
+                ]
+                for mask in masks_to_process:
+                    try:
+                        if grab:
+                            self.root.grab_key(keycode, mask, False, X.GrabModeAsync, X.GrabModeAsync)
+                        else:
+                            self.root.ungrab_key(keycode, mask, self.root)
+                    except Exception as e:
+                        if "BadAccess" not in str(e) and "BadValue" not in str(e):
+                             logging.warning(f"{action_name} 失败 (kc={keycode}, m={mask}): {e}")
+            try:
+                self.disp.flush()
+            except Exception as e:
+                 logging.warning(f"disp.flush() during {action_name} failed: {e}")
+        logging.info(f"XlibHotkeyInterceptor: 完成 {action_name} All")
+
+    def run(self):
+        """线程主循环，监听 X events"""
+        try:
+            self.disp = display.Display()
+            self.root = self.disp.screen().root
+            self.running = True
+        except Exception as e:
+            logging.error(f"XlibHotkeyInterceptor 线程初始化 Display 失败: {e}")
+            self.running = False
+            return
+        toggle_keys = [k for k in self.keymap_tuples if k[2]]
+        normal_keys_to_grab = [k for k in self.keymap_tuples if not k[2] and are_hotkeys_enabled]
+        self._grab_ungrab_keys(True, toggle_keys + normal_keys_to_grab)
+        logging.info("Xlib 热键拦截线程已启动")
+        while self.running:
+            try:
+                event = self.disp.next_event()
+                if event.type == X.KeyPress and self.running:
+                    keycode = event.detail
+                    clean_state = event.state & (X.ShiftMask | X.ControlMask | X.Mod1Mask | X.Mod4Mask)
+                    key_id = (keycode, clean_state)
+                    key_name = self.debug_key_map.get(key_id, "UnknownKey")
+                    log_key_str = f"key='{key_name}' (kc={keycode})"
+                    if key_id in self.handlers:
+                        is_toggle_key = False
+                        for kc, mod, is_toggle, _ in self.keymap_tuples:
+                            if kc == keycode and mod == clean_state:
+                                is_toggle_key = is_toggle
+                                break
+                        if is_toggle_key:
+                            logging.info(f"Xlib 拦截到切换键 ({log_key_str}, state={clean_state})")
+                            callback = self.handlers[key_id]
+                            GLib.idle_add(callback)
+                            continue
+                        if are_hotkeys_enabled:
+                            logging.info(f"Xlib 拦截到热键 ({log_key_str}, state={clean_state}) 并执行回调")
+                            callback = self.handlers[key_id]
+                            GLib.idle_add(callback)
+            except Exception as e:
+                if self.running:
+                    logging.error(f"Xlib 事件循环错误: {e}")
+                    time.sleep(0.1)
+        logging.info("Xlib 热键拦截线程正在停止...")
+        all_keys = self.keymap_tuples
+        self._grab_ungrab_keys(False, all_keys)
+        if self.disp:
+            try:
+                self.disp.close()
+            except Exception as e:
+                 logging.error(f"关闭 X Display 连接时出错: {e}")
+        logging.info("Xlib 热键拦截线程已停止")
+
+    def stop(self):
+        """请求线程停止"""
+        logging.info("收到停止 Xlib 拦截线程的请求...")
+        self.running = False
+        if self.disp and self.root:
+            try:
+                client_event = protocol.event.ClientMessage(
+                    window=self.root,
+                    client_type=self.disp.intern_atom("_STOP_THREAD"),
+                    data=(8, [0] * 20)
+                )
+                self.disp.send_event(self.root, client_event, event_mask=X.NoEventMask)
+                self.disp.flush()
+                logging.info("已发送 ClientMessage 事件以唤醒 Xlib 事件循环")
+            except Exception as e:
+                logging.warning(f"发送唤醒事件失败: {e}")
+        else:
+            logging.warning("无法发送唤醒事件，Display 尚未初始化或已关闭")
+
 def toggle_config_window():
     """创建或显示配置窗口，确保只有一个实例存在"""
     global config_window_instance
+    def on_window_destroy(widget):
+        global config_window_instance
+        config_window_instance = None
+        logging.info("配置窗口已销毁，实例已清除")
+
     def task():
         global config_window_instance
-        # 如果窗口已存在且可见，则将其带到前台
-        if config_window_instance:
-            activate_window_with_xlib(config_window_instance.xid)
-            return
-        # 如果窗口不存在，则创建一个新的
-        config_window_instance = ConfigWindow(config)
-        def on_window_destroy(widget):
-            global config_window_instance
-            config_window_instance = None
-            logging.info("配置窗口已关闭")
-        config_window_instance.connect("destroy", on_window_destroy)
-        logging.info("配置窗口已创建")
+        if config_window_instance is None:
+            logging.info("配置窗口不存在，正在创建...")
+            config_window_instance = ConfigWindow(config)
+            config_window_instance.connect("destroy", on_window_destroy)
+            logging.info("配置窗口已创建并显示")
+        else:
+            win_xid = config_window_instance.xid
+            if not config_window_instance.is_visible():
+                logging.info("配置窗口已隐藏，正在显示并激活...")
+                config_window_instance.show()
+                GLib.idle_add(activate_window_with_xlib, win_xid)
+            else:
+                active_xid = get_active_window_xid()
+                if win_xid == active_xid:
+                    logging.info("配置窗口已激活，正在隐藏...")
+                    config_window_instance.hide()
+                    global hotkey_listener
+                    if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and are_hotkeys_enabled:
+                        hotkey_listener.set_normal_keys_grabbed(True)
+                        logging.info("配置窗口隐藏，全局热键已恢复")
+                else:
+                    logging.info("配置窗口可见但未激活，正在激活...")
+                    GLib.idle_add(activate_window_with_xlib, win_xid)
     GLib.idle_add(task)
 
 def toggle_hotkeys_globally():
-    """切换全局热键的启用状态并发送桌面通知"""
+    """切换全局热键的启用状态，应用 grab/ungrab 并发送桌面通知"""
     global are_hotkeys_enabled
     are_hotkeys_enabled = not are_hotkeys_enabled
     state_str = "启用" if are_hotkeys_enabled else "禁用"
+    if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor):
+        normal_keys = [k for k in hotkey_listener.keymap_tuples if not k[2]]
+        if not normal_keys:
+            logging.info("没有需要切换状态的普通热键。")
+        else:
+            should_grab = are_hotkeys_enabled
+            if should_grab and config_window_instance:
+                if config_window_instance.capturing_hotkey_button or config_window_instance.input_has_focus:
+                    logging.info("全局热键已设为启用，但配置窗口处于输入状态，暂不抓取普通热键")
+                    should_grab = False
+            logging.info(f"正在调用 _grab_ungrab_keys({should_grab}) for normal keys")
+            threading.Thread(
+                target=hotkey_listener._grab_ungrab_keys, 
+                args=(should_grab, normal_keys), 
+                daemon=True
+            ).start()
+    else:
+        logging.warning("hotkey_listener 未初始化或类型错误，无法应用 grab/ungrab 状态")
     title = "全局热键状态"
     message = f"截图会话的全局热键当前已{state_str}"
     GLib.idle_add(send_desktop_notification, title, message)
@@ -3932,89 +4152,91 @@ def toggle_hotkeys_globally():
 
 def setup_hotkey_listener(overlay):
     global hotkey_listener
-    def is_overlay_focused(overlay_widget):
-        """检查截图覆盖层窗口当前是否拥有焦点"""
-        if not overlay_widget.window_xid:
-            return False
-        focused_xid = get_active_window_xid()
-        if focused_xid is None:
-            return False
-        is_focused = (focused_xid == overlay_widget.window_xid)
-        if is_focused:
-            logging.info(f"焦点检查: 成功，焦点在覆盖层窗口 (XID: {focused_xid})")
-        return is_focused
+    def gdk_mask_to_x_mask(gdk_mask):
+        x_mask = 0
+        if gdk_mask & Gdk.ModifierType.CONTROL_MASK: x_mask |= X.ControlMask
+        if gdk_mask & Gdk.ModifierType.SHIFT_MASK: x_mask |= X.ShiftMask
+        if gdk_mask & Gdk.ModifierType.MOD1_MASK: x_mask |= X.Mod1Mask
+        if gdk_mask & Gdk.ModifierType.SUPER_MASK: x_mask |= X.Mod4Mask
+        return x_mask
 
-    def activate_and_send(hotkey_config):
-        def task():
-            if not overlay.window_xid: return
+    def get_keycode_from_keyval(keyval):
             try:
-                main_key_str = hotkey_config.get('main_key_str')
-                if not main_key_str:
-                    logging.error("无法发送按键：在快捷键配置中未找到 'main_key_str'")
-                    return
-                key_to_press = None
-                if main_key_str in config._key_map_pynput_special:
-                    key_to_press = config._key_map_pynput_special[main_key_str]
-                elif len(main_key_str) == 1:
-                    key_to_press = main_key_str
-                if not key_to_press:
-                    logging.error(f"无法为 '{main_key_str}' 确定要模拟的 pynput 按键对象")
-                    return
-                if not activate_window_with_xlib(overlay.window_xid):
-                    return
-                time.sleep(0.05)
-                modifiers_to_press = []
-                if hotkey_config['gtk_mask'] & Gdk.ModifierType.CONTROL_MASK: modifiers_to_press.append(keyboard.Key.ctrl)
-                if hotkey_config['gtk_mask'] & Gdk.ModifierType.SHIFT_MASK: modifiers_to_press.append(keyboard.Key.shift)
-                if hotkey_config['gtk_mask'] & Gdk.ModifierType.MOD1_MASK: modifiers_to_press.append(keyboard.Key.alt)
-                for mod in modifiers_to_press: keyboard_controller.press(mod)
-                keyboard_controller.press(key_to_press)
-                keyboard_controller.release(key_to_press)
-                for mod in reversed(modifiers_to_press): keyboard_controller.release(mod)
+                gdk_disp = Gdk.Display.get_default()
+                keymap = Gdk.Keymap.get_for_display(gdk_disp)
+                found, keys = keymap.get_entries_for_keyval(keyval)
+                if found and keys and len(keys) > 0:
+                    keycode = keys[0].keycode
+                    return keycode
+                else:
+                    lower_keyval = Gdk.keyval_to_lower(keyval)
+                    if lower_keyval != keyval:
+                        found, keys = keymap.get_entries_for_keyval(lower_keyval)
+                        if found and keys and len(keys) > 0:
+                            return keys[0].keycode
+                logging.warning(f"Gdk.Keymap 无法为 keyval {keyval} (名称: {Gdk.keyval_name(keyval)}) 找到 keycode")
+                return 0
             except Exception as e:
-                logging.error(f"执行 'activate and send key' 失败: {e}")
-        threading.Thread(target=task, daemon=True).start()
+                logging.error(f"通过 Gdk.Keymap 获取 keycode 失败 (keyval={keyval}): {e}")
+                try:
+                     tmp_disp = display.Display()
+                     keysym = XK.string_to_keysym(Gdk.keyval_name(keyval))
+                     keycode = tmp_disp.keysym_to_keycode(keysym) if keysym else 0
+                     tmp_disp.close()
+                     if keycode:
+                          logging.warning(f"GDK 获取 keycode 失败，回退到 Xlib 获取 keycode {keycode} for keyval {keyval}")
+                          return keycode
+                     else:
+                          logging.error(f"Xlib 也无法为 keyval {keyval} 获取 keycode")
+                          return 0
+                except Exception as ex:
+                     logging.error(f"Xlib 回退获取 keycode 时出错: {ex}")
+                     return 0
 
-    def create_hotkey_callback(action_func, requires_activation=False, hotkey_config=None):
-        def callback():
-            if not are_hotkeys_enabled:
-                return
-            if overlay.is_dialog_open:
-                return
-            if is_overlay_focused(overlay):
-                return
-            if config_window_instance is not None:
-                if config_window_instance.capturing_hotkey_button is not None:
-                    logging.info("配置窗口正在设置快捷键，全局热键已临时禁用")
-                    return
-                if config_window_instance.input_has_focus:
-                    logging.info("配置窗口输入框具有焦点，全局热键已临时禁用")
-                    return
-            if requires_activation:
-                activate_and_send(hotkey_config)
-            else:
-                GLib.idle_add(action_func)
-        return callback
-    hotkey_map = {
-        config.HOTKEY_CAPTURE['pynput_str']: create_hotkey_callback(overlay.controller.take_capture),
-        config.HOTKEY_FINALIZE['pynput_str']: create_hotkey_callback(overlay.controller.finalize_and_quit),
-        config.HOTKEY_UNDO['pynput_str']: create_hotkey_callback(overlay.controller.delete_last_capture),
-        config.HOTKEY_SCROLL_UP['pynput_str']: create_hotkey_callback(lambda: overlay.controller.handle_movement_action('up')),
-        config.HOTKEY_SCROLL_DOWN['pynput_str']: create_hotkey_callback(lambda: overlay.controller.handle_movement_action('down')),
-        config.HOTKEY_TOGGLE_GRID_MODE['pynput_str']: create_hotkey_callback(overlay.controller.grid_mode_controller.toggle),
-        config.HOTKEY_CANCEL['pynput_str']: create_hotkey_callback(None, requires_activation=True, hotkey_config=config.HOTKEY_CANCEL),
-        config.HOTKEY_CONFIGURE_SCROLL_UNIT['pynput_str']: create_hotkey_callback(None, requires_activation=True, hotkey_config=config.HOTKEY_CONFIGURE_SCROLL_UNIT),
-        config.HOTKEY_OPEN_CONFIG_EDITOR['pynput_str']: toggle_config_window,
-        config.HOTKEY_TOGGLE_HOTKEYS_ENABLED['pynput_str']: toggle_hotkeys_globally,
-    }
-    valid_hotkey_map = {k: v for k, v in hotkey_map.items() if k}
+    toggle_key_config_keys = ['toggle_hotkeys_enabled']
+    hotkey_key_callback_list = [
+        ('capture', overlay.controller.take_capture),
+        ('finalize', overlay.controller.finalize_and_quit),
+        ('undo', overlay.controller.delete_last_capture),
+        ('cancel', overlay.controller.quit_and_cleanup),
+        ('scroll_up', lambda: overlay.controller.handle_movement_action('up')),
+        ('scroll_down', lambda: overlay.controller.handle_movement_action('down')),
+        ('toggle_grid_mode', overlay.controller.grid_mode_controller.toggle),
+        ('configure_scroll_unit', overlay.controller.grid_mode_controller.start_calibration),
+        ('open_config_editor', toggle_config_window),
+        ('toggle_hotkeys_enabled', toggle_hotkeys_globally),
+    ]
+    handlers_map = {}
+    keymap_tuples = []
+    for key_name, callback in hotkey_key_callback_list:
+        hotkey_config_attr_name = f"HOTKEY_{key_name.upper()}"
+        hotkey_config = getattr(config, hotkey_config_attr_name, None)
+        if not hotkey_config or not hotkey_config.get('gtk_keys'):
+            logging.warning(f"跳过无效或未找到的热键配置: {key_name}")
+            continue
+        for keyval in hotkey_config['gtk_keys']:
+            keycode = get_keycode_from_keyval(keyval)
+            if keycode == 0:
+                logging.error(f"无法为 '{key_name}' (Keyval: {keyval}, Name: {Gdk.keyval_name(keyval)}) 找到 keycode，跳过此特定 keyval")
+                continue
+            x_mask = gdk_mask_to_x_mask(hotkey_config['gtk_mask'])
+            key_id = (keycode, x_mask)
+            is_toggle_key_flag = key_name in toggle_key_config_keys
+            debug_key_name = Gdk.keyval_name(keyval)
+            if key_id in handlers_map:
+                if handlers_map[key_id] != callback:
+                    logging.warning(f"热键组合 (kc={keycode}, mask={x_mask}, name={debug_key_name}) 已存在，将被覆盖。请检查配置。键名: {key_name}")
+                else:
+                    pass
+            handlers_map[key_id] = callback
+            keymap_tuples.append((keycode, x_mask, is_toggle_key_flag, debug_key_name))
+    if not any(k[2] for k in keymap_tuples):
+         logging.warning("配置中未找到有效的切换键 (如 toggle_hotkeys_enabled)，热键启用/禁用功能可能无法通过键盘触发。")
     try:
-        hotkey_listener = keyboard.GlobalHotKeys(valid_hotkey_map)
-        listener_thread = threading.Thread(target=hotkey_listener.start, daemon=True)
-        listener_thread.start()
-        logging.info("全局组合键热键监听器已启动")
+        hotkey_listener = XlibHotkeyInterceptor(overlay, handlers_map, keymap_tuples)
+        hotkey_listener.start()
     except Exception as e:
-        logging.error(f"启动 GlobalHotKeys 失败: {e}")
+        logging.error(f"启动 XlibHotkeyInterceptor 线程失败: {e}")
 
 def cleanup_stale_temp_dirs(config):
     """在启动时清理由已退出的旧进程留下的临时目录"""
