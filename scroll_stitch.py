@@ -9,6 +9,7 @@ import re
 import subprocess
 import logging
 import queue
+import collections
 import threading
 from pathlib import Path
 from datetime import datetime
@@ -791,86 +792,36 @@ def _find_overlap_pyramid(img_top, img_bottom, max_overlap_search):
         return estimated_overlap, 0.0
     return _find_overlap_brute_force(img_top, img_bottom, min_fine_search, max_fine_search)
 
-def stitch_images_in_memory(image_paths, session, progress_callback=None):
-    if not image_paths:
-        return None, 0.0
+def stitch_images_in_memory_from_model(entries: list, image_width: int, total_height: int, progress_callback=None):
+    if not entries:
+        return None
+    num_images = len(entries)
+    logging.info(f"开始从 {num_images} 个条目拼接图像，最终尺寸: {image_width}x{total_height}")
     try:
-        images_pil = [Image.open(p) for p in image_paths]
+        stitched_image = Image.new('RGBA', (image_width, total_height))
+        y_offset = 0
+        for i, entry in enumerate(entries):
+            filepath = entry['filepath']
+            height = entry['height']
+            overlap_with_next = entry['overlap']
+            logging.info(f"粘贴 {Path(filepath).name} 到 Y={int(round(y_offset))}")
+            try:
+                img_pil = Image.open(filepath)
+                if img_pil.width != image_width:
+                    logging.warning(f"图片 {filepath} 宽度 {img_pil.width} 与预期 {image_width} 不符，可能导致错位")
+                stitched_image.paste(img_pil, (0, int(round(y_offset))))
+                img_pil.close()
+            except Exception as e_load:
+                logging.error(f"加载或粘贴图片失败 {filepath}: {e_load}")
+            if i < num_images - 1:
+                y_offset += height - overlap_with_next
+            if progress_callback:
+                GLib.idle_add(progress_callback, (i + 1) / num_images)
+        logging.info("图像拼接完成")
+        return stitched_image
     except Exception as e:
-        logging.error(f"加载图片失败: {e}")
-        return None, 0.0
-    num_images = len(images_pil)
-    if num_images <= 1:
-        return images_pil[0].copy() if images_pil else None, 0.0
-    images_np = [cv2.cvtColor(np.asarray(img.convert('RGB')), cv2.COLOR_RGB2BGR) for img in images_pil]
-    is_grid_mode_session = session.detected_app_class is not None
-    is_grid_mode_matching = session.is_matching_enabled and is_grid_mode_session
-    is_free_scroll_matching = not is_grid_mode_session and config.ENABLE_FREE_SCROLL_MATCHING
-    use_matching = is_grid_mode_matching or is_free_scroll_matching
-    total_matching_time = 0.0
-    overlaps = [0] * (num_images - 1)
-    if not use_matching:
-        logging.info("使用简单粘贴模式进行拼接...")
-    else:
-        match_start_time = time.perf_counter()
-        max_overlap_config = (config.GRID_MATCHING_MAX_OVERLAP if is_grid_mode_matching 
-                              else config.FREE_SCROLL_MATCHING_MAX_OVERLAP)
-        for i in range(num_images - 1):
-            img_top_np = images_np[i]
-            img_bottom_np = images_np[i+1]
-            h1, _, _ = img_top_np.shape
-            h2, _, _ = img_bottom_np.shape
-            prediction_successful = False
-            if session.known_scroll_distances:
-                for s_known in session.known_scroll_distances:
-                    predicted_overlap = h2 - s_known
-                    if 1 <= predicted_overlap < min(h1, h2):
-                        _, score = _find_overlap_brute_force(img_top_np, img_bottom_np, predicted_overlap, predicted_overlap)
-                        PREDICTION_THRESHOLD = 0.995
-                        if score > PREDICTION_THRESHOLD:
-                            overlaps[i] = predicted_overlap
-                            prediction_successful = True
-                            logging.info(f"图片对 {i+1}/{i+2} 预测成功：重叠 {predicted_overlap}px, 相似度 {score:.3f}")
-                            break
-            if prediction_successful:
-                if progress_callback: GLib.idle_add(progress_callback, (i + 1) / (num_images - 1))
-                continue
-            logging.info(f"图片对 {i+1}/{i+2} 预测失败，执行全范围搜索...")
-            effective_search_range = min(max_overlap_config, h1 - 1, h2 - 1)
-            overlap_value = 0
-            if effective_search_range > 0:
-                found_overlap, best_match_score = _find_overlap_pyramid(
-                    img_top_np, img_bottom_np, effective_search_range
-                )
-                QUALITY_THRESHOLD = 0.95
-                if best_match_score >= QUALITY_THRESHOLD:
-                    overlap_value = found_overlap
-                    logging.info(f"图片对 {i+1}/{i+2} 搜索匹配成功：重叠 {overlap_value}px, 相似度 {best_match_score:.3f}")
-                else:
-                    logging.warning(f"图片对 {i+1}/{i+2} 搜索匹配失败 (最高相似度 {best_match_score:.3f} < {QUALITY_THRESHOLD})")
-            overlaps[i] = overlap_value
-            if overlap_value > 0:
-                s_new = h2 - overlap_value
-                if s_new > 0 and s_new not in session.known_scroll_distances:
-                    session.known_scroll_distances.append(s_new)
-                    logging.info(f"学习到新滚动距离: {s_new}px，可用于下次预测")
-            if progress_callback: GLib.idle_add(progress_callback, (i + 1) / (num_images - 1))
-        total_matching_time = time.perf_counter() - match_start_time
-        logging.info(f"模板匹配总耗时: {total_matching_time:.3f} 秒")
-    final_width = images_pil[0].width
-    final_height = sum(img.height for img in images_pil) - sum(overlaps)
-    logging.info(f"计算完成，最终尺寸: {final_width}x{final_height}")
-    stitched_image = Image.new('RGBA', (final_width, final_height))
-    y_offset = 0
-    for i, img in enumerate(images_pil):
-        stitched_image.paste(img, (0, y_offset))
-        if i < num_images - 1:
-            y_offset += img.height - overlaps[i]
-    if session.known_scroll_distances:
-        logging.info(f"本次会话学习到的滚动距离列表: {sorted(session.known_scroll_distances)}")
-    for img in images_pil:
-        img.close()
-    return stitched_image, total_matching_time
+        logging.exception(f"拼接图像时发生严重错误: {e}")
+        return None
 
 def copy_to_clipboard(image_path: Path) -> bool:
     """使用 Gtk.Clipboard 将图片复制到剪贴板"""
@@ -967,14 +918,91 @@ def create_feedback_dialog(parent_window, text, show_progress_bar=False, positio
         win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
     return win, progress_bar
 
+class StitchModel(GObject.Object):
+    """管理拼接数据的模型，支持异步更新和信号通知"""
+    __gsignals__ = {
+        'model-updated': (GObject.SignalFlags.RUN_FIRST, None, ()),
+    }
+    def __init__(self):
+        super().__init__()
+        self.entries = []
+        self.image_width = 0
+        self.total_virtual_height = 0
+        self.y_positions = []
+        self.pixbuf_cache = collections.OrderedDict()
+        self.CACHE_SIZE = 10
+
+    @property
+    def capture_count(self) -> int:
+        """返回当前截图数量"""
+        return len(self.entries)
+
+    def _get_cached_pixbuf(self, filepath):
+        if filepath in self.pixbuf_cache:
+            self.pixbuf_cache.move_to_end(filepath)
+            return self.pixbuf_cache[filepath]
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(filepath)
+            self.pixbuf_cache[filepath] = pixbuf
+            if len(self.pixbuf_cache) > self.CACHE_SIZE:
+                self.pixbuf_cache.popitem(last=False)
+            return pixbuf
+        except GLib.Error as e:
+            logging.error(f"无法加载图片用于缓存 {filepath}: {e}")
+            return None
+
+    def add_entry(self, filepath: str, width: int, height: int, overlap_with_previous: int):
+        logging.info(f"主线程: 收到添加请求: {filepath}, h={height}, overlap={overlap_with_previous}")
+        if not self.entries:
+            self.image_width = width
+            self.total_virtual_height = height
+            self.y_positions = [0]
+            self.entries.append({'filepath': filepath, 'height': height, 'overlap': 0})
+            logging.info(f"添加首张截图，当前总高: {self.total_virtual_height}")
+        else:
+            self.entries[-1]['overlap'] = overlap_with_previous
+            last_entry = self.entries[-1]
+            last_y_pos = self.y_positions[-1]
+            new_y_pos = last_y_pos + last_entry['height'] - overlap_with_previous
+            self.y_positions.append(new_y_pos)
+            self.entries.append({'filepath': filepath, 'height': height, 'overlap': 0})
+            self.total_virtual_height = new_y_pos + height
+            logging.info(f"添加新截图，上一张重叠: {overlap_with_previous}px, 当前总高: {self.total_virtual_height}")
+        self.emit('model-updated')
+
+    def pop_entry(self):
+        if not self.entries:
+            return
+        logging.info("主线程: 收到移除最后一个条目的请求")
+        popped_entry = self.entries.pop()
+        self.y_positions.pop()
+        if popped_entry['filepath'] in self.pixbuf_cache:
+            del self.pixbuf_cache[popped_entry['filepath']]
+            logging.info(f"从缓存中移除 {popped_entry['filepath']}")
+        try:
+            filepath_to_remove = Path(popped_entry['filepath'])
+            if filepath_to_remove.exists():
+                os.remove(filepath_to_remove)
+                logging.info(f"已删除文件: {filepath_to_remove}")
+        except OSError as e:
+            logging.error(f"删除文件失败 {popped_entry['filepath']}: {e}")
+        if self.entries:
+            self.entries[-1]['overlap'] = 0
+            last_entry = self.entries[-1]
+            last_y_pos = self.y_positions[-1] if self.y_positions else 0
+            self.total_virtual_height = last_y_pos + last_entry['height']
+            logging.info(f"移除截图后，当前总高: {self.total_virtual_height}")
+        else:
+            self.image_width = 0
+            self.total_virtual_height = 0
+            logging.info("所有截图已移除")
+        self.emit('model-updated')
+
 class CaptureSession:
     """管理一次滚动截图会话的数据和状态"""
     def __init__(self, geometry_str: str):
-        self.captures = []
         self.is_horizontally_locked: bool = False
         self.geometry: dict = self._parse_geometry(geometry_str)
-        self.total_height: int = 0
-        self.image_width: int = 0
         self.detected_app_class: str = None
         self.is_matching_enabled: bool = False
         self.known_scroll_distances = []
@@ -985,43 +1013,6 @@ class CaptureSession:
         dims, x_str, y_str = parts[0], parts[1], parts[2]
         w_str, h_str = dims.split('x')
         return {'x': int(x_str), 'y': int(y_str), 'w': int(w_str), 'h': int(h_str)}
-
-    def add_capture(self, filepath: str):
-        """添加一张截图并更新状态"""
-        self.captures.append(filepath)
-        try:
-            with Image.open(filepath) as img:
-                w, h = img.size
-                if not self.is_horizontally_locked:
-                    self.image_width = w
-                self.total_height += h
-        except Exception as e:
-            logging.error(f"无法读取图片 {filepath} 的尺寸: {e}")
-        if not self.is_horizontally_locked:
-            self.is_horizontally_locked = True
-            logging.info("首次截图完成，窗口水平位置和宽度已被锁定")
-
-    def pop_last_capture(self):
-        """移除最后一张截图并更新状态"""
-        if not self.captures:
-            return None
-        last_capture_path = self.captures.pop()
-        try:
-            with Image.open(last_capture_path) as img:
-                _, h = img.size
-                self.total_height -= h
-        except Exception as e:
-             logging.error(f"撤销时无法读取图片 {last_capture_path} 的尺寸: {e}")
-        if not self.captures and self.is_horizontally_locked:
-            self.is_horizontally_locked = False
-            self.image_width = 0
-            self.total_height = 0
-            logging.info("所有截图均已删除，已解锁窗口水平调整功能")
-        return last_capture_path
-
-    @property
-    def capture_count(self) -> int:
-        return len(self.captures)
 
     def update_geometry(self, new_geometry):
         """更新捕获区域的几何信息，并确保所有值为整数"""
@@ -1385,7 +1376,6 @@ class ScrollManager:
                     disp.sync()
                     if i < num_clicks - 1:
                          time.sleep(0.015)
-                logging.debug("XTest: Scroll simulation finished.")
                 disp.close()
             except Exception as e:
                 logging.error(f"使用 XTest 模拟滚动失败: {e}")
@@ -1435,7 +1425,6 @@ class ActionController:
         self.view = view
         self.config = config
         self.final_notification = None
-        # 将交互状态从视图移至控制器
         self.is_dragging = False
         self.resize_edge = None
         self.drag_start_geometry = {}
@@ -1443,6 +1432,148 @@ class ActionController:
         self.drag_start_y_root = 0
         self.scroll_manager = ScrollManager(self.config, self.session, self.view)
         self.grid_mode_controller = GridModeController(self.config, self.session, self.view)
+        self.stitch_model = StitchModel()
+        self.task_queue = queue.Queue()
+        self.result_queue = queue.Queue()
+        self.stitch_worker = threading.Thread(
+            target=self._stitch_worker_loop,
+            args=(self.task_queue, self.result_queue, session.known_scroll_distances),
+            daemon=True
+        )
+        self.stitch_worker_running = True
+        self.stitch_worker.start()
+        self.result_check_timer_id = GLib.timeout_add(100, self._check_result_queue)
+        logging.info("StitchWorker 后台线程及结果检查器已启动")
+        self.stitch_model.connect('model-updated', self._on_model_updated)
+
+    def _on_model_updated(self, model_instance):
+        if self.view.show_side_panel:
+            self.view.side_panel.info_panel.update_info(
+                count=self.stitch_model.capture_count,
+                width=self.stitch_model.image_width,
+                height=self.stitch_model.total_virtual_height
+            )
+            self.view.side_panel.button_panel.set_undo_sensitive(self.stitch_model.capture_count > 0)
+        self._check_horizontal_lock_state()
+
+    def _check_horizontal_lock_state(self):
+        should_be_locked = self.stitch_model.capture_count > 0
+        if should_be_locked and not self.session.is_horizontally_locked:
+            self.session.is_horizontally_locked = True
+            logging.info("第一张截图已添加到模型，窗口水平位置和宽度已被锁定")
+        elif not should_be_locked and self.session.is_horizontally_locked:
+            self.session.is_horizontally_locked = False
+            logging.info("所有截图均已移除，已解锁窗口水平调整功能")
+
+    def _check_result_queue(self):
+        while not self.result_queue.empty():
+            try:
+                result = self.result_queue.get_nowait()
+                result_type = result[0]
+                payload = result[1]
+                if result_type == 'ADD_RESULT':
+                    filepath, width, height, overlap = payload
+                    logging.info(f"主线程: 处理结果 {Path(filepath).name}, overlap={overlap}")
+                    self.stitch_model.add_entry(filepath, width, height, overlap)
+                elif result_type == 'LEARNED_SCROLL':
+                    s_new = payload
+                    if s_new not in self.session.known_scroll_distances:
+                        self.session.known_scroll_distances.append(s_new)
+                        logging.info(f"主线程: 学习到新滚动距离: {s_new}px")
+                elif result_type == 'POP_REQUEST_RECEIVED':
+                    logging.info("主线程: 收到 Worker 的 POP 确认，执行模型删除")
+                    self.stitch_model.pop_entry()
+            except queue.Empty:
+                break
+            except Exception as e:
+                logging.exception(f"处理 Worker 结果时出错: {e}")
+        return True
+
+    @staticmethod
+    def _stitch_worker_loop(task_queue: queue.Queue, result_queue: queue.Queue, known_scroll_distances: list):
+        """后台工作线程的主循环"""
+        logging.info("StitchWorker 线程开始运行...")
+        while True:
+            try:
+                task = task_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            if task is None or task.get('type') == 'EXIT':
+                logging.info("StitchWorker 收到退出信号")
+                break
+            if task.get('type') == 'ADD':
+                filepath_str = task.get('filepath')
+                prev_filepath_str = task.get('prev_filepath')
+                should_match = task.get('should_perform_matching', False)
+                max_overlap = task.get('max_overlap_to_use', 0)
+                filepath = Path(filepath_str)
+                logging.info(f"StitchWorker: 处理 ADD 任务: {filepath.name}")
+                if not filepath.is_file():
+                    logging.error(f"StitchWorker: 文件不存在 {filepath}")
+                    task_queue.task_done()
+                    continue
+                try:
+                    img_new_np = cv2.imread(filepath_str)
+                    if img_new_np is None: raise ValueError("cv2.imread 返回 None")
+                    h_new, w_new, _ = img_new_np.shape
+                    overlap = 0
+                    if prev_filepath_str:
+                        logging.info(f"StitchWorker: 计算 {filepath.name} 与 {Path(prev_filepath_str).name} 的重叠")
+                        img_top_np = cv2.imread(prev_filepath_str)
+                        if img_top_np is None: raise ValueError(f"无法加载上一张图片 {prev_filepath_str}")
+                        h_top, _, _ = img_top_np.shape
+                        predicted_overlap = -1
+                        if known_scroll_distances:
+                            for s_known in known_scroll_distances:
+                                potential_overlap = h_new - s_known
+                                if 1 <= potential_overlap < min(h_top, h_new):
+                                    _, score = _find_overlap_brute_force(img_top_np, img_new_np, potential_overlap, potential_overlap)
+                                    PREDICTION_THRESHOLD = 0.995
+                                    if score > PREDICTION_THRESHOLD:
+                                        predicted_overlap = potential_overlap
+                                        logging.info(f"StitchWorker: 预测成功 overlap={predicted_overlap}, score={score:.3f}")
+                                        break
+                        if predicted_overlap != -1:
+                            overlap = predicted_overlap
+                        else:
+                            if should_match:
+                                search_range = min(max_overlap, h_top - 1, h_new - 1)
+                                if search_range > 0:
+                                    logging.info(f"StitchWorker: 预测失败，执行全范围搜索 (max={search_range}px)...")
+                                    found_overlap, score = _find_overlap_pyramid(img_top_np, img_new_np, search_range)
+                                    QUALITY_THRESHOLD = 0.95
+                                    if score >= QUALITY_THRESHOLD:
+                                        overlap = found_overlap
+                                        logging.info(f"StitchWorker: 计算重叠成功: {overlap}px, score={score:.3f}")
+                                        s_new = h_new - overlap
+                                        if s_new > 0 and s_new not in known_scroll_distances:
+                                            result_queue.put(('LEARNED_SCROLL', s_new))
+                                    else:
+                                        logging.warning(f"StitchWorker: 计算重叠失败 (score {score:.3f} < {QUALITY_THRESHOLD})")
+                                else:
+                                    logging.warning("StitchWorker: 有效搜索范围为0，跳过重叠计算")
+                            else:
+                                logging.info("StitchWorker: 主线程指示无需进行匹配，设置 overlap=0")
+                                overlap = 0
+                    result_queue.put(('ADD_RESULT', (filepath_str, w_new, h_new, overlap)))
+                except Exception as e:
+                    logging.exception(f"StitchWorker: 处理 ADD 任务时出错 ({filepath.name}): {e}")
+                    try:
+                        if 'w_new' not in locals() or 'h_new' not in locals():
+                            with Image.open(filepath) as img: w_new, h_new = img.size
+                        result_queue.put(('ADD_RESULT', (filepath_str, w_new, h_new, 0)))
+                    except Exception as fallback_e:
+                        logging.error(f"StitchWorker: 获取图片尺寸失败: {fallback_e}")
+                finally:
+                    task_queue.task_done()
+            elif task.get('type') == 'POP':
+                logging.info("StitchWorker: 收到 POP 任务，发送确认回主线程")
+                result_queue.put(('POP_REQUEST_RECEIVED', None)) # payload 可以是 None
+                task_queue.task_done()
+            else:
+                logging.warning(f"StitchWorker: 收到未知任务类型: {task.get('type')}")
+                task_queue.task_done()
+        logging.info("StitchWorker 线程已结束。")
 
     def handle_movement_action(self, direction: str):
         """根据配置文件处理前进/后退动作 (滚动, 截图, 删除). """
@@ -1500,6 +1631,7 @@ class ActionController:
     def take_capture(self, widget=None):
         """执行截图的核心逻辑"""
         grabbed_seat = None
+        filepath = None
         try:
             win_x, win_y = self.view.get_position()
             shot_x = win_x + self.view.left_panel_w + config.BORDER_WIDTH
@@ -1511,15 +1643,35 @@ class ActionController:
                 logging.warning(f"捕获区域过小，跳过截图。尺寸: {shot_w}x{shot_h}")
                 send_desktop_notification("截图跳过", "选区太小，无法截图", "dialog-warning")
                 return
-            filepath = config.TMP_DIR / f"{self.session.capture_count:02d}_capture.png"
+            filepath = config.TMP_DIR / f"{self.stitch_model.capture_count:02d}_capture.png"
             if capture_area(shot_x, shot_y, shot_w, shot_h, filepath):
-                self.session.add_capture(str(filepath))
-            self.view.update_ui()
-            logging.info(f"已捕获截图: {filepath}")
-            play_sound(config.CAPTURE_SOUND)
+                logging.info(f"已捕获截图: {filepath}")
+                play_sound(config.CAPTURE_SOUND)
+                prev_filepath = self.stitch_model.entries[-1]['filepath'] if self.stitch_model.entries else None
+                should_perform_matching = False
+                max_overlap_to_use = 0
+                if prev_filepath:
+                    if self.grid_mode_controller.is_active:
+                        should_perform_matching = self.session.is_matching_enabled
+                        max_overlap_to_use = self.config.GRID_MATCHING_MAX_OVERLAP
+                    else:
+                        should_perform_matching = self.config.ENABLE_FREE_SCROLL_MATCHING
+                        max_overlap_to_use = self.config.FREE_SCROLL_MATCHING_MAX_OVERLAP
+                task = {
+                    'type': 'ADD',
+                    'filepath': str(filepath),
+                    'prev_filepath': prev_filepath,
+                    'should_perform_matching': should_perform_matching,
+                    'max_overlap_to_use': max_overlap_to_use
+                }
+                self.task_queue.put(task)
+            else:
+                 logging.error(f"截图失败: {filepath}")
+                 filepath = None
         except Exception as e:
             logging.error(f"执行截图失败: {e}")
             send_desktop_notification("截图失败", f"无法执行截图命令: {e}", "dialog-warning")
+            filepath = None
         finally:
             if grabbed_seat:
                 display = self.view.get_display()
@@ -1547,7 +1699,7 @@ class ActionController:
             if status == Gdk.GrabStatus.SUCCESS:
                 logging.info("指针抓取成功，光标已全局隐藏")
                 display.flush()
-                return seat # 返回 seat 对象，用于后续的释放操作
+                return seat
             else:
                 logging.warning(f"指针抓取失败，状态: {status}。光标可能不会被隐藏")
                 return None
@@ -1556,35 +1708,37 @@ class ActionController:
             return None
 
     def delete_last_capture(self, widget=None):
-        """执行删除最后一张截图的逻辑"""
-        if not self.session.capture_count:
-            return
-        try:
-            last_capture_path = self.session.pop_last_capture()
-            if last_capture_path and os.path.exists(last_capture_path):
-                os.remove(last_capture_path)
-                logging.info(f"已成功删除截图: {last_capture_path}")
-                play_sound(config.UNDO_SOUND)
-            self.view.update_ui() # 通知视图更新
-        except Exception as e:
-            logging.error(f"删除最后一张截图时出错: {e}")
-            send_desktop_notification("删除失败", f"无法删除截图: {e}", "dialog-error")
+        logging.info("请求删除最后一张截图...")
+        play_sound(config.UNDO_SOUND)
+        task = {'type': 'POP'}
+        self.task_queue.put(task)
 
     def finalize_and_quit(self, widget=None):
         """执行完成拼接并退出的逻辑"""
-        if not self.session.capture_count:
+        if self.stitch_model.capture_count == 0:
             logging.warning("未进行任何截图。正在退出")
             self.quit_and_cleanup()
             return
         if hotkey_listener and hotkey_listener.is_alive():
             hotkey_listener.stop()
+        logging.info("Finalize: 请求停止 StitchWorker 并等待...")
+        self.task_queue.put({'type': 'EXIT'})
+        self.stitch_worker.join(timeout=2.0)
+        if self.stitch_worker.is_alive():
+             logging.warning("Finalize: StitchWorker 在2秒内未能停止，继续执行...")
+        self.stitch_worker_running = False
+        self._check_result_queue()
+        logging.info("Finalize: StitchWorker 已停止且结果队列已清空.")
         processing_window, progress_bar = self.view._create_processing_window()
         self.view.hide()
+        entries_snapshot = list(self.stitch_model.entries)
+        image_width_snapshot = self.stitch_model.image_width
+        total_height_snapshot = self.stitch_model.total_virtual_height
         thread = threading.Thread(
-            target=self._do_finalize_in_background,
-            args=(processing_window, progress_bar)
+            target=self._perform_final_stitch_and_save,
+            args=(processing_window, progress_bar, entries_snapshot, image_width_snapshot, total_height_snapshot),
+            daemon=True
         )
-        thread.daemon = True
         thread.start()
 
     def _ensure_cleanup(self):
@@ -1594,7 +1748,7 @@ class ActionController:
             self._perform_cleanup()
         return GLib.SOURCE_REMOVE
 
-    def _do_finalize_in_background(self, processing_window, progress_bar):
+    def _perform_final_stitch_and_save(self, processing_window, progress_bar, entries, image_width, total_height):
         """在后台线程中执行拼接和保存"""
         finalize_start_time = time.perf_counter()
         label_widget = None
@@ -1615,6 +1769,9 @@ class ActionController:
             copy_to_clipboard(path_to_copy)
             return GLib.SOURCE_REMOVE
         try:
+            if not entries:
+                logging.warning("Finalize BG: 传入的截图列表为空，退出处理")
+                return
             now = datetime.now()
             timestamp_str = now.strftime(config.FILENAME_TIMESTAMP_FORMAT)
             base_filename = config.FILENAME_TEMPLATE.replace('{timestamp}', timestamp_str)
@@ -1623,11 +1780,14 @@ class ActionController:
             output_file = config.SAVE_DIRECTORY / final_filename
             output_file.parent.mkdir(parents=True, exist_ok=True)
             stitch_start_time = time.perf_counter()
-            stitched_image, total_matching_time = stitch_images_in_memory(self.session.captures, self.session, progress_callback=update_progress)
+            stitched_image = stitch_images_in_memory_from_model(
+                 entries=entries,
+                 image_width=image_width,
+                 total_height=total_height,
+                 progress_callback=update_progress
+            )
             stitch_duration = time.perf_counter() - stitch_start_time
             logging.info(f"图片拼接总耗时: {stitch_duration:.3f} 秒")
-            if total_matching_time > 0:
-                logging.info(f"模板匹配总耗时: {total_matching_time:.3f} 秒")
             if stitched_image:
                 update_label_text("正在保存...")
                 GLib.idle_add(progress_bar.set_fraction, 1.0)
@@ -1657,8 +1817,8 @@ class ActionController:
                         sound_name=config.FINALIZE_SOUND,
                         action_path=output_file,
                         controller=self,
-                        width=self.session.image_width, 
-                        height=self.session.total_height
+                        width=image_width,
+                        height=total_height,
                     )
                 )
                 GLib.timeout_add_seconds(12, self._ensure_cleanup)
@@ -1673,7 +1833,8 @@ class ActionController:
 
     def quit_and_cleanup(self, widget=None):
         """处理带确认的退出逻辑"""
-        if self.session.capture_count == 0:
+        if self.stitch_model.capture_count == 0:
+            logging.info("没有截图，直接退出")
             self._perform_cleanup()
             return
         response = self.view.show_quit_confirmation_dialog()
@@ -1688,6 +1849,15 @@ class ActionController:
         logging.info("正在执行清理和退出操作")
         if hotkey_listener and hotkey_listener.is_alive():
             hotkey_listener.stop()
+        if self.result_check_timer_id:
+             GLib.source_remove(self.result_check_timer_id)
+             self.result_check_timer_id = None
+             logging.info("结果检查定时器已移除")
+        if self.stitch_worker_running:
+             logging.warning("Cleanup: 检测到 StitchWorker 仍在运行，尝试最后停止...")
+             self.task_queue.put({'type': 'EXIT'})
+             self.stitch_worker.join(timeout=0.5)
+             self.stitch_worker_running = False
         if self.view.touchpad_controller:
             self.view.touchpad_controller.close()
         if self.view.invisible_scroller:
@@ -3473,6 +3643,8 @@ class CaptureOverlay(Gtk.Window):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.session = CaptureSession(geometry_str)
         self.controller = ActionController(self.session, self, config)
+        self.stitch_model = self.controller.stitch_model
+        self.stitch_model.connect('model-updated', self.on_model_updated_ui)
         self.touchpad_controller = None
         self.invisible_scroller = None
         self.screen_rect = self._get_current_monitor_geometry()
@@ -3571,16 +3743,15 @@ class CaptureOverlay(Gtk.Window):
         except Exception as e:
             logging.error(f"获取 xid 失败: {e}")
 
-    def update_ui(self):
-        """根据会话状态刷新UI元素"""
+    def on_model_updated_ui(self, model_instance):
+        """模型更新时刷新界面元素 (连接到 StitchModel 的信号)"""
         if self.show_side_panel:
-            self.side_panel.button_panel.set_undo_sensitive(self.session.capture_count > 0)
             self.side_panel.info_panel.update_info(
-                count=self.session.capture_count,
-                width=self.session.image_width,
-                height=self.session.total_height
+                count=model_instance.capture_count,
+                width=model_instance.image_width,
+                height=model_instance.total_virtual_height
             )
-        self.queue_draw()
+            self.side_panel.button_panel.set_undo_sensitive(model_instance.capture_count > 0)
 
     def show_quit_confirmation_dialog(self):
         """显示退出确认对话框并返回用户的响应"""
@@ -3603,7 +3774,7 @@ class CaptureOverlay(Gtk.Window):
         button_no.set_label(no_label)
         button_yes = dialog.get_widget_for_response(Gtk.ResponseType.YES)
         button_yes.set_label(yes_label)
-        message = config.DIALOG_QUIT_MESSAGE.format(count=self.session.capture_count)
+        message = config.DIALOG_QUIT_MESSAGE.format(count=self.stitch_model.capture_count)
         dialog.format_secondary_text(message)
         dialog.connect("key-press-event", self.on_dialog_key_press)
         response = dialog.run()
