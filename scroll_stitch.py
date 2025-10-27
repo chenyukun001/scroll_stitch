@@ -23,7 +23,8 @@ import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 gi.require_version('Notify', '0.7')
-from gi.repository import Gtk, Gdk, GLib, GObject, Notify, Pango, GdkPixbuf
+gi.require_version('PangoCairo', '1.0')
+from gi.repository import Gtk, Gdk, GLib, GObject, Notify, Pango, PangoCairo, GdkPixbuf
 import cairo
 from Xlib import display, X, protocol, XK
 from Xlib.ext import xtest
@@ -47,7 +48,6 @@ class Config:
             path_to_load = script_dir_config_path
         elif default_config_path.is_file():
             path_to_load = default_config_path
-
         if path_to_load:
             self.config_path = path_to_load
             self.parser.read(self.config_path, encoding='utf-8')
@@ -135,6 +135,7 @@ class Config:
         self.ENABLE_SCROLL_BUTTONS = self.parser.getboolean('Interface.Components', 'enable_scroll_buttons', fallback=True)
         self.ENABLE_FREE_SCROLL = self.parser.getboolean('Interface.Components', 'enable_free_scroll', fallback=True)
         self.ENABLE_SLIDER = self.parser.getboolean('Interface.Components', 'enable_slider', fallback=True)
+        self.SHOW_PREVIEW_ON_START = self.parser.getboolean('Interface.Components', 'show_preview_on_start', fallback=True)
         self.SHOW_CAPTURE_COUNT = self.parser.getboolean('Interface.Components', 'show_capture_count', fallback=True)
         self.SHOW_TOTAL_DIMENSIONS = self.parser.getboolean('Interface.Components', 'show_total_dimensions', fallback=True)
         self.SHOW_INSTRUCTION_NOTIFICATION = self.parser.getboolean('Interface.Components', 'show_instruction_notification', fallback=True)
@@ -250,6 +251,7 @@ enable_buttons = true
 enable_scroll_buttons = true
 enable_free_scroll = true
 enable_slider = true
+show_preview_on_start = true
 show_capture_count = true
 show_total_dimensions = true
 show_instruction_notification = true
@@ -930,7 +932,7 @@ class StitchModel(GObject.Object):
         self.total_virtual_height = 0
         self.y_positions = []
         self.pixbuf_cache = collections.OrderedDict()
-        self.CACHE_SIZE = 10
+        self.CACHE_SIZE = config.parser.getint('Performance', 'preview_cache_size', fallback=10)
 
     @property
     def capture_count(self) -> int:
@@ -945,10 +947,17 @@ class StitchModel(GObject.Object):
             pixbuf = GdkPixbuf.Pixbuf.new_from_file(filepath)
             self.pixbuf_cache[filepath] = pixbuf
             if len(self.pixbuf_cache) > self.CACHE_SIZE:
-                self.pixbuf_cache.popitem(last=False)
+                oldest_key, _ = self.pixbuf_cache.popitem(last=False)
             return pixbuf
         except GLib.Error as e:
-            logging.error(f"无法加载图片用于缓存 {filepath}: {e}")
+            logging.error(f"无法加载图片文件用于缓存 {filepath}: {e}")
+            if filepath in self.pixbuf_cache:
+                 del self.pixbuf_cache[filepath]
+            return None
+        except Exception as e:
+            logging.error(f"加载 Pixbuf 时发生意外错误 {filepath}: {e}")
+            if filepath in self.pixbuf_cache:
+                 del self.pixbuf_cache[filepath]
             return None
 
     def add_entry(self, filepath: str, width: int, height: int, overlap_with_previous: int):
@@ -1553,7 +1562,7 @@ class ActionController:
                                 else:
                                     logging.warning("StitchWorker: 有效搜索范围为0，跳过重叠计算")
                             else:
-                                logging.info("StitchWorker: 主线程指示无需进行匹配，设置 overlap=0")
+                                logging.info("StitchWorker: 无需进行匹配，设置 overlap=0")
                                 overlap = 0
                     result_queue.put(('ADD_RESULT', (filepath_str, w_new, h_new, overlap)))
                 except Exception as e:
@@ -1568,7 +1577,7 @@ class ActionController:
                     task_queue.task_done()
             elif task.get('type') == 'POP':
                 logging.info("StitchWorker: 收到 POP 任务，发送确认回主线程")
-                result_queue.put(('POP_REQUEST_RECEIVED', None)) # payload 可以是 None
+                result_queue.put(('POP_REQUEST_RECEIVED', None))
                 task_queue.task_done()
             else:
                 logging.warning(f"StitchWorker: 收到未知任务类型: {task.get('type')}")
@@ -1721,16 +1730,18 @@ class ActionController:
             return
         if hotkey_listener and hotkey_listener.is_alive():
             hotkey_listener.stop()
-        logging.info("Finalize: 请求停止 StitchWorker 并等待...")
+        logging.info("请求停止 StitchWorker 并等待...")
         self.task_queue.put({'type': 'EXIT'})
         self.stitch_worker.join(timeout=2.0)
-        if self.stitch_worker.is_alive():
-             logging.warning("Finalize: StitchWorker 在2秒内未能停止，继续执行...")
         self.stitch_worker_running = False
         self._check_result_queue()
-        logging.info("Finalize: StitchWorker 已停止且结果队列已清空.")
+        logging.info("StitchWorker 已停止且结果队列已清空.")
         processing_window, progress_bar = self.view._create_processing_window()
         self.view.hide()
+        if self.view.preview_window:
+             logging.info("检测到预览窗口仍然打开，正在销毁它...")
+             GLib.idle_add(self.view.preview_window.destroy)
+             self.view.preview_window = None
         entries_snapshot = list(self.stitch_model.entries)
         image_width_snapshot = self.stitch_model.image_width
         total_height_snapshot = self.stitch_model.total_virtual_height
@@ -1847,6 +1858,7 @@ class ActionController:
     def _perform_cleanup(self):
         """执行最终的清理工作"""
         logging.info("正在执行清理和退出操作")
+        global hotkey_listener
         if hotkey_listener and hotkey_listener.is_alive():
             hotkey_listener.stop()
         if self.result_check_timer_id:
@@ -1854,7 +1866,7 @@ class ActionController:
              self.result_check_timer_id = None
              logging.info("结果检查定时器已移除")
         if self.stitch_worker_running:
-             logging.warning("Cleanup: 检测到 StitchWorker 仍在运行，尝试最后停止...")
+             logging.warning("检测到 StitchWorker 仍在运行，尝试最后停止...")
              self.task_queue.put({'type': 'EXIT'})
              self.stitch_worker.join(timeout=0.5)
              self.stitch_worker_running = False
@@ -2186,6 +2198,7 @@ class ConfigWindow(Gtk.Window):
             ('Output', 'filename_timestamp_format'),
             ('Interface.Components', 'enable_buttons'), ('Interface.Components', 'enable_scroll_buttons'),
             ('Interface.Components', 'enable_free_scroll'), ('Interface.Components', 'enable_slider'),
+            ('Interface.Components', 'show_preview_on_start'),
             ('Interface.Components', 'show_capture_count'), ('Interface.Components', 'show_total_dimensions'),
             ('Interface.Components', 'show_instruction_notification'),
             ('Behavior', 'enable_free_scroll_matching'), ('Behavior', 'capture_with_cursor'), ('Behavior', 'scroll_method'),
@@ -2828,6 +2841,7 @@ class ConfigWindow(Gtk.Window):
             ('Interface.Components', 'enable_scroll_buttons'),
             ('Interface.Components', 'enable_free_scroll'),
             ('Interface.Components', 'enable_slider'),
+            ('Interface.Components', 'show_preview_on_start'),
             ('Interface.Components', 'show_capture_count'),
             ('Interface.Components', 'show_total_dimensions'),
             ('Interface.Components', 'show_instruction_notification'),
@@ -2855,6 +2869,7 @@ class ConfigWindow(Gtk.Window):
             ("enable_scroll_buttons", "启用“前进/后退”按钮", "控制是否显示“前进”和“后退”按钮\n禁用后，仍能通过快捷键或滑块进行滚动"),
             ("enable_free_scroll", "自由模式启用滚动功能", "控制在<b>自由模式</b>下，“前进/后退”按钮及其快捷键是否可用"),
             ("enable_slider", "启用左侧滑块条", "是否在截图区域左侧显示一个用于平滑滚动的拖动条"),
+            ("show_preview_on_start", "启动时显示预览窗口", "控制是否在截图会话开始时自动打开预览窗口"),
             ("show_capture_count", "显示已截图数量", "是否在侧边栏信息面板中显示当前已截取的图片数量"),
             ("show_total_dimensions", "显示最终图片总尺寸", "是否在侧边栏信息面板中显示拼接后图片的总宽度和总高度"),
             ("enable_free_scroll_matching", "自由模式启用滚动误差修正", "在<b>自由模式</b>下，使用模板匹配来修正滚动误差，此功能会增加拼接处理时间\n启用后，请确保每次滚动有重叠部分，否则修正无效"),
@@ -3638,11 +3653,218 @@ class ConfigWindow(Gtk.Window):
         except Exception as e:
             logging.error(f"写入配置文件失败: {e}")
 
+class PreviewWindow(Gtk.Window):
+    """显示截图预览的滚动窗口"""
+    def __init__(self, model: StitchModel, parent_overlay: 'CaptureOverlay'):
+        super().__init__(title="长图预览")
+        self.model = model
+        self.parent_overlay = parent_overlay
+        self.set_transient_for(parent_overlay)
+        self.set_destroy_with_parent(True)
+        self.set_default_size(500, 800)
+        self.set_position(Gtk.WindowPosition.NONE)
+        self.was_at_bottom = True
+        self.display_total_height = 0
+        self.should_scale_width = False
+        self.last_viewport_width = -1
+        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(main_vbox)
+        # 创建 ScrolledWindow 和 DrawingArea
+        self.scrolled_window = Gtk.ScrolledWindow()
+        self.scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        main_vbox.pack_start(self.scrolled_window, True, True, 0)
+        self.drawing_area = Gtk.DrawingArea()
+        self.drawing_area.set_events(Gdk.EventMask.EXPOSURE_MASK)
+        self.scrolled_window.add(self.drawing_area)
+        button_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        button_hbox.set_halign(Gtk.Align.CENTER)
+        button_hbox.set_margin_top(5)
+        button_hbox.set_margin_bottom(5)
+        main_vbox.pack_end(button_hbox, False, False, 0)
+        self.btn_scroll_top = Gtk.Button.new_from_icon_name("go-top-symbolic", Gtk.IconSize.BUTTON)
+        self.btn_scroll_top.set_tooltip_text("滚动到顶部")
+        self.btn_scroll_top.connect("clicked", self._scroll_to_top)
+        button_hbox.pack_start(self.btn_scroll_top, False, False, 0)
+        self.btn_scroll_bottom = Gtk.Button.new_from_icon_name("go-bottom-symbolic", Gtk.IconSize.BUTTON)
+        self.btn_scroll_bottom.set_tooltip_text("滚动到底部")
+        self.btn_scroll_bottom.connect("clicked", self._scroll_to_bottom)
+        button_hbox.pack_start(self.btn_scroll_bottom, False, False, 0)
+        self.model.connect("model-updated", self.on_model_updated)
+        v_adj = self.scrolled_window.get_vadjustment()
+        if v_adj:
+            v_adj.connect("value-changed", self.on_scroll_changed)
+            v_adj.connect("changed", self._update_button_sensitivity)
+        self.drawing_area.connect("draw", self.on_draw)
+        self.scrolled_window.connect("size-allocate", self.on_viewport_resized)
+        self.on_model_updated(self.model)
+        self._update_button_sensitivity()
+        main_vbox.show_all()
+        logging.info("预览窗口已初始化")
+
+    def on_viewport_resized(self, widget, allocation):
+        if allocation.width != self.last_viewport_width:
+            self.last_viewport_width = allocation.width
+            self._update_drawing_area_size(scroll_if_needed=False)
+
+    def on_model_updated(self, model_instance):
+        logging.info("预览窗口收到模型更新信号，准备更新尺寸并重绘")
+        v_adj = self.scrolled_window.get_vadjustment()
+        old_upper = v_adj.get_upper()
+        should_scroll_now = False
+        if old_upper > 0:
+            is_currently_at_bottom = v_adj.get_value() + v_adj.get_page_size() >= old_upper - 5
+            should_scroll_now = self.was_at_bottom
+        else:
+            self.was_at_bottom = True
+            should_scroll_now = True
+        self._update_drawing_area_size(scroll_if_needed=should_scroll_now)
+
+    def _scroll_to_top(self, button):
+        v_adj = self.scrolled_window.get_vadjustment()
+        v_adj.set_value(v_adj.get_lower())
+
+    def _scroll_to_bottom(self, button):
+        v_adj = self.scrolled_window.get_vadjustment()
+        target_value = v_adj.get_upper() - v_adj.get_page_size()
+        v_adj.set_value(max(v_adj.get_lower(), target_value))
+
+    def _update_button_sensitivity(self, adjustment=None):
+        v_adj = self.scrolled_window.get_vadjustment()
+        can_scroll = v_adj.get_upper() > v_adj.get_page_size() + 1
+        self.btn_scroll_top.set_sensitive(can_scroll)
+        self.btn_scroll_bottom.set_sensitive(can_scroll)
+
+    def _update_drawing_area_size(self, scroll_if_needed=False):
+        image_width = self.model.image_width
+        unscaled_total_height = 0
+        self.display_total_height = 0
+        self.should_scale_width = False
+        if not self.model.entries:
+            requested_width = 500
+            requested_height = 800
+            logging.info("模型为空，设置预览区域请求尺寸为默认值")
+        else:
+            viewport_width = self.scrolled_window.get_allocated_width()
+            if viewport_width <= 0:
+                viewport_width, _ = self.get_default_size()
+            if viewport_width > 0 and self.last_viewport_width != viewport_width:
+                 self.last_viewport_width = viewport_width
+            requested_width = max(1, viewport_width)
+            scale_factor = 1.0
+            if image_width > viewport_width and viewport_width > 0:
+                self.should_scale_width = True
+                scale_factor = viewport_width / image_width
+            else:
+                self.should_scale_width = False
+                scale_factor = 1.0
+            for entry in self.model.entries:
+                h = entry.get('height', 0)
+                unscaled_total_height += h
+                self.display_total_height += (h * scale_factor)
+            requested_height = int(self.display_total_height)
+            self.drawing_area.set_size_request(max(1, requested_width), max(1, requested_height))
+        self.drawing_area.queue_draw()
+        GLib.idle_add(self._update_button_sensitivity)
+        if scroll_if_needed and requested_height > 0:
+            GLib.idle_add(self._scroll_to_bottom_if_needed)
+
+    def _scroll_to_bottom_if_needed(self):
+        """检查并滚动到 Adjustment 的底部"""
+        v_adj = self.scrolled_window.get_vadjustment()
+        new_upper = v_adj.get_upper()
+        page_size = v_adj.get_page_size()
+        if new_upper > page_size:
+             target_value = new_upper - page_size
+             current_value = v_adj.get_value()
+             if abs(current_value - target_value) > 1:
+                  v_adj.set_value(target_value)
+                  self.was_at_bottom = True
+        else:
+             self.was_at_bottom = True
+        return GLib.SOURCE_REMOVE
+
+    def on_scroll_changed(self, adjustment):
+        is_now_at_bottom = adjustment.get_value() + adjustment.get_page_size() >= adjustment.get_upper() - 5
+        if self.was_at_bottom and not is_now_at_bottom:
+             self.was_at_bottom = False
+        elif not self.was_at_bottom and is_now_at_bottom:
+             self.was_at_bottom = True
+
+    def on_draw(self, widget, cr):
+        """绘制 DrawingArea 的内容"""
+        widget_width = widget.get_allocated_width()
+        widget_height = widget.get_allocated_height()
+        cr.set_source_rgb(0.1, 0.1, 0.1)
+        cr.paint()
+        if not self.model.entries:
+            cr.set_source_rgb(0.8, 0.8, 0.8)
+            layout = PangoCairo.create_layout(cr)
+            font_desc = Pango.FontDescription("Sans 24")
+            layout.set_font_description(font_desc)
+            layout.set_text("暂无截图", -1)
+            text_width, text_height = layout.get_pixel_size()
+            x = (widget_width - text_width) / 2
+            y = (widget_height - text_height) / 2
+            cr.move_to(x, y)
+            PangoCairo.show_layout(cr, layout)
+            return
+        initial_y_offset = 0
+        if self.display_total_height < widget_height:
+             initial_y_offset = max(0, (widget_height - self.display_total_height) / 2)
+        else:
+            pass
+        clip_x1, clip_y1, clip_x2, clip_y2 = cr.clip_extents()
+        logging.info(f"绘制区域剪裁范围: y=[{clip_y1:.2f}, {clip_y2:.2f}]")
+        y_offset = initial_y_offset
+        drawn_count = 0
+        base_img_width = self.model.image_width
+        for i, entry in enumerate(self.model.entries):
+            filepath = entry.get('filepath')
+            entry_height = entry.get('height', 0)
+            scale_factor = 1.0
+            draw_h = entry_height
+            if self.should_scale_width and base_img_width > 0:
+                scale_factor = widget_width / base_img_width
+                draw_h = entry_height * scale_factor
+            img_y_start = y_offset
+            img_y_end = y_offset + draw_h
+            if img_y_end <= clip_y1:
+                y_offset = img_y_end
+                continue
+            if img_y_start >= clip_y2:
+                break
+            pixbuf = self.model._get_cached_pixbuf(filepath)
+            if not pixbuf:
+                logging.error(f"无法加载 Pixbuf 缓存: {Path(filepath).name}")
+                y_offset = img_y_end
+                continue
+            img_w = pixbuf.get_width()
+            img_h = pixbuf.get_height()
+            draw_x = (widget_width - img_w) / 2
+            cr_scale_factor = 1.0
+            if self.should_scale_width:
+                if img_w > 0:
+                    cr_scale_factor = widget_width / img_w
+                draw_x = 0
+            try:
+                cr.save()
+                cr.translate(draw_x, img_y_start)
+                if self.should_scale_width:
+                    cr.scale(cr_scale_factor, cr_scale_factor)
+                Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+                cr.paint()
+                cr.restore()
+                drawn_count += 1
+            except Exception as e:
+                logging.error(f"  绘制 Pixbuf {Path(filepath).name} 时出错: {e}")
+            y_offset = img_y_end
+
 class CaptureOverlay(Gtk.Window):
     def __init__(self, geometry_str, config: Config):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.session = CaptureSession(geometry_str)
         self.controller = ActionController(self.session, self, config)
+        self.preview_window = None
         self.stitch_model = self.controller.stitch_model
         self.stitch_model.connect('model-updated', self.on_model_updated_ui)
         self.touchpad_controller = None
@@ -3740,6 +3962,13 @@ class CaptureOverlay(Gtk.Window):
         try:
             self.window_xid = widget.get_window().get_xid()
             GLib.idle_add(activate_window_with_xlib, self.window_xid)
+            if config.SHOW_PREVIEW_ON_START and self.preview_window is None:
+                logging.info("正在创建预览窗口...")
+                self.preview_window = PreviewWindow(self.controller.stitch_model, self)
+                self.preview_window.connect("destroy", self._on_preview_destroyed)
+                GLib.idle_add(self._position_and_show_preview)
+            elif not config.SHOW_PREVIEW_ON_START:
+                logging.info("配置项 'show_preview_on_start' 为 false，启动时不创建预览窗口。")
         except Exception as e:
             logging.error(f"获取 xid 失败: {e}")
 
@@ -3752,6 +3981,81 @@ class CaptureOverlay(Gtk.Window):
                 height=model_instance.total_virtual_height
             )
             self.side_panel.button_panel.set_undo_sensitive(model_instance.capture_count > 0)
+
+    def _position_and_show_preview(self):
+        """计算预览窗口的位置并显示它"""
+        if self.preview_window and not self.preview_window.get_visible():
+            try:
+                parent_x, parent_y = self.get_position()
+                parent_w, parent_h = self.get_size()
+                preview_def_w, preview_def_h = self.preview_window.get_default_size()
+                screen_x = self.screen_rect.x
+                screen_y = self.screen_rect.y
+                screen_w = self.screen_rect.width
+                screen_h = self.screen_rect.height
+                min_preview_w = 300
+                spacing = 20
+                space_right = (screen_x + screen_w) - (parent_x + parent_w + spacing)
+                space_left = (parent_x - spacing) - screen_x
+                can_place_right = space_right >= min_preview_w
+                can_place_left = space_left >= min_preview_w
+                place_left = False
+                available_space = 0
+                if can_place_right and can_place_left:
+                    if space_left > space_right:
+                        place_left = True
+                        available_space = space_left
+                    else:
+                        place_left = False
+                        available_space = space_right
+                elif can_place_right:
+                    place_left = False
+                    available_space = space_right
+                elif can_place_left:
+                    place_left = True
+                    available_space = space_left
+                else:
+                    place_left = True
+                    available_space = space_left
+                if available_space >= min_preview_w:
+                    preview_w = max(min_preview_w, min(preview_def_w, available_space))
+                else:
+                    preview_w = max(300, available_space)
+                if place_left:
+                    preview_x = parent_x - spacing - preview_w
+                else:
+                    preview_x = parent_x + parent_w + spacing
+                preview_y = parent_y
+                preview_h = preview_def_h
+                screen_bottom = screen_y + screen_h
+                bottom_edge = preview_y + preview_h
+                if bottom_edge > screen_bottom:
+                    overflow = bottom_edge - screen_bottom
+                    preview_y -= overflow
+                    preview_y = max(screen_y, preview_y)
+                    preview_h = screen_bottom - preview_y
+                logging.info(f"定位预览窗口到 ({preview_x}, {preview_y}) 尺寸 ({preview_w} x {preview_h})")
+                self.preview_window.resize(preview_w, preview_h)
+                self.preview_window.move(preview_x, preview_y)
+                self.preview_window.show_all()
+                logging.info("预览窗口已显示")
+            except Exception as e:
+                logging.error(f"定位和显示预览窗口时出错: {e}")
+                if self.preview_window and not self.preview_window.get_visible():
+                    try:
+                        parent_x, parent_y = self.get_position()
+                        parent_w, _ = self.get_size()
+                        self.preview_window.move(parent_x + parent_w + 10, parent_y)
+                        self.preview_window.show_all()
+                    except Exception as fallback_e:
+                         logging.error(f"尝试后备显示预览窗口失败: {fallback_e}")
+        return False
+
+    def _on_preview_destroyed(self, widget):
+        """预览窗口关闭时的回调"""
+        logging.info("预览窗口已被销毁")
+        if self.preview_window == widget:
+            self.preview_window = None
 
     def show_quit_confirmation_dialog(self):
         """显示退出确认对话框并返回用户的响应"""
@@ -3817,42 +4121,6 @@ class CaptureOverlay(Gtk.Window):
             config.save_setting('Interface.Components', 'show_instruction_notification', 'false')
         dialog.destroy()
         return False
-
-    def show_scroll_config_dialog(self):
-        """显示一个对话框，让用户输入滚动格数"""
-        dialog = Gtk.Dialog(
-            title="辅助配置滚动单位",
-            transient_for=self,
-            modal=True
-        )
-        dialog.add_buttons(
-            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-            Gtk.STOCK_OK, Gtk.ResponseType.OK
-        )
-        content_area = dialog.get_content_area()
-        content_area.set_spacing(10)
-        info_label = Gtk.Label(
-            label="请将界面恰好滚动一个截图区域的高度，\n然后输入所需的鼠标滚轮“格”数"
-        )
-        info_label.set_justify(Gtk.Justification.CENTER)
-        entry = Gtk.Entry()
-        entry.set_placeholder_text("例如: 10")
-        # 提示系统这个输入框用于输入数字
-        entry.set_input_purpose(Gtk.InputPurpose.DIGITS)
-        content_area.pack_start(info_label, True, True, 5)
-        content_area.pack_start(entry, True, True, 5)
-        dialog.show_all()
-        response = dialog.run()
-        ticks = 0
-        if response == Gtk.ResponseType.OK:
-            try:
-                value = int(entry.get_text())
-                if value > 0:
-                    ticks = value
-            except ValueError:
-                pass
-        dialog.destroy()
-        return ticks
 
     def create_slider_panel(self):
         self.slider_panel = SliderPanel()
