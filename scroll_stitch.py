@@ -14,6 +14,8 @@ import threading
 from pathlib import Path
 from datetime import datetime
 import time
+import math
+import bisect
 from PIL import Image
 import cv2
 import numpy as np
@@ -72,6 +74,7 @@ class Config:
             'backspace': Gdk.KEY_BackSpace, 'esc': Gdk.KEY_Escape,
             'up': Gdk.KEY_Up, 'down': Gdk.KEY_Down,
             'left': Gdk.KEY_Left, 'right': Gdk.KEY_Right,
+            'minus': Gdk.KEY_minus, 'equal': Gdk.KEY_equal,
             'f1': Gdk.KEY_F1, 'f2': Gdk.KEY_F2, 'f3': Gdk.KEY_F3, 'f4': Gdk.KEY_F4,
             'f5': Gdk.KEY_F5, 'f6': Gdk.KEY_F6, 'f7': Gdk.KEY_F7, 'f8': Gdk.KEY_F8,
             'f9': Gdk.KEY_F9, 'f10': Gdk.KEY_F10, 'f11': Gdk.KEY_F11, 'f12': Gdk.KEY_F12,
@@ -209,6 +212,7 @@ class Config:
         self.MOUSE_MOVE_TOLERANCE = self.parser.getint('Performance', 'mouse_move_tolerance', fallback=5)
         self.MAX_VIEWER_DIMENSION = self.parser.getint('Performance', 'max_viewer_dimension', fallback=32767)
         self.FREE_SCROLL_DISTANCE_PX = self.parser.getint('Performance', 'free_scroll_distance_px', fallback=17)
+        self.PREVIEW_DRAG_SENSITIVITY = self.parser.getfloat('Performance', 'preview_drag_sensitivity', fallback=2.0)
         # Hotkeys
         self.str_capture = self.parser.get('Hotkeys', 'capture', fallback='space')
         self.str_finalize = self.parser.get('Hotkeys', 'finalize', fallback='enter')
@@ -221,6 +225,8 @@ class Config:
         self.str_configure_scroll_unit = self.parser.get('Hotkeys', 'configure_scroll_unit', fallback='s')
         self.str_toggle_grid_mode = self.parser.get('Hotkeys', 'toggle_grid_mode', fallback='<shift>')
         self.str_open_config_editor = self.parser.get('Hotkeys', 'open_config_editor', fallback='g')
+        self.str_preview_zoom_in = self.parser.get('Hotkeys', 'preview_zoom_in', fallback='<ctrl>+equal')
+        self.str_preview_zoom_out = self.parser.get('Hotkeys', 'preview_zoom_out', fallback='<ctrl>+minus')
         self.str_toggle_hotkeys_enabled = self.parser.get('Hotkeys', 'toggle_hotkeys_enabled', fallback='f4')
         self.HOTKEY_CAPTURE = self._parse_hotkey_string(self.str_capture)
         self.HOTKEY_FINALIZE = self._parse_hotkey_string(self.str_finalize)
@@ -232,6 +238,8 @@ class Config:
         self.HOTKEY_TOGGLE_GRID_MODE = self._parse_hotkey_string(self.str_toggle_grid_mode)
         self.HOTKEY_OPEN_CONFIG_EDITOR = self._parse_hotkey_string(self.str_open_config_editor)
         self.HOTKEY_TOGGLE_HOTKEYS_ENABLED = self._parse_hotkey_string(self.str_toggle_hotkeys_enabled)
+        self.HOTKEY_PREVIEW_ZOOM_IN = self._parse_hotkey_string(self.str_preview_zoom_in)
+        self.HOTKEY_PREVIEW_ZOOM_OUT = self._parse_hotkey_string(self.str_preview_zoom_out)
         self.HOTKEY_DIALOG_CONFIRM = self._parse_hotkey_string(self.str_dialog_confirm)
         self.HOTKEY_DIALOG_CANCEL = self._parse_hotkey_string(self.str_dialog_cancel)
 
@@ -321,6 +329,7 @@ slider_sensitivity = 1.8
 mouse_move_tolerance = 5
 max_viewer_dimension = 32767
 free_scroll_distance_px = 17
+preview_drag_sensitivity = 2.0
 
 [Hotkeys]
 capture = space
@@ -333,6 +342,8 @@ configure_scroll_unit = s
 toggle_grid_mode = <shift>
 open_config_editor = g
 toggle_hotkeys_enabled = f4
+preview_zoom_in = <ctrl>+equal
+preview_zoom_out = <ctrl>+minus
 dialog_confirm = space
 dialog_cancel = esc
 
@@ -2216,7 +2227,7 @@ class ConfigWindow(Gtk.Window):
             ('System', 'large_image_opener'), ('System', 'sound_theme'),
             ('System', 'capture_sound'), ('System', 'undo_sound'), ('System', 'finalize_sound'),
             ('Performance', 'grid_matching_max_overlap'), ('Performance', 'free_scroll_matching_max_overlap'), ('Performance', 'slider_sensitivity'), ('Performance', 'mouse_move_tolerance'),
-            ('Performance', 'free_scroll_distance_px'), ('Performance', 'max_viewer_dimension'),
+            ('Performance', 'free_scroll_distance_px'), ('Performance', 'max_viewer_dimension'), ('Performance', 'preview_drag_sensitivity'),
             ('System', 'log_file'), ('System', 'temp_directory_base'),
         ]
         self.sound_data = self._discover_sound_themes()
@@ -2413,8 +2424,6 @@ class ConfigWindow(Gtk.Window):
                  return '<ctrl>'
              if 'alt' in key_name_lower and '<shift>' not in mods and '<ctrl>' not in mods and '<super>' not in mods:
                  return '<alt>'
-             if 'super' in key_name_lower and '<shift>' not in mods and '<ctrl>' not in mods and '<alt>' not in mods:
-                 return '<super>'
         rev_map = {v: k for k, v in self.config._key_map_gtk_special.items()}
         print(keyval)
         main_key_str = ""
@@ -2801,8 +2810,9 @@ class ConfigWindow(Gtk.Window):
             ("undo", "撤销"), ("cancel", "取消"),
             ("scroll_up", "后退"), ("scroll_down", "前进"),
             ("configure_scroll_unit", "配置滚动单位"), ("toggle_grid_mode", "切换整格模式"),
-            ("open_config_editor", "激活/隐藏配置窗口"), ("toggle_hotkeys_enabled", "启用/禁用全局热键"), ("dialog_confirm", "退出对话框确认"),
-            ("dialog_cancel", "退出对话框取消")
+            ("open_config_editor", "激活/隐藏配置窗口"), ("toggle_hotkeys_enabled", "启用/禁用全局热键"), 
+            ("preview_zoom_in", "预览窗口放大"), ("preview_zoom_out", "预览窗口缩小"),
+            ("dialog_confirm", "退出对话框确认"), ("dialog_cancel", "退出对话框取消")
         ]
         self.managed_settings.extend([('Hotkeys', key) for key, _ in self.hotkey_configs])
         self.hotkey_buttons = {}
@@ -3279,7 +3289,8 @@ class ConfigWindow(Gtk.Window):
             ("free_scroll_matching_max_overlap", "自由模式误差修正范围", 20, 300, "<b>自由模式</b>下的误差修正设置最大搜索范围\n值越大，处理用时越长"),
             ("mouse_move_tolerance", "鼠标容差", 0, 50, "在使用“移动用户光标”方式滚动后，若用户鼠标的移动距离超过此像素值，程序将不会把光标移回原位"),
             ("free_scroll_distance_px", "自由滚动步长", 10, 500, "在<b>自由模式</b>下，“前进”/“后退”滚动的相对距离"),
-            ("max_viewer_dimension", "图片尺寸阈值", -1, 131071, "最终图片长或宽超过此值时，会使用上面的“大尺寸图片打开命令”\n设为 <b>-1</b> 禁用此功能，总是用系统默认方式打开图片\n设为 <b>0</b> 总是用自定义命令打开图片")
+            ("max_viewer_dimension", "图片尺寸阈值", -1, 131071, "最终图片长或宽超过此值时，会使用上面的“大尺寸图片打开命令”\n设为 <b>-1</b> 禁用此功能，总是用系统默认方式打开图片\n设为 <b>0</b> 总是用自定义命令打开图片"),
+            ("preview_drag_sensitivity", "预览拖动灵敏度", 0.5, 10.0, "预览窗口中按住左键拖动图像的速度倍数")
         ]
         self.performance_spins = {}
         for i, (key, desc, min_val, max_val, tooltip) in enumerate(performance_configs):
@@ -3291,6 +3302,9 @@ class ConfigWindow(Gtk.Window):
             spin.connect("scroll-event", lambda widget, event: True)
             spin.set_range(min_val, max_val)
             spin.set_increments(1, 10)
+            if isinstance(min_val, float) or isinstance(max_val, float): # 处理浮点数 SpinButton
+                spin.set_digits(1)
+                spin.set_increments(0.1, 1.0)
             spin.set_halign(Gtk.Align.START)
             grid3.attach(label, 0, i + 1, 1, 1)
             grid3.attach(spin, 1, i + 1, 1, 1)
@@ -3554,7 +3568,7 @@ class ConfigWindow(Gtk.Window):
         elif isinstance(widget, Gtk.ComboBoxText):
             return widget.get_active_id()
         elif isinstance(widget, Gtk.SpinButton):
-            if key == 'slider_sensitivity':
+            if key in ('slider_sensitivity', 'preview_drag_sensitivity'):
                  return f"{widget.get_value():.1f}"
             else:
                  return str(widget.get_value_as_int())
@@ -3655,18 +3669,32 @@ class ConfigWindow(Gtk.Window):
 
 class PreviewWindow(Gtk.Window):
     """显示截图预览的滚动窗口"""
-    def __init__(self, model: StitchModel, parent_overlay: 'CaptureOverlay'):
+    ZOOM_FACTOR = 1.26  # 缩放系数
+    MIN_ZOOM = 0.25     # 最小缩放比例
+    MAX_ZOOM = 4.0      # 最大缩放比例
+    def __init__(self, model: StitchModel, config: Config, parent_overlay: 'CaptureOverlay'):
         super().__init__(title="长图预览")
         self.model = model
         self.parent_overlay = parent_overlay
+        self.config = config
         self.set_transient_for(parent_overlay)
         self.set_destroy_with_parent(True)
         self.set_default_size(500, 800)
         self.set_position(Gtk.WindowPosition.NONE)
+        self.zoom_level = 1.0
+        self.manual_zoom_active = False
+        self.effective_scale_factor = 1.0
+        self.drawing_area_width = 1
+        self.drawing_area_height = 1
+        self.center_vertically = False
         self.was_at_bottom = True
         self.display_total_height = 0
-        self.should_scale_width = False
         self.last_viewport_width = -1
+        self.is_dragging = False
+        self.drag_start_x = 0
+        self.drag_start_y = 0
+        self.drag_start_hadj_value = 0
+        self.drag_start_vadj_value = 0
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(main_vbox)
         # 创建 ScrolledWindow 和 DrawingArea
@@ -3674,7 +3702,12 @@ class PreviewWindow(Gtk.Window):
         self.scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         main_vbox.pack_start(self.scrolled_window, True, True, 0)
         self.drawing_area = Gtk.DrawingArea()
-        self.drawing_area.set_events(Gdk.EventMask.EXPOSURE_MASK)
+        self.drawing_area.add_events(
+            Gdk.EventMask.EXPOSURE_MASK |
+            Gdk.EventMask.BUTTON_PRESS_MASK |
+            Gdk.EventMask.BUTTON_RELEASE_MASK |
+            Gdk.EventMask.POINTER_MOTION_MASK
+        )
         self.scrolled_window.add(self.drawing_area)
         button_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         button_hbox.set_halign(Gtk.Align.CENTER)
@@ -3689,17 +3722,95 @@ class PreviewWindow(Gtk.Window):
         self.btn_scroll_bottom.set_tooltip_text("滚动到底部")
         self.btn_scroll_bottom.connect("clicked", self._scroll_to_bottom)
         button_hbox.pack_start(self.btn_scroll_bottom, False, False, 0)
+        separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        button_hbox.pack_start(separator, False, False, 5)
+        self.btn_zoom_out = Gtk.Button.new_from_icon_name("zoom-out-symbolic", Gtk.IconSize.BUTTON)
+        self.btn_zoom_out.set_tooltip_text("缩小")
+        self.btn_zoom_out.connect("clicked", self._zoom_out)
+        button_hbox.pack_start(self.btn_zoom_out, False, False, 0)
+        self.btn_zoom_reset = Gtk.Button.new_from_icon_name("zoom-original-symbolic", Gtk.IconSize.BUTTON)
+        self.btn_zoom_reset.set_tooltip_text("重置缩放 (100%)")
+        self.btn_zoom_reset.connect("clicked", self._reset_zoom)
+        button_hbox.pack_start(self.btn_zoom_reset, False, False, 0)
+        self.btn_zoom_in = Gtk.Button.new_from_icon_name("zoom-in-symbolic", Gtk.IconSize.BUTTON)
+        self.btn_zoom_in.set_tooltip_text("放大")
+        self.btn_zoom_in.connect("clicked", self._zoom_in)
+        button_hbox.pack_start(self.btn_zoom_in, False, False, 0)
+        self.zoom_label = Gtk.Label(label="100%")
+        self.zoom_label.set_margin_start(5)
+        button_hbox.pack_start(self.zoom_label, False, False, 0)
         self.model.connect("model-updated", self.on_model_updated)
         v_adj = self.scrolled_window.get_vadjustment()
         if v_adj:
             v_adj.connect("value-changed", self.on_scroll_changed)
             v_adj.connect("changed", self._update_button_sensitivity)
         self.drawing_area.connect("draw", self.on_draw)
+        self.drawing_area.connect("button-press-event", self._on_drawing_area_button_press)
+        self.drawing_area.connect("motion-notify-event", self._on_drawing_area_motion_notify)
+        self.drawing_area.connect("button-release-event", self._on_drawing_area_button_release)
         self.scrolled_window.connect("size-allocate", self.on_viewport_resized)
+        self.connect("key-press-event", self._on_key_press)
+        self._setup_cursors()
         self.on_model_updated(self.model)
         self._update_button_sensitivity()
         main_vbox.show_all()
         logging.info("预览窗口已初始化")
+
+    def _setup_cursors(self):
+        """获取并存储拖动所需的光标"""
+        display = Gdk.Display.get_default()
+        self.cursor_default = None
+        self.cursor_grab = Gdk.Cursor.new_from_name(display, "grab")
+        self.cursor_grabbing = Gdk.Cursor.new_from_name(display, "grabbing")
+
+    def _on_key_press(self, widget, event):
+        """处理预览窗口的按键事件，用于缩放"""
+        keyval = event.keyval
+        state = event.state & self.config.GTK_MODIFIER_MASK
+        def is_match(hotkey_config):
+            return keyval in hotkey_config['gtk_keys'] and state == hotkey_config['gtk_mask']
+        if is_match(self.config.HOTKEY_PREVIEW_ZOOM_IN):
+            self._zoom_in()
+            return True
+        elif is_match(self.config.HOTKEY_PREVIEW_ZOOM_OUT):
+            self._zoom_out()
+            return True
+        return False
+
+    def _zoom_in(self, button=None):
+        current_base_zoom = self.zoom_level if self.manual_zoom_active else self.effective_scale_factor
+        new_zoom = current_base_zoom * self.ZOOM_FACTOR
+        if new_zoom > self.MAX_ZOOM:
+            new_zoom = self.MAX_ZOOM
+        if abs(new_zoom - current_base_zoom) > 1e-5:
+            self.zoom_level = new_zoom
+            self.manual_zoom_active = True
+            self._update_drawing_area_size()
+            self._update_button_sensitivity()
+            self._update_zoom_label()
+
+    def _zoom_out(self, button=None):
+        current_base_zoom = self.zoom_level if self.manual_zoom_active else self.effective_scale_factor
+        new_zoom = current_base_zoom / self.ZOOM_FACTOR
+        if new_zoom < self.MIN_ZOOM:
+            new_zoom = self.MIN_ZOOM
+        if abs(new_zoom - current_base_zoom) > 1e-5:
+            self.zoom_level = new_zoom
+            self.manual_zoom_active = True
+            self._update_drawing_area_size()
+            self._update_button_sensitivity()
+            self._update_zoom_label()
+
+    def _reset_zoom(self, button=None):
+        if abs(self.effective_scale_factor - 1.0) > 1e-5 or not self.manual_zoom_active:
+            self.zoom_level = 1.0
+            self.manual_zoom_active = True
+            self._update_drawing_area_size()
+            self._update_button_sensitivity()
+
+    def _update_zoom_label(self):
+        self.zoom_label.set_text(f"{self.effective_scale_factor * 100:.0f}%")
+        return GLib.SOURCE_REMOVE
 
     def on_viewport_resized(self, widget, allocation):
         if allocation.width != self.last_viewport_width:
@@ -3733,39 +3844,45 @@ class PreviewWindow(Gtk.Window):
         can_scroll = v_adj.get_upper() > v_adj.get_page_size() + 1
         self.btn_scroll_top.set_sensitive(can_scroll)
         self.btn_scroll_bottom.set_sensitive(can_scroll)
+        self.btn_zoom_in.set_sensitive(self.zoom_level < self.MAX_ZOOM)
+        self.btn_zoom_out.set_sensitive(self.zoom_level > self.MIN_ZOOM)
+        self.btn_zoom_reset.set_sensitive(abs(self.effective_scale_factor - 1.0) > 1e-5)
 
     def _update_drawing_area_size(self, scroll_if_needed=False):
+        """根据模型数据、缩放级别和视口大小计算绘制区域尺寸和缩放因子"""
         image_width = self.model.image_width
-        unscaled_total_height = 0
-        self.display_total_height = 0
-        self.should_scale_width = False
-        if not self.model.entries:
-            requested_width = 500
-            requested_height = 800
-            logging.info("模型为空，设置预览区域请求尺寸为默认值")
+        virtual_height = self.model.total_virtual_height
+        if image_width <= 0 or virtual_height <= 0:
+            viewport_width = self.scrolled_window.get_allocated_width()
+            viewport_height = self.scrolled_window.get_allocated_height()
+            if viewport_width <= 0:
+                 viewport_width, viewport_height = self.get_default_size()
+            self.drawing_area_width = max(1, viewport_width)
+            self.drawing_area_height = max(1, viewport_height)
+            self.effective_scale_factor = 1.0
+            self.center_vertically = True
+            self.display_total_height = self.drawing_area_height
         else:
             viewport_width = self.scrolled_window.get_allocated_width()
+            viewport_height = self.scrolled_window.get_allocated_height()
             if viewport_width <= 0:
                 viewport_width, _ = self.get_default_size()
-            if viewport_width > 0 and self.last_viewport_width != viewport_width:
-                 self.last_viewport_width = viewport_width
-            requested_width = max(1, viewport_width)
-            scale_factor = 1.0
+            auto_scale_factor = 1.0
             if image_width > viewport_width and viewport_width > 0:
-                self.should_scale_width = True
-                scale_factor = viewport_width / image_width
+                auto_scale_factor = viewport_width / image_width
+            if self.manual_zoom_active:
+                self.effective_scale_factor = self.zoom_level
             else:
-                self.should_scale_width = False
-                scale_factor = 1.0
-            for entry in self.model.entries:
-                h = entry.get('height', 0)
-                unscaled_total_height += h
-                self.display_total_height += (h * scale_factor)
-            requested_height = int(self.display_total_height)
-            self.drawing_area.set_size_request(max(1, requested_width), max(1, requested_height))
+                self.effective_scale_factor = auto_scale_factor
+            self.drawing_area_width = math.ceil(image_width * self.effective_scale_factor)
+            self.drawing_area_height = math.ceil(virtual_height * self.effective_scale_factor)
+            self.center_vertically = self.drawing_area_height < viewport_height
+            self.display_total_height = self.drawing_area_height
+        GLib.idle_add(self._update_zoom_label)
+        self.drawing_area.set_size_request(self.drawing_area_width, self.drawing_area_height)
         self.drawing_area.queue_draw()
         GLib.idle_add(self._update_button_sensitivity)
-        if scroll_if_needed and requested_height > 0:
+        if scroll_if_needed and self.drawing_area_height > 0 and not self.is_dragging:
             GLib.idle_add(self._scroll_to_bottom_if_needed)
 
     def _scroll_to_bottom_if_needed(self):
@@ -3791,73 +3908,107 @@ class PreviewWindow(Gtk.Window):
              self.was_at_bottom = True
 
     def on_draw(self, widget, cr):
-        """绘制 DrawingArea 的内容"""
-        widget_width = widget.get_allocated_width()
-        widget_height = widget.get_allocated_height()
-        cr.set_source_rgb(0.1, 0.1, 0.1)
-        cr.paint()
-        if not self.model.entries:
-            cr.set_source_rgb(0.8, 0.8, 0.8)
-            layout = PangoCairo.create_layout(cr)
-            font_desc = Pango.FontDescription("Sans 24")
-            layout.set_font_description(font_desc)
-            layout.set_text("暂无截图", -1)
-            text_width, text_height = layout.get_pixel_size()
-            x = (widget_width - text_width) / 2
-            y = (widget_height - text_height) / 2
-            cr.move_to(x, y)
-            PangoCairo.show_layout(cr, layout)
-            return
-        initial_y_offset = 0
-        if self.display_total_height < widget_height:
-             initial_y_offset = max(0, (widget_height - self.display_total_height) / 2)
-        else:
-            pass
-        clip_x1, clip_y1, clip_x2, clip_y2 = cr.clip_extents()
-        logging.info(f"绘制区域剪裁范围: y=[{clip_y1:.2f}, {clip_y2:.2f}]")
-        y_offset = initial_y_offset
-        drawn_count = 0
-        base_img_width = self.model.image_width
-        for i, entry in enumerate(self.model.entries):
-            filepath = entry.get('filepath')
-            entry_height = entry.get('height', 0)
-            scale_factor = 1.0
-            draw_h = entry_height
-            if self.should_scale_width and base_img_width > 0:
-                scale_factor = widget_width / base_img_width
-                draw_h = entry_height * scale_factor
-            img_y_start = y_offset
-            img_y_end = y_offset + draw_h
-            if img_y_end <= clip_y1:
-                y_offset = img_y_end
-                continue
-            if img_y_start >= clip_y2:
-                break
-            pixbuf = self.model._get_cached_pixbuf(filepath)
-            if not pixbuf:
-                logging.error(f"无法加载 Pixbuf 缓存: {Path(filepath).name}")
-                y_offset = img_y_end
-                continue
-            img_w = pixbuf.get_width()
-            img_h = pixbuf.get_height()
-            draw_x = (widget_width - img_w) / 2
-            cr_scale_factor = 1.0
-            if self.should_scale_width:
-                if img_w > 0:
-                    cr_scale_factor = widget_width / img_w
-                draw_x = 0
-            try:
-                cr.save()
-                cr.translate(draw_x, img_y_start)
-                if self.should_scale_width:
-                    cr.scale(cr_scale_factor, cr_scale_factor)
-                Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
-                cr.paint()
-                cr.restore()
-                drawn_count += 1
-            except Exception as e:
-                logging.error(f"  绘制 Pixbuf {Path(filepath).name} 时出错: {e}")
-            y_offset = img_y_end
+         """绘制 DrawingArea 的内容"""
+         widget_width = widget.get_allocated_width()
+         widget_height = widget.get_allocated_height()
+         cr.set_source_rgb(0.1, 0.1, 0.1)
+         cr.paint()
+         if not self.model.entries:
+             cr.set_source_rgb(0.8, 0.8, 0.8)
+             layout = PangoCairo.create_layout(cr)
+             font_desc = Pango.FontDescription("Sans 24")
+             layout.set_font_description(font_desc)
+             layout.set_text("暂无截图", -1)
+             text_width, text_height = layout.get_pixel_size()
+             x = (widget_width - text_width) / 2
+             y = (widget_height - text_height) / 2
+             cr.move_to(x, y)
+             PangoCairo.show_layout(cr, layout)
+             return
+         scale_factor = self.effective_scale_factor
+         draw_area_w = self.drawing_area_width
+         draw_area_h = self.drawing_area_height
+         draw_x_offset = (widget_width - draw_area_w) / 2 if widget_width > draw_area_w else 0
+         initial_y_offset = (widget_height - draw_area_h) / 2 if self.center_vertically else 0
+         initial_y_offset = max(0, initial_y_offset)
+         clip_x1, visible_y1_widget, clip_x2, visible_y2_widget = cr.clip_extents()
+         visible_y1_draw = visible_y1_widget - initial_y_offset
+         visible_y2_draw = visible_y2_widget - initial_y_offset
+         scaled_y_positions = [y * scale_factor for y in self.model.y_positions]
+         first_index = max(0, bisect.bisect_right(scaled_y_positions, visible_y1_draw) - 1)
+         drawn_count = 0
+         for i in range(first_index, len(self.model.entries)):
+             entry = self.model.entries[i]
+             filepath = entry.get('filepath')
+             original_h = entry.get('height', 0)
+             scaled_y_pos = scaled_y_positions[i]
+             scaled_h = original_h * scale_factor
+             if scaled_y_pos >= visible_y2_draw:
+                 break
+             if scaled_y_pos + scaled_h <= visible_y1_draw:
+                 continue
+             pixbuf = self.model._get_cached_pixbuf(filepath)
+             if not pixbuf:
+                 logging.error(f"无法为 {Path(filepath).name} 获取 Pixbuf")
+                 continue
+             try:
+                 cr.save()
+                 cr.translate(draw_x_offset, scaled_y_pos + initial_y_offset)
+                 cr.scale(scale_factor, scale_factor)
+                 Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+                 cr.paint()
+                 cr.restore()
+                 drawn_count += 1
+             except Exception as e:
+                 logging.error(f"绘制 Pixbuf {Path(filepath).name} 时出错: {e}")
+                 try: cr.restore()
+                 except cairo.Error: pass
+
+    def _on_drawing_area_button_press(self, widget, event):
+        if event.button == 1:
+            hadj = self.scrolled_window.get_hadjustment()
+            vadj = self.scrolled_window.get_vadjustment()
+            can_scroll_h = hadj and hadj.get_upper() > hadj.get_page_size()
+            can_scroll_v = vadj and vadj.get_upper() > vadj.get_page_size()
+            if can_scroll_h or can_scroll_v:
+                self.is_dragging = True
+                self.drag_start_x = event.x_root
+                self.drag_start_y = event.y_root
+                self.drag_start_hadj_value = hadj.get_value() if hadj else 0
+                self.drag_start_vadj_value = vadj.get_value() if vadj else 0
+                self.get_window().set_cursor(self.cursor_grab)
+                return True
+        return False
+
+    def _on_drawing_area_motion_notify(self, widget, event):
+        if self.is_dragging:
+            hadj = self.scrolled_window.get_hadjustment()
+            vadj = self.scrolled_window.get_vadjustment()
+            current_hadj_before = hadj.get_value() if hadj else 0
+            current_vadj_before = vadj.get_value() if vadj else 0
+            drag_sensitivity = self.config.PREVIEW_DRAG_SENSITIVITY
+            delta_x = event.x_root - self.drag_start_x
+            delta_y = event.y_root - self.drag_start_y
+            if hadj:
+                new_h_value = self.drag_start_hadj_value - (delta_x * drag_sensitivity)
+                new_h_value_clamped = max(hadj.get_lower(), min(new_h_value, hadj.get_upper() - hadj.get_page_size()))
+                hadj.set_value(new_h_value_clamped)
+            if vadj:
+                new_v_value = self.drag_start_vadj_value - (delta_y * drag_sensitivity)
+                new_v_value_clamped = max(vadj.get_lower(), min(new_v_value, vadj.get_upper() - vadj.get_page_size()))
+                vadj.set_value(new_v_value_clamped)
+            actual_h_after = hadj.get_value() if hadj else 0
+            actual_v_after = vadj.get_value() if vadj else 0
+            self.get_window().set_cursor(self.cursor_grabbing)
+            return True
+        return False
+
+    def _on_drawing_area_button_release(self, widget, event):
+        if event.button == 1 and self.is_dragging:
+            self.is_dragging = False
+            self.get_window().set_cursor(self.cursor_default)
+            return True
+        return False
 
 class CaptureOverlay(Gtk.Window):
     def __init__(self, geometry_str, config: Config):
@@ -3964,7 +4115,7 @@ class CaptureOverlay(Gtk.Window):
             GLib.idle_add(activate_window_with_xlib, self.window_xid)
             if config.SHOW_PREVIEW_ON_START and self.preview_window is None:
                 logging.info("正在创建预览窗口...")
-                self.preview_window = PreviewWindow(self.controller.stitch_model, self)
+                self.preview_window = PreviewWindow(self.controller.stitch_model, config, self)
                 self.preview_window.connect("destroy", self._on_preview_destroyed)
                 GLib.idle_add(self._position_and_show_preview)
             elif not config.SHOW_PREVIEW_ON_START:
@@ -3981,6 +4132,7 @@ class CaptureOverlay(Gtk.Window):
                 height=model_instance.total_virtual_height
             )
             self.side_panel.button_panel.set_undo_sensitive(model_instance.capture_count > 0)
+        self.queue_draw()
 
     def _position_and_show_preview(self):
         """计算预览窗口的位置并显示它"""
@@ -3989,11 +4141,12 @@ class CaptureOverlay(Gtk.Window):
                 parent_x, parent_y = self.get_position()
                 parent_w, parent_h = self.get_size()
                 preview_def_w, preview_def_h = self.preview_window.get_default_size()
+                min_req, _ = self.preview_window.get_preferred_size()
+                min_preview_w = min_req.width
                 screen_x = self.screen_rect.x
                 screen_y = self.screen_rect.y
                 screen_w = self.screen_rect.width
                 screen_h = self.screen_rect.height
-                min_preview_w = 300
                 spacing = 20
                 space_right = (screen_x + screen_w) - (parent_x + parent_w + spacing)
                 space_left = (parent_x - spacing) - screen_x
@@ -4017,10 +4170,7 @@ class CaptureOverlay(Gtk.Window):
                 else:
                     place_left = True
                     available_space = space_left
-                if available_space >= min_preview_w:
-                    preview_w = max(min_preview_w, min(preview_def_w, available_space))
-                else:
-                    preview_w = max(300, available_space)
+                preview_w = max(min_preview_w, min(preview_def_w, available_space))
                 if place_left:
                     preview_x = parent_x - spacing - preview_w
                 else:
@@ -4045,7 +4195,7 @@ class CaptureOverlay(Gtk.Window):
                     try:
                         parent_x, parent_y = self.get_position()
                         parent_w, _ = self.get_size()
-                        self.preview_window.move(parent_x + parent_w + 10, parent_y)
+                        self.preview_window.move(parent_x + parent_w + spacing, parent_y)
                         self.preview_window.show_all()
                     except Exception as fallback_e:
                          logging.error(f"尝试后备显示预览窗口失败: {fallback_e}")
