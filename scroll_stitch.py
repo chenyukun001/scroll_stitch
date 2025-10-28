@@ -131,6 +131,7 @@ class Config:
         self.ENABLE_FREE_SCROLL_MATCHING = self.parser.getboolean('Behavior', 'enable_free_scroll_matching', fallback=True)
         self.SCROLL_METHOD = self.parser.get('Behavior', 'scroll_method', fallback='move_user_cursor')
         self.CAPTURE_WITH_CURSOR = self.parser.getboolean('Behavior', 'capture_with_cursor', fallback=False)
+        self.REUSE_INVISIBLE_CURSOR = self.parser.getboolean('Behavior', 'reuse_invisible_cursor', fallback=False)
         self.FORWARD_ACTION = self.parser.get('Behavior', 'forward_action', fallback='scroll_capture')
         self.BACKWARD_ACTION = self.parser.get('Behavior', 'backward_action', fallback='scroll_delete')
         # Interface.Components
@@ -251,6 +252,7 @@ class Config:
 enable_free_scroll_matching = true
 scroll_method = move_user_cursor
 capture_with_cursor = false
+reuse_invisible_cursor = false
 forward_action = scroll_capture
 backward_action = scroll_delete
 
@@ -459,15 +461,37 @@ class EvdevTouchpadSimulator:
                 time.sleep(0.01)
 
 class InvisibleCursorScroller:
-    def __init__(self, screen_w, screen_h):
+    def __init__(self, screen_w, screen_h, config: Config):
+        self.config = config
         self.screen_w = screen_w
         self.screen_h = screen_h
         self.master_id = None
         self.ui_mouse = None
         self.ui_touchpad = None
-        self.unique_name = f"scroll-stitch-cursor-{int(time.time())}"
+        self.unique_name = "scroll-stitch-cursor"
         self.park_position = (self.screen_w - 1, self.screen_h - 1)
         self.is_ready = False
+
+    def _device_exists(self, device_name):
+        """检查具有给定名称的 xinput 设备是否存在"""
+        try:
+            output = subprocess.check_output(['xinput', 'list', '--name-only']).decode()
+            return device_name in output.splitlines()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
+    def _get_all_master_ids(self, master_name):
+        """获取所有具有指定名称的主指针设备的ID列表"""
+        ids = []
+        try:
+            output = subprocess.check_output(['xinput', 'list']).decode()
+            pattern = fr'{re.escape(master_name)} pointer\s+id=(\d+)'
+            matches = re.findall(pattern, output)
+            ids = [int(match) for match in matches]
+            logging.info(f"找到 {len(ids)} 个名为 '{master_name}' 的主指针设备: {ids}")
+        except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
+            logging.error(f"查找主设备 ID 时出错: {e}")
+        return ids
 
     def _wait_for_device(self, device_name, timeout=3):
         """轮询 'xinput list' 直到找到指定的设备或超时"""
@@ -486,28 +510,95 @@ class InvisibleCursorScroller:
 
     def setup(self):
         try:
-            subprocess.check_call(['xinput', 'create-master', self.unique_name])
-            output = subprocess.check_output(['xinput', 'list']).decode()
-            match = re.search(fr'{re.escape(self.unique_name)} pointer\s+id=(\d+)', output)
-            if not match:
-                raise RuntimeError(f"未能找到新 master device 的 ID: {self.unique_name}")
-            self.master_id = int(match.group(1))
-            self._create_virtual_devices()
+            master_pointer_name = f"{self.unique_name} pointer"
             mouse_dev_name = f"VirtualMouse-{self.unique_name}"
             touchpad_dev_name = f"VirtualTouchpad-{self.unique_name}"
-            if not self._wait_for_device(mouse_dev_name) or not self._wait_for_device(touchpad_dev_name):
-                 raise RuntimeError("一个或多个虚拟设备未能被 X Server 及时识别")
-            subprocess.check_call(['xinput', 'reattach', mouse_dev_name, str(self.master_id)])
-            subprocess.check_call(['xinput', 'reattach', touchpad_dev_name, str(self.master_id)])
+            existing_master_ids = self._get_all_master_ids(self.unique_name)
+            master_id_to_use = None
+            if not self.config.REUSE_INVISIBLE_CURSOR:
+                if existing_master_ids:
+                    logging.info("配置为不复用，正在尝试清理所有检测到的旧主设备...")
+                    for old_id in existing_master_ids:
+                        try:
+                            result = subprocess.run(
+                                ['xinput', 'remove-master', str(old_id)],
+                                check=False, capture_output=True, text=True, timeout=1
+                            )
+                            if result.returncode == 0:
+                                logging.info(f"成功移除旧主设备 ID: {old_id}")
+                            else:
+                                logging.warning(f"尝试移除旧主设备 ID {old_id} 未成功 (可能已被移除或权限问题). stderr: {result.stderr.strip()}")
+                        except subprocess.TimeoutExpired:
+                            logging.warning(f"移除旧主设备 ID {old_id} 超时.")
+                        except Exception as e_remove:
+                            logging.warning(f"尝试移除旧主设备 ID {old_id} 时发生异常: {e_remove}")
+                    existing_master_ids = []
+                else:
+                    logging.info("配置为不复用，且未检测到旧主设备。")
+            else:
+                if len(existing_master_ids) == 0:
+                    logging.info("配置为复用，但未找到现有设备，将创建新设备。")
+                elif len(existing_master_ids) == 1:
+                    master_id_to_use = existing_master_ids[0]
+                    logging.info(f"配置为复用，找到唯一现有设备 ID: {master_id_to_use}，将复用。")
+                else:
+                    logging.warning(f"配置为复用，但检测到多个 ({len(existing_master_ids)}) 同名主设备: {existing_master_ids}。将尝试复用第一个 ID: {existing_master_ids[0]}")
+                    master_id_to_use = existing_master_ids[0]
+            if master_id_to_use is None:
+                logging.info(f"创建新的主指针设备 '{self.unique_name}'")
+                ids_before = self._get_all_master_ids(self.unique_name)
+                subprocess.check_call(['xinput', 'create-master', self.unique_name])
+                time.sleep(0.2)
+                new_master_id = None
+                output_after = ""
+                for _ in range(10):
+                    ids_after = self._get_all_master_ids(self.unique_name)
+                    diff_ids = list(set(ids_after) - set(ids_before))
+                    if len(diff_ids) == 1:
+                        new_master_id = diff_ids[0]
+                        logging.info(f"成功识别新创建的主设备 ID: {new_master_id}")
+                        break
+                    elif len(diff_ids) > 1:
+                         logging.warning(f"检测到多个新设备 ID: {diff_ids}，将使用第一个: {diff_ids[0]}")
+                         new_master_id = diff_ids[0]
+                         break
+                    time.sleep(0.1)
+                else:
+                    ids_now = self._get_all_master_ids(self.unique_name)
+                    if len(ids_now) == len(ids_before) + 1:
+                        new_master_id = max(ids_now) if ids_now else None
+                    else:
+                        raise RuntimeError(f"创建主设备后无法可靠地识别其 ID。创建前: {ids_before}, 当前: {ids_now}")
+                self.master_id = new_master_id
+                self._create_virtual_devices()
+                if not self._wait_for_device(mouse_dev_name) or not self._wait_for_device(touchpad_dev_name):
+                    logging.error("虚拟设备未能及时被 X Server 识别。尝试清理...")
+                    try:
+                        subprocess.run(['xinput', 'remove-master', str(self.master_id)], check=False)
+                    except Exception as e_cleanup:
+                        logging.warning(f"清理失败的主设备 {self.master_id} 时出错: {e_cleanup}")
+                logging.info(f"将新虚拟设备附加到主设备 ID {self.master_id}")
+                subprocess.check_call(['xinput', 'reattach', mouse_dev_name, str(self.master_id)])
+                subprocess.check_call(['xinput', 'reattach', touchpad_dev_name, str(self.master_id)])
+            else:
+                self.master_id = master_id_to_use
+                try:
+                    self._create_virtual_devices()
+                    logging.info(f"尝试重新打开 UInput 句柄以复用设备 (Master ID: {self.master_id})。")
+                    subprocess.check_call(['xinput', 'reattach', mouse_dev_name, str(self.master_id)])
+                    subprocess.check_call(['xinput', 'reattach', touchpad_dev_name, str(self.master_id)])
+                    logging.info(f"已重新附加虚拟设备到 Master ID: {self.master_id}")
+                except Exception as e_reopen:
+                    logging.warning(f"复用设备 (Master ID: {self.master_id}) 时重新打开 UInput 或重新附加失败: {e_reopen}。滚动功能可能无效。")
             self.park()
-            logging.info(f"已创建并附加隐形光标 (Master ID: {self.master_id})")
+            logging.info(f"隐形光标设置完成 (Master ID: {self.master_id})")
             self.is_ready = True
             return self
         except Exception as e:
-            logging.error(f"创建隐形光标失败: {e}")
+            logging.error(f"创建/设置隐形光标失败: {e}")
             self.cleanup()
             self.is_ready = False
-            raise
+            return self
 
     def park(self):
         self.move(*self.park_position)
@@ -567,23 +658,26 @@ class InvisibleCursorScroller:
         self.touchpad_simulator.scroll(distance, steps)
 
     def cleanup(self):
-        if self.ui_mouse:
-            self.ui_mouse.close()
-        if self.ui_touchpad:
-            self.ui_touchpad.close()
-        if self.master_id is not None:
-            try:
-                output = subprocess.check_output(['xinput', 'list']).decode()
-                core_ptr_match = re.search(r'Virtual core pointer\s+id=(\d+)', output)
-                if core_ptr_match:
-                    core_id = core_ptr_match.group(1)
-                    subprocess.check_call(['xinput', 'remove-master', f'{self.unique_name} pointer', 'AttachToMaster', core_id])
-                else:
-                    subprocess.check_call(['xinput', 'remove-master', f'{self.unique_name} pointer'])
-                logging.info(f"已移除隐形光标 (Master ID: {self.master_id})")
-            except Exception as e:
-                logging.error(f"清理隐形光标失败: {e}")
-        self.master_id = None
+        if not self.config.REUSE_INVISIBLE_CURSOR:
+            logging.info("清理隐形光标资源")
+            if self.ui_mouse:
+                self.ui_mouse.close()
+                self.ui_mouse = None
+            if self.ui_touchpad:
+                self.ui_touchpad.close()
+                self.ui_touchpad = None
+            if self.master_id is not None:
+                try:
+                     command = ['xinput', 'remove-master', str(self.master_id)]
+                     subprocess.check_call(command)
+                     logging.info(f"已移除隐形光标 (Master ID: {self.master_id})")
+                except Exception as e:
+                     logging.warning(f"清理隐形光标主设备时出错: {e}")
+            self.master_id = None
+        else:
+            logging.info("跳过隐形光标资源清理（启用复用）")
+            if self.is_ready:
+                self.park()
 
 class VirtualTouchpadController:
     """ 只有在其实例被创建时，才会尝试导入 evdev 库 """
@@ -1877,7 +1971,7 @@ class ActionController:
              self.result_check_timer_id = None
              logging.info("结果检查定时器已移除")
         if self.stitch_worker_running:
-             logging.warning("检测到 StitchWorker 仍在运行，尝试最后停止...")
+             logging.info("检测到 StitchWorker 仍在运行，尝试最后停止...")
              self.task_queue.put({'type': 'EXIT'})
              self.stitch_worker.join(timeout=0.5)
              self.stitch_worker_running = False
@@ -2212,7 +2306,7 @@ class ConfigWindow(Gtk.Window):
             ('Interface.Components', 'show_preview_on_start'),
             ('Interface.Components', 'show_capture_count'), ('Interface.Components', 'show_total_dimensions'),
             ('Interface.Components', 'show_instruction_notification'),
-            ('Behavior', 'enable_free_scroll_matching'), ('Behavior', 'capture_with_cursor'), ('Behavior', 'scroll_method'),
+            ('Behavior', 'enable_free_scroll_matching'), ('Behavior', 'capture_with_cursor'), ('Behavior', 'scroll_method'), ('Behavior', 'reuse_invisible_cursor'),
             ('Behavior', 'forward_action'), ('Behavior', 'backward_action'),
             ('Interface.Theme', 'border_color'), ('Interface.Theme', 'matching_indicator_color'),
             ('Interface.Theme', 'slider_marks_per_side'),
@@ -2857,6 +2951,7 @@ class ConfigWindow(Gtk.Window):
             ('Interface.Components', 'show_instruction_notification'),
             ('Behavior', 'capture_with_cursor'),
             ('Behavior', 'scroll_method'),
+            ('Behavior', 'reuse_invisible_cursor'),
             ('Behavior', 'forward_action'),
             ('Behavior', 'backward_action'),
         ]
@@ -2882,7 +2977,6 @@ class ConfigWindow(Gtk.Window):
             ("show_preview_on_start", "启动时显示预览窗口", "控制是否在截图会话开始时自动打开预览窗口"),
             ("show_capture_count", "显示已截图数量", "是否在侧边栏信息面板中显示当前已截取的图片数量"),
             ("show_total_dimensions", "显示最终图片总尺寸", "是否在侧边栏信息面板中显示拼接后图片的总宽度和总高度"),
-            ("enable_free_scroll_matching", "自由模式启用滚动误差修正", "在<b>自由模式</b>下，使用模板匹配来修正滚动误差，此功能会增加拼接处理时间\n启用后，请确保每次滚动有重叠部分，否则修正无效"),
             ("show_instruction_notification", "启动时显示操作说明", "每次启动截图会话时，是否弹出一个包含基本操作指南的通知")
         ]
         self.component_checkboxes = {}
@@ -2907,6 +3001,10 @@ class ConfigWindow(Gtk.Window):
         self.cursor_checkbox = Gtk.CheckButton(label="截取鼠标指针")
         self.cursor_checkbox.set_tooltip_markup("截图时是否将鼠标指针也一并截取下来")
         grid2.attach(self.cursor_checkbox, 0, 0, 2, 1)
+        self.free_scroll_matching_checkbox = Gtk.CheckButton(label="自由模式启用滚动误差修正")
+        tooltip = "在<b>自由模式</b>下，使用模板匹配来修正滚动误差，此功能会增加拼接处理时间\n启用后，请确保每次滚动有重叠部分，否则修正无效"
+        self.free_scroll_matching_checkbox.set_tooltip_markup(tooltip)
+        grid2.attach(self.free_scroll_matching_checkbox, 3, 0, 2, 1)
         # 高级行为设置
         self.behavior_advanced_frame = Gtk.Frame(label="高级行为设置")
         vbox.pack_start(self.behavior_advanced_frame, False, False, 0)
@@ -2925,7 +3023,11 @@ class ConfigWindow(Gtk.Window):
         self.scroll_method_combo.set_tooltip_markup(label.get_tooltip_markup())
         self.scroll_method_combo.connect("scroll-event", lambda widget, event: True)
         self.scroll_method_combo.append("move_user_cursor", "移动用户光标")
-        self.scroll_method_combo.append("invisible_cursor", "使用隐形光标")
+        self.scroll_method_combo.append("invisible_cursor", "使用隐形光标（实验性功能）")
+        self.reuse_cursor_checkbox = Gtk.CheckButton(label="复用隐形光标设备")
+        self.reuse_cursor_checkbox.set_tooltip_markup("勾选后，在使用“隐形光标”滚动方式时，程序退出后不会删除创建的虚拟鼠标和触摸板设备，下次启动时会尝试复用它们")
+        self.reuse_cursor_checkbox.connect("toggled", lambda w: self._on_behavior_toggled(w, 'reuse_invisible_cursor'))
+        grid3.attach(self.reuse_cursor_checkbox, 3, 0, 2, 1)
         grid3.attach(label, 0, 0, 1, 1)
         grid3.attach(self.scroll_method_combo, 1, 0, 1, 1)
         # 前进/后退按钮功能
@@ -3496,6 +3598,9 @@ class ConfigWindow(Gtk.Window):
         text = widget.get_text()
         self.config.save_setting('Hotkeys', key, text)
 
+    def _on_behavior_toggled(self, widget, key):
+        is_active = widget.get_active()
+        self.config.save_setting('Behavior', key, str(is_active).lower())
     def _on_component_toggled(self, widget, key):
         is_active = widget.get_active()
         self.config.save_setting('Interface.Components', key, str(is_active).lower())
@@ -3522,21 +3627,16 @@ class ConfigWindow(Gtk.Window):
             'filename_timestamp_format': self.timestamp_entry,
             'border_color': self.border_color_button,
             'matching_indicator_color': self.indicator_color_button,
-           'border_width': self.border_width_spin,
+            'border_width': self.border_width_spin,
             'slider_marks_per_side': self.slider_marks_spin,
             'slider_sensitivity': self.sensitivity_spin,
             'copy_to_clipboard_on_finish': self.clipboard_checkbox,
             'notification_click_action': self.notification_combo,
             'large_image_opener': self.large_opener_entry,
             'capture_with_cursor': self.cursor_checkbox,
+            'enable_free_scroll_matching': self.free_scroll_matching_checkbox,
             'scroll_method': self.scroll_method_combo,
-            'forward_action': self.forward_combo,
-            'backward_action': self.backward_combo,
-            'copy_to_clipboard_on_finish': self.clipboard_checkbox,
-            'notification_click_action': self.notification_combo,
-            'large_image_opener': self.large_opener_entry,
-            'capture_with_cursor': self.cursor_checkbox,
-            'scroll_method': self.scroll_method_combo,
+            'reuse_invisible_cursor': self.reuse_cursor_checkbox,
             'forward_action': self.forward_combo,
             'backward_action': self.backward_combo,
         }
@@ -3739,7 +3839,8 @@ class PreviewWindow(Gtk.Window):
         self.zoom_label = Gtk.Label(label="100%")
         self.zoom_label.set_margin_start(5)
         button_hbox.pack_start(self.zoom_label, False, False, 0)
-        self.model.connect("model-updated", self.on_model_updated)
+        self.model_update_handler_id = self.model.connect("model-updated", self.on_model_updated)
+        self.connect("destroy", self._on_preview_window_destroy)
         v_adj = self.scrolled_window.get_vadjustment()
         if v_adj:
             v_adj.connect("value-changed", self.on_scroll_changed)
@@ -3755,6 +3856,15 @@ class PreviewWindow(Gtk.Window):
         self._update_button_sensitivity()
         main_vbox.show_all()
         logging.info("预览窗口已初始化")
+
+    def _on_preview_window_destroy(self, widget):
+        """预览窗口自身销毁时的处理"""
+        if self.model and self.model_update_handler_id:
+            try:
+                self.model.disconnect(self.model_update_handler_id)
+                self.model_update_handler_id = None
+            except Exception as e:
+                logging.warning(f"{e}")
 
     def _setup_cursors(self):
         """获取并存储拖动所需的光标"""
@@ -4025,10 +4135,9 @@ class CaptureOverlay(Gtk.Window):
             try:
                 if config.SCROLL_METHOD == 'invisible_cursor':
                     self.invisible_scroller = InvisibleCursorScroller(
-                        self.screen_rect.width, self.screen_rect.height
+                        self.screen_rect.width, self.screen_rect.height, config
                     )
-                    setup_thread = threading.Thread(target=self.invisible_scroller.setup, daemon=True)
-                    setup_thread.start()
+                    self.invisible_scroller.setup()
                     logging.info("InvisibleCursorScroller.setup() 正在后台线程中执行")
                 else:
                     self.touchpad_controller = VirtualTouchpadController()
