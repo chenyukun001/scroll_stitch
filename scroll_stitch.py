@@ -1540,6 +1540,9 @@ class ActionController:
         self.config = config
         self.final_notification = None
         self.is_dragging = False
+        self.is_processing_movement = False
+        self.SCROLL_TIME_MS = 300
+        self.CAPTURE_DELAY_MS = 50
         self.resize_edge = None
         self.drag_start_geometry = {}
         self.drag_start_x_root = 0
@@ -1691,26 +1694,43 @@ class ActionController:
 
     def handle_movement_action(self, direction: str):
         """根据配置文件处理前进/后退动作 (滚动, 截图, 删除). """
+        if self.is_processing_movement:
+            logging.warning("正在处理上一个移动动作，忽略新的请求")
+            return
         if not self.grid_mode_controller.is_active and not config.ENABLE_FREE_SCROLL:
             send_desktop_notification("操作无效", "请先按 Shift 键启用整格模式，或在配置中开启非整格模式滚动按钮")
             logging.warning("尝试在不允许的模式下执行移动操作，已取消")
             return
+        self.is_processing_movement = True
         if self.grid_mode_controller.is_active:
             if self.grid_mode_controller.grid_unit <= 0:
                 logging.error("滚动单位无效，无法执行操作")
+                self.is_processing_movement = False
                 return
             action_str = config.FORWARD_ACTION if direction == 'down' else config.BACKWARD_ACTION
             actions = action_str.lower().replace(" ", "").split('_')
-            def do_scroll_action():
+            def do_scroll_action(callback):
                 region_height = self.session.geometry['h']
                 num_ticks = round(region_height / self.grid_mode_controller.grid_unit)
                 direction_sign = 1 if direction == 'up' else -1
                 total_ticks = num_ticks * direction_sign
                 self.scroll_manager.scroll_discrete(total_ticks)
+                GLib.timeout_add(self.SCROLL_TIME_MS, callback)
+                return False
+            def do_capture_action(callback):
+                logging.info("执行截图...")
+                self.take_capture()
+                GLib.timeout_add(self.CAPTURE_DELAY_MS, callback)
+                return False
+            def do_delete_action(callback):
+                logging.info("执行删除...")
+                self.delete_last_capture()
+                GLib.timeout_add(self.CAPTURE_DELAY_MS, callback)
+                return False
             action_map = {
                 'scroll': do_scroll_action,
-                'capture': self.take_capture,
-                'delete': self.delete_last_capture
+                'capture': do_capture_action,
+                'delete': do_delete_action
             }
             action_queue = [action_map[act] for act in actions if act in action_map]
             if not action_queue:
@@ -1718,20 +1738,22 @@ class ActionController:
                 return
             def execute_next_in_queue(index=0):
                 if index >= len(action_queue):
+                    self.is_processing_movement = False
                     return False
                 action_func = action_queue[index]
-                is_scroll_action = action_func == do_scroll_action
-                action_func()
-                delay = 250 if is_scroll_action and index + 1 < len(action_queue) else 20
-                GLib.timeout_add(delay, execute_next_in_queue, index + 1)
+                action_func(lambda: execute_next_in_queue(index + 1))
                 return False
-            execute_next_in_queue(0)
+            GLib.idle_add(execute_next_in_queue, 0)
         else:
             scroll_distance = config.FREE_SCROLL_DISTANCE_PX
             final_distance = -scroll_distance if direction == 'down' else scroll_distance
-            win_x, win_y = self.view.get_position()
-            _, win_h = self.view.get_size()
-            GLib.timeout_add(20, self.scroll_manager.scroll_smooth, final_distance)
+            self.scroll_manager.scroll_smooth(final_distance)
+            GLib.timeout_add(100, self._release_movement_lock)
+
+    def _release_movement_lock(self):
+         if self.is_processing_movement:
+             self.is_processing_movement = False
+         return False
 
     def handle_slider_press(self, event):
         return self.scroll_manager.handle_slider_press(event)
