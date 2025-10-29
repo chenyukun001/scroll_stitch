@@ -35,7 +35,6 @@ hotkey_listener = None
 config_window_instance = None
 are_hotkeys_enabled = True
 log_queue = None
-EVDEV_AVAILABLE = False
 active_notification = None
 
 class Config:
@@ -132,7 +131,7 @@ class Config:
         self.SCROLL_METHOD = self.parser.get('Behavior', 'scroll_method', fallback='move_user_cursor')
         self.CAPTURE_WITH_CURSOR = self.parser.getboolean('Behavior', 'capture_with_cursor', fallback=False)
         self.REUSE_INVISIBLE_CURSOR = self.parser.getboolean('Behavior', 'reuse_invisible_cursor', fallback=False)
-        self.FORWARD_ACTION = self.parser.get('Behavior', 'forward_action', fallback='scroll_capture')
+        self.FORWARD_ACTION = self.parser.get('Behavior', 'forward_action', fallback='capture_scroll')
         self.BACKWARD_ACTION = self.parser.get('Behavior', 'backward_action', fallback='scroll_delete')
         # Interface.Components
         self.ENABLE_BUTTONS = self.parser.getboolean('Interface.Components', 'enable_buttons', fallback=True)
@@ -209,6 +208,9 @@ class Config:
         self.GRID_MATCHING_MAX_OVERLAP = self.parser.getint('Performance', 'grid_matching_max_overlap', fallback=20)
         self.FREE_SCROLL_MATCHING_MAX_OVERLAP = self.parser.getint('Performance', 'free_scroll_matching_max_overlap', fallback=200)
         self.MATCHING_MAX_OVERLAP = self.parser.getint('Performance', 'matching_max_overlap', fallback=20)
+        self.AUTO_SCROLL_TICKS_PER_STEP = self.parser.getint('Performance', 'auto_scroll_ticks_per_step', fallback=2)
+        self.MIN_SCROLL_PER_TICK = self.parser.getint('Performance', 'min_scroll_per_tick', fallback=30)
+        self.MAX_SCROLL_PER_TICK = self.parser.getint('Performance', 'max_scroll_per_tick', fallback=170)
         self.SLIDER_SENSITIVITY = self.parser.getfloat('Performance', 'slider_sensitivity', fallback=1.8)
         self.MOUSE_MOVE_TOLERANCE = self.parser.getint('Performance', 'mouse_move_tolerance', fallback=5)
         self.MAX_VIEWER_DIMENSION = self.parser.getint('Performance', 'max_viewer_dimension', fallback=32767)
@@ -223,7 +225,9 @@ class Config:
         self.str_dialog_cancel = self.parser.get('Hotkeys', 'dialog_cancel', fallback='esc')
         self.str_scroll_up = self.parser.get('Hotkeys', 'scroll_up', fallback='b')
         self.str_scroll_down = self.parser.get('Hotkeys', 'scroll_down', fallback='f')
-        self.str_configure_scroll_unit = self.parser.get('Hotkeys', 'configure_scroll_unit', fallback='s')
+        self.str_auto_scroll_start = self.parser.get('Hotkeys', 'auto_scroll_start', fallback='s')
+        self.str_auto_scroll_stop = self.parser.get('Hotkeys', 'auto_scroll_stop', fallback='e')
+        self.str_configure_scroll_unit = self.parser.get('Hotkeys', 'configure_scroll_unit', fallback='c')
         self.str_toggle_grid_mode = self.parser.get('Hotkeys', 'toggle_grid_mode', fallback='<shift>')
         self.str_open_config_editor = self.parser.get('Hotkeys', 'open_config_editor', fallback='g')
         self.str_preview_zoom_in = self.parser.get('Hotkeys', 'preview_zoom_in', fallback='<ctrl>+equal')
@@ -235,6 +239,8 @@ class Config:
         self.HOTKEY_CANCEL = self._parse_hotkey_string(self.str_cancel)
         self.HOTKEY_SCROLL_UP = self._parse_hotkey_string(self.str_scroll_up)
         self.HOTKEY_SCROLL_DOWN = self._parse_hotkey_string(self.str_scroll_down)
+        self.HOTKEY_AUTO_SCROLL_START = self._parse_hotkey_string(self.str_auto_scroll_start)
+        self.HOTKEY_AUTO_SCROLL_STOP = self._parse_hotkey_string(self.str_auto_scroll_stop)
         self.HOTKEY_CONFIGURE_SCROLL_UNIT = self._parse_hotkey_string(self.str_configure_scroll_unit)
         self.HOTKEY_TOGGLE_GRID_MODE = self._parse_hotkey_string(self.str_toggle_grid_mode)
         self.HOTKEY_OPEN_CONFIG_EDITOR = self._parse_hotkey_string(self.str_open_config_editor)
@@ -253,7 +259,7 @@ enable_free_scroll_matching = true
 scroll_method = move_user_cursor
 capture_with_cursor = false
 reuse_invisible_cursor = false
-forward_action = scroll_capture
+forward_action = capture_scroll
 backward_action = scroll_delete
 
 [Interface.Components]
@@ -327,6 +333,9 @@ temp_directory_base = /tmp/scroll_stitch_{pid}
 [Performance]
 grid_matching_max_overlap = 20
 free_scroll_matching_max_overlap = 200
+auto_scroll_ticks_per_step = 2
+max_scroll_per_tick = 170
+min_scroll_per_tick = 30
 slider_sensitivity = 1.8
 mouse_move_tolerance = 5
 max_viewer_dimension = 32767
@@ -340,7 +349,9 @@ undo = backspace
 cancel = esc
 scroll_up = b
 scroll_down = f
-configure_scroll_unit = s
+auto_scroll_start = s
+auto_scroll_stop = e
+configure_scroll_unit = c
 toggle_grid_mode = <shift>
 open_config_editor = g
 toggle_hotkeys_enabled = f4
@@ -1207,6 +1218,9 @@ class GridModeController:
 
     def toggle(self):
         """切换整格模式的开关"""
+        if self.view.controller.is_auto_scrolling:
+            logging.warning("自动滚动模式下忽略切换整格模式请求")
+            return
         if self.is_active:
             self.is_active = False
             self.grid_unit = 0
@@ -1253,6 +1267,9 @@ class GridModeController:
 
     def start_calibration(self):
         """启动自动滚动单位校准流程"""
+        if self.view.controller.is_auto_scrolling:
+            logging.warning("自动滚动模式下忽略配置滚动单位请求")
+            return
         if self.is_active:
             send_desktop_notification("操作无效", "请先按 Shift 键退出整格模式再进行配置")
             return
@@ -1312,12 +1329,12 @@ class GridModeController:
                 img_top = cv2.imread(str(state["filepath_before"]))
                 img_bottom = cv2.imread(str(filepath_after))
                 if img_top is not None and img_bottom is not None:
-                    found_overlap, score = _find_overlap_pyramid(img_top, img_bottom, h - ticks_to_scroll*30)
+                    max_search_overlap = h - (ticks_to_scroll * self.config.MIN_SCROLL_PER_TICK)
+                    found_overlap, score = _find_overlap_pyramid(img_top, img_bottom, max_search_overlap)
                     if score > 0.95:
                         scroll_dist_px = h - found_overlap
                         unit = scroll_dist_px / state['ticks_to_scroll']
-                        MIN_SCROLL_PER_TICK = 30
-                        if unit < MIN_SCROLL_PER_TICK:
+                        if unit < self.config.MIN_SCROLL_PER_TICK:
                             logging.warning(f"检测到滚动距离过小({unit:.2f}px/格)，已到达页面末端。提前中止采样")
                             self._finalize_calibration(success=True)
                             return False
@@ -1325,6 +1342,11 @@ class GridModeController:
                         logging.info(f"采样 {step}: 成功，单位距离 ≈ {unit:.2f}px/格，相似度 {score:.3f}")
                     else:
                         logging.warning(f"采样 {step}: 匹配失败（相似度 {score:.3f}）")
+                        bottom_check_height = ticks_to_scroll * self.config.MIN_SCROLL_PER_TICK
+                        if ActionController._check_if_bottom_reached(img_top, img_bottom, bottom_check_height):
+                            logging.warning(f"校准：检测到底部（匹配失败后底部仍一致），提前中止采样")
+                            self._finalize_calibration(success=True)
+                            return False
             if os.path.exists(state["filepath_before"]):
                 os.remove(state["filepath_before"])
             if os.path.exists(filepath_after):
@@ -1439,7 +1461,7 @@ class ScrollManager:
             scroll_exec_pos = (center_x_int, center_y_int)
             time.sleep(0.08)
             self._set_pointer_position(*scroll_exec_pos)
-            time.sleep(0.05) # 等待鼠标位置生效
+            time.sleep(0.05)
             logging.info(f"触发高级滚动，距离: {scroll_distance}")
             self.view.touchpad_controller.scroll(scroll_distance)
             time.sleep(0.1)
@@ -1455,7 +1477,7 @@ class ScrollManager:
             else:
                 logging.info("检测到用户在滚动期间手动移动鼠标，放弃恢复原始鼠标位置")
 
-    def scroll_discrete(self, ticks):
+    def scroll_discrete(self, ticks, is_auto_scroll=False):
         if ticks == 0:
             return
         win_x, win_y = self.view.get_position()
@@ -1495,9 +1517,20 @@ class ScrollManager:
                 logging.error(f"使用 XTest 模拟滚动失败: {e}")
                 try: disp.close()
                 except: pass
-            time.sleep(0.05)
-            current_pos_after_scroll = self._get_pointer_position()
-            self._set_pointer_position(*original_pos)
+            hide_and_auto = is_auto_scroll and not self.config.CAPTURE_WITH_CURSOR
+            if not hide_and_auto:
+               time.sleep(0.05)
+               current_pos_after_scroll = self._get_pointer_position()
+               tolerance = self.config.MOUSE_MOVE_TOLERANCE
+               user_intervened_during_scroll = (
+                    abs(current_pos_after_scroll[0] - center_x) > tolerance or
+                    abs(current_pos_after_scroll[1] - center_y) > tolerance
+               )
+               if not user_intervened_during_scroll:
+                   self._set_pointer_position(*original_pos)
+            else:
+                logging.info("自动模式隐藏光标：滚动完成，保持光标在中心")
+                time.sleep(0.05)
 
     def handle_slider_press(self, event):
         event_x_root, event_y_root = event.get_root_coords()
@@ -1541,8 +1574,17 @@ class ActionController:
         self.final_notification = None
         self.is_dragging = False
         self.is_processing_movement = False
-        self.SCROLL_TIME_MS = 300
-        self.CAPTURE_DELAY_MS = 50
+        self.is_auto_scrolling = False
+        self.auto_scroll_timer_id = None
+        self.is_first_auto_capture = False
+        self.auto_scroll_original_cursor_pos = None
+        self.last_auto_scroll_cursor_pos = None
+        self.auto_scroll_needs_capture = False
+        self.auto_mode_context = None
+        self.SCROLL_TIME_MS = 200
+        self.CAPTURE_DELAY_MS = 150
+        self.AUTO_SCROLL_INTERVAL_MS = 300
+        self.AUTO_CAPTURE_DELAY_MS = 50
         self.resize_edge = None
         self.drag_start_geometry = {}
         self.drag_start_x_root = 0
@@ -1564,13 +1606,14 @@ class ActionController:
         self.stitch_model.connect('model-updated', self._on_model_updated)
 
     def _on_model_updated(self, model_instance):
+        can_undo = self.stitch_model.capture_count > 0 and not self.is_auto_scrolling
         if self.view.show_side_panel:
             self.view.side_panel.info_panel.update_info(
                 count=self.stitch_model.capture_count,
                 width=self.stitch_model.image_width,
                 height=self.stitch_model.total_virtual_height
             )
-            self.view.side_panel.button_panel.set_undo_sensitive(self.stitch_model.capture_count > 0)
+            self.view.side_panel.button_panel.set_undo_sensitive(can_undo)
         self._check_horizontal_lock_state()
 
     def _check_horizontal_lock_state(self):
@@ -1600,11 +1643,31 @@ class ActionController:
                 elif result_type == 'POP_REQUEST_RECEIVED':
                     logging.info("主线程: 收到 Worker 的 POP 确认，执行模型删除")
                     self.stitch_model.pop_entry()
+                elif result_type == 'BOTTOM_REACHED':
+                    logging.info("主线程: 收到 Worker 的 BOTTOM_REACHED 信号，停止自动滚动")
+                    if self.is_auto_scrolling:
+                        GLib.idle_add(self.stop_auto_scroll, "检测到页面已到达底部")
+                    else:
+                        logging.warning("收到 BOTTOM_REACHED 但当前并非自动滚动状态")
             except queue.Empty:
                 break
             except Exception as e:
                 logging.exception(f"处理 Worker 结果时出错: {e}")
         return True
+
+    @staticmethod
+    def _check_if_bottom_reached(img_top, img_bottom, search_height, threshold=0.95):
+        """检查 img_bottom 的底部是否与 img_top 的底部高度匹配"""
+        h_top, _, _ = img_top.shape
+        h_bottom, w_bottom, _ = img_bottom.shape
+        effective_search_height = min(search_height, h_top, h_bottom)
+        if effective_search_height <= 0:
+            return False
+        template_bottom = img_bottom[h_bottom - effective_search_height:, :]
+        region_top_bottom = img_top[h_top - effective_search_height:, :]
+        result = cv2.matchTemplate(region_top_bottom, template_bottom, cv2.TM_CCOEFF_NORMED)
+        score = result[0][0]
+        return score >= threshold
 
     @staticmethod
     def _stitch_worker_loop(task_queue: queue.Queue, result_queue: queue.Queue, known_scroll_distances: list):
@@ -1622,7 +1685,9 @@ class ActionController:
                 filepath_str = task.get('filepath')
                 prev_filepath_str = task.get('prev_filepath')
                 should_match = task.get('should_perform_matching', False)
-                max_overlap = task.get('max_overlap_to_use', 0)
+                auto_mode_context = task.get('auto_mode_context')
+                is_grid_mode = task.get('is_grid_mode', False)
+                grid_matching_enabled = task.get('grid_matching_enabled', False)
                 filepath = Path(filepath_str)
                 logging.info(f"StitchWorker: 处理 ADD 任务: {filepath.name}")
                 if not filepath.is_file():
@@ -1633,10 +1698,24 @@ class ActionController:
                     img_new_np = cv2.imread(filepath_str)
                     if img_new_np is None: raise ValueError("cv2.imread 返回 None")
                     h_new, w_new, _ = img_new_np.shape
+                    should_perform_matching = False
+                    max_overlap_to_use = 0
+                    if prev_filepath_str:
+                        ticks_scrolled = task.get('ticks_scrolled', 2)
+                        if auto_mode_context is not None:
+                            should_perform_matching = True
+                            max_overlap_to_use = h_new - ticks_scrolled * config.MIN_SCROLL_PER_TICK
+                        elif is_grid_mode:
+                            should_perform_matching = grid_matching_enabled
+                            max_overlap_to_use = config.GRID_MATCHING_MAX_OVERLAP
+                        else:
+                            should_perform_matching = config.ENABLE_FREE_SCROLL_MATCHING
+                            max_overlap_to_use = config.FREE_SCROLL_MATCHING_MAX_OVERLAP
                     overlap = 0
                     if prev_filepath_str:
                         logging.info(f"StitchWorker: 计算 {filepath.name} 与 {Path(prev_filepath_str).name} 的重叠")
                         img_top_np = cv2.imread(prev_filepath_str)
+                        score = 0.0
                         if img_top_np is None: raise ValueError(f"无法加载上一张图片 {prev_filepath_str}")
                         h_top, _, _ = img_top_np.shape
                         predicted_overlap = -1
@@ -1653,20 +1732,43 @@ class ActionController:
                         if predicted_overlap != -1:
                             overlap = predicted_overlap
                         else:
-                            if should_match:
-                                search_range = min(max_overlap, h_top - 1, h_new - 1)
+                            if should_perform_matching:
+                                search_range = min(max_overlap_to_use, h_top - 1, h_new - 1)
                                 if search_range > 0:
                                     logging.info(f"StitchWorker: 预测失败，执行全范围搜索 (max={search_range}px)...")
                                     found_overlap, score = _find_overlap_pyramid(img_top_np, img_new_np, search_range)
                                     QUALITY_THRESHOLD = 0.95
-                                    if score >= QUALITY_THRESHOLD:
+                                    bottom_check_height = config.MIN_SCROLL_PER_TICK
+                                    if score >= QUALITY_THRESHOLD and found_overlap >= config.MIN_SCROLL_PER_TICK:
                                         overlap = found_overlap
                                         logging.info(f"StitchWorker: 计算重叠成功: {overlap}px, score={score:.3f}")
                                         s_new = h_new - overlap
+                                        is_stuck = False
+                                        KNOWN_SCROLL_DEVIATION_LOW = 0.5
+                                        KNOWN_SCROLL_DEVIATION_HIGH = 1.5
+                                        if auto_mode_context is not None and known_scroll_distances:
+                                            stable_distance = np.median(known_scroll_distances[-5:])
+                                            if stable_distance > 0 and (s_new < (stable_distance * KNOWN_SCROLL_DEVIATION_LOW) or s_new > (stable_distance * KNOWN_SCROLL_DEVIATION_HIGH)):
+                                                logging.warning(f"StitchWorker: 检测到滚动距离异常。当前: {s_new}px, 稳定值: {stable_distance:.1f}px。")
+                                                is_stuck = True
+                                        if is_stuck:
+                                            if ActionController._check_if_bottom_reached(img_top_np, img_new_np, bottom_check_height):
+                                                logging.info("StitchWorker: 滚动距离异常且检测到底部，发送 BOTTOM_REACHED 信号")
+                                                result_queue.put(('BOTTOM_REACHED', None))
+                                                continue
+                                            else:
+                                                logging.warning("StitchWorker: 滚动距离异常，但底部检测未通过。将接受此帧。")
                                         if s_new > 0 and s_new not in known_scroll_distances:
                                             result_queue.put(('LEARNED_SCROLL', s_new))
                                     else:
                                         logging.warning(f"StitchWorker: 计算重叠失败 (score {score:.3f} < {QUALITY_THRESHOLD})")
+                                        if auto_mode_context is not None:
+                                            if ActionController._check_if_bottom_reached(img_top_np, img_new_np, bottom_check_height):
+                                                logging.info("StitchWorker: 检测到底部，发送 BOTTOM_REACHED 信号")
+                                                result_queue.put(('BOTTOM_REACHED', None))
+                                                continue
+                                            else:
+                                                logging.info("StitchWorker: 重叠匹配失败，底部检测也未通过")
                                 else:
                                     logging.warning("StitchWorker: 有效搜索范围为0，跳过重叠计算")
                             else:
@@ -1756,6 +1858,9 @@ class ActionController:
          return False
 
     def handle_slider_press(self, event):
+        if self.is_auto_scrolling:
+            logging.warning("自动滚动模式下忽略滑块按下事件")
+            return False
         return self.scroll_manager.handle_slider_press(event)
 
     def handle_slider_motion(self, widget, event):
@@ -1764,41 +1869,57 @@ class ActionController:
     def handle_slider_release(self, widget, event):
         return self.scroll_manager.handle_slider_release(widget, event)
 
-    def take_capture(self, widget=None):
+    def take_capture(self, widget=None, auto_mode=False):
         """执行截图的核心逻辑"""
         grabbed_seat = None
         filepath = None
+        self.auto_mode_context = None
+        if not auto_mode and self.is_auto_scrolling:
+            logging.warning("自动滚动模式下忽略手动截图请求")
+            return
         try:
             win_x, win_y = self.view.get_position()
             shot_x = win_x + self.view.left_panel_w + config.BORDER_WIDTH
             shot_y = win_y + config.BORDER_WIDTH
             shot_w = self.session.geometry['w']
             shot_h = self.session.geometry['h']
-            grabbed_seat = self._hide_cursor_if_needed(shot_x, shot_y, shot_w, shot_h)
-            if shot_w <= 0 or shot_h <= 0:
-                logging.warning(f"捕获区域过小，跳过截图。尺寸: {shot_w}x{shot_h}")
+            if auto_mode:
+                if self.is_first_auto_capture:
+                    logging.info("自动模式：截取首次完整高度")
+                    cap_x, cap_y, cap_w, cap_h = shot_x, shot_y, shot_w, shot_h
+                    self.auto_mode_context = {'initial_full': True}
+                    self.is_first_auto_capture = False
+                else:
+                    ticks_to_scroll = self.config.AUTO_SCROLL_TICKS_PER_STEP
+                    capture_height_per_tick = self.config.MAX_SCROLL_PER_TICK
+                    total_capture_height = capture_height_per_tick * ticks_to_scroll
+                    cap_h = min(total_capture_height, shot_h)
+                    cap_y = shot_y + shot_h - cap_h
+                    cap_x, cap_w = shot_x, shot_w
+                    self.auto_mode_context = {'initial_full': False}
+            else:
+                cap_x, cap_y, cap_w, cap_h = shot_x, shot_y, shot_w, shot_h
+                self.auto_mode_context = None
+
+            grabbed_seat = self._hide_cursor_if_needed(cap_x, cap_y, cap_w, cap_h)
+            if cap_w <= 0 or cap_h <= 0:
+                logging.warning(f"捕获区域过小，跳过截图。尺寸: {cap_w}x{cap_h}")
                 send_desktop_notification("截图跳过", "选区太小，无法截图", "dialog-warning")
                 return
             filepath = config.TMP_DIR / f"{self.stitch_model.capture_count:02d}_capture.png"
-            if capture_area(shot_x, shot_y, shot_w, shot_h, filepath):
+            if capture_area(cap_x, cap_y, cap_w, cap_h, filepath):
                 logging.info(f"已捕获截图: {filepath}")
-                play_sound(config.CAPTURE_SOUND)
+                if not auto_mode:
+                    play_sound(config.CAPTURE_SOUND)
                 prev_filepath = self.stitch_model.entries[-1]['filepath'] if self.stitch_model.entries else None
-                should_perform_matching = False
-                max_overlap_to_use = 0
-                if prev_filepath:
-                    if self.grid_mode_controller.is_active:
-                        should_perform_matching = self.session.is_matching_enabled
-                        max_overlap_to_use = self.config.GRID_MATCHING_MAX_OVERLAP
-                    else:
-                        should_perform_matching = self.config.ENABLE_FREE_SCROLL_MATCHING
-                        max_overlap_to_use = self.config.FREE_SCROLL_MATCHING_MAX_OVERLAP
                 task = {
                     'type': 'ADD',
                     'filepath': str(filepath),
                     'prev_filepath': prev_filepath,
-                    'should_perform_matching': should_perform_matching,
-                    'max_overlap_to_use': max_overlap_to_use
+                    'is_grid_mode': self.grid_mode_controller.is_active,
+                    'grid_matching_enabled': self.session.is_matching_enabled,
+                    'auto_mode_context': self.auto_mode_context,
+                    'ticks_scrolled': self.config.AUTO_SCROLL_TICKS_PER_STEP if auto_mode and not self.auto_mode_context.get('initial_full', False) else 2
                 }
                 self.task_queue.put(task)
             else:
@@ -1845,12 +1966,121 @@ class ActionController:
 
     def delete_last_capture(self, widget=None):
         logging.info("请求删除最后一张截图...")
+        if self.is_auto_scrolling:
+            logging.warning("自动滚动模式下忽略撤销请求")
+            return
         play_sound(config.UNDO_SOUND)
         task = {'type': 'POP'}
         self.task_queue.put(task)
 
+    def start_auto_scroll(self):
+        if self.is_auto_scrolling:
+            logging.warning("自动滚动已在运行中")
+            return
+        self.is_auto_scrolling = True
+        self.last_auto_scroll_cursor_pos = None
+        self.auto_scroll_original_cursor_pos = None
+        if not self.config.CAPTURE_WITH_CURSOR and self.config.SCROLL_METHOD == 'move_user_cursor':
+            self.auto_scroll_original_cursor_pos = self.scroll_manager._get_pointer_position()
+            logging.info(f"自动模式隐藏光标：记录原始光标位置 {self.auto_scroll_original_cursor_pos}")
+        self.auto_scroll_needs_capture = False
+        if self.stitch_model.capture_count == 0:
+            logging.info("自动模式：首次启动，先进行一次完整截图")
+            self.is_first_auto_capture = True
+            self.take_capture(auto_mode=True)
+            self.auto_scroll_timer_id = GLib.timeout_add(self.AUTO_CAPTURE_DELAY_MS, self._auto_scroll_step)
+        else:
+            logging.info("自动模式：继续添加截图，直接开始滚动")
+            self.is_first_auto_capture = False
+            self._auto_scroll_step()
+        send_desktop_notification("自动模式已启动", f"按 {config.str_auto_scroll_stop.upper()} 或移动鼠标停止", level="low")
+        btn_panel = self.view.side_panel.button_panel
+        btn_panel.btn_capture.set_sensitive(False)
+        btn_panel.btn_undo.set_sensitive(False)
+        btn_panel.btn_scroll_up.set_sensitive(False)
+        btn_panel.btn_scroll_down.set_sensitive(False)
+        self.view.slider_panel.set_sensitive(False)
+
+    def stop_auto_scroll(self, reason_message=None):
+        if not self.is_auto_scrolling:
+            return
+        logging.info("正在停止自动滚动...")
+        self.is_auto_scrolling = False
+        if self.auto_scroll_timer_id:
+            GLib.source_remove(self.auto_scroll_timer_id)
+            self.auto_scroll_timer_id = None
+            logging.info("自动滚动定时器已移除")
+            if self.auto_scroll_needs_capture:
+                logging.info("自动模式：停止时捕获最后一个滚动帧")
+                self.take_capture(auto_mode=True)
+                self.needs_final_auto_capture = False
+                self.auto_scroll_needs_capture = False
+        self._release_movement_lock()
+        if self.auto_scroll_original_cursor_pos:
+            logging.info(f"自动模式结束：恢复原始光标位置到 {self.auto_scroll_original_cursor_pos}")
+            self.scroll_manager._set_pointer_position(*self.auto_scroll_original_cursor_pos)
+            self.auto_scroll_original_cursor_pos = None
+        if reason_message:
+            send_desktop_notification("自动滚动已停止", reason_message, level="normal")
+        else:
+            send_desktop_notification("自动模式已停止", "用户手动停止", level="normal")
+        btn_panel = self.view.side_panel.button_panel
+        btn_panel.btn_capture.set_sensitive(True)
+        btn_panel.set_undo_sensitive(self.stitch_model.capture_count > 0)
+        btn_panel.btn_scroll_up.set_sensitive(True)
+        btn_panel.btn_scroll_down.set_sensitive(True)
+        self.view.slider_panel.set_sensitive(True)
+
+    def _auto_scroll_step(self):
+        if self.last_auto_scroll_cursor_pos:
+            current_pos = self.scroll_manager._get_pointer_position()
+            dx = current_pos[0] - self.last_auto_scroll_cursor_pos[0]
+            dy = current_pos[1] - self.last_auto_scroll_cursor_pos[1]
+            distance_moved = math.sqrt(dx*dx + dy*dy)
+            if distance_moved > self.config.MOUSE_MOVE_TOLERANCE:
+                logging.info(f"自动模式：检测到用户鼠标移动 {distance_moved:.1f}px (超过阈值 {self.config.MOUSE_MOVE_TOLERANCE}px)，停止滚动。")
+                self.stop_auto_scroll(reason_message="检测到鼠标移动")
+                return False
+        if not self.is_auto_scrolling:
+            self._release_movement_lock()
+            return False
+        if self.is_processing_movement:
+            logging.warning("自动滚动：正在处理上一动作，等待100ms")
+            self.auto_scroll_timer_id = GLib.timeout_add(100, self._auto_scroll_step)
+            return False
+        ticks_to_scroll = self.config.AUTO_SCROLL_TICKS_PER_STEP
+        base_interval_ms = self.AUTO_SCROLL_INTERVAL_MS
+        dynamic_interval_ms = int(base_interval_ms * (1 + 0.6 * (ticks_to_scroll - 1)))
+        dynamic_interval_ms = min(dynamic_interval_ms, 2000)
+        logging.info(f"自动滚动: 滚动 {ticks_to_scroll} 格, 等待 {dynamic_interval_ms}ms 后截图")
+        self.scroll_manager.scroll_discrete(-ticks_to_scroll, is_auto_scroll=True)
+        self.auto_scroll_needs_capture = True
+        self.is_processing_movement = True
+        self.auto_scroll_timer_id = GLib.timeout_add(
+            dynamic_interval_ms,
+            self._auto_capture_step
+        )
+        return False
+
+    def _auto_capture_step(self):
+        if not self.is_auto_scrolling:
+            self._release_movement_lock()
+            return False
+        self.take_capture(auto_mode=True)
+        if self.config.SCROLL_METHOD == 'move_user_cursor':
+            self.last_auto_scroll_cursor_pos = self.scroll_manager._get_pointer_position()
+        self.is_processing_movement = False
+        self.auto_scroll_needs_capture = False
+        self.auto_scroll_timer_id = GLib.timeout_add(
+            self.AUTO_CAPTURE_DELAY_MS, 
+            self._auto_scroll_step
+        )
+        return False
+
     def finalize_and_quit(self, widget=None):
         """执行完成拼接并退出的逻辑"""
+        if self.is_auto_scrolling:
+            self.stop_auto_scroll()
         if self.stitch_model.capture_count == 0:
             logging.warning("未进行任何截图。正在退出")
             self.quit_and_cleanup()
@@ -1971,6 +2201,8 @@ class ActionController:
 
     def quit_and_cleanup(self, widget=None):
         """处理带确认的退出逻辑"""
+        if self.is_auto_scrolling:
+            self.stop_auto_scroll()
         if self.stitch_model.capture_count == 0:
             logging.info("没有截图，直接退出")
             self._perform_cleanup()
@@ -2037,6 +2269,11 @@ class ActionController:
         elif is_match(config.HOTKEY_SCROLL_DOWN):
             self.handle_movement_action('down')
             return True
+        elif is_match(config.HOTKEY_AUTO_SCROLL_START):
+            self.start_auto_scroll()
+            return True
+        elif is_match(config.HOTKEY_AUTO_SCROLL_STOP):
+            self.stop_auto_scroll()
         elif is_match(config.HOTKEY_CONFIGURE_SCROLL_UNIT):
             self.grid_mode_controller.start_calibration()
             return True
@@ -2114,17 +2351,17 @@ class ButtonPanel(Gtk.Box):
         self.btn_scroll_down = Gtk.Button(label="前进")
         self.btn_scroll_up.connect("clicked", lambda w: self.emit('scroll-up-clicked'))
         self.btn_scroll_down.connect("clicked", lambda w: self.emit('scroll-down-clicked'))
-        btn_capture = Gtk.Button(label="截图")
-        btn_capture.connect("clicked", lambda w: self.emit('capture-clicked'))
+        self.btn_capture = Gtk.Button(label="截图")
+        self.btn_capture.connect("clicked", lambda w: self.emit('capture-clicked'))
         self.btn_undo = Gtk.Button(label="撤销")
         self.btn_undo.connect("clicked", lambda w: self.emit('undo-clicked'))
-        btn_finalize = Gtk.Button(label="完成")
-        btn_finalize.connect("clicked", lambda w: self.emit('finalize-clicked'))
-        btn_cancel = Gtk.Button(label="取消")
-        btn_cancel.connect("clicked", lambda w: self.emit('cancel-clicked'))
+        self.btn_finalize = Gtk.Button(label="完成")
+        self.btn_finalize.connect("clicked", lambda w: self.emit('finalize-clicked'))
+        self.btn_cancel = Gtk.Button(label="取消")
+        self.btn_cancel.connect("clicked", lambda w: self.emit('cancel-clicked'))
         all_buttons = [
             self.btn_scroll_up, self.btn_scroll_down,
-            btn_capture, self.btn_undo, btn_finalize, btn_cancel
+            self.btn_capture, self.btn_undo, self.btn_finalize, self.btn_cancel
         ]
         for btn in all_buttons:
             btn.set_can_focus(False)
@@ -2143,10 +2380,10 @@ class ButtonPanel(Gtk.Box):
         self.pack_start(self.btn_scroll_down, True, True, 0)
         separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         self.pack_start(separator, False, False, 0)
-        self.pack_start(btn_capture, True, True, 0)
+        self.pack_start(self.btn_capture, True, True, 0)
         self.pack_start(self.btn_undo, True, True, 0)
-        self.pack_start(btn_finalize, True, True, 0)
-        self.pack_start(btn_cancel, True, True, 0)
+        self.pack_start(self.btn_finalize, True, True, 0)
+        self.pack_start(self.btn_cancel, True, True, 0)
 
     def set_scroll_buttons_visible(self, visible: bool):
         if not config.ENABLE_SCROLL_BUTTONS:
@@ -2343,6 +2580,7 @@ class ConfigWindow(Gtk.Window):
             ('System', 'large_image_opener'), ('System', 'sound_theme'),
             ('System', 'capture_sound'), ('System', 'undo_sound'), ('System', 'finalize_sound'),
             ('Performance', 'grid_matching_max_overlap'), ('Performance', 'free_scroll_matching_max_overlap'), ('Performance', 'slider_sensitivity'), ('Performance', 'mouse_move_tolerance'),
+            ('Performance', 'auto_scroll_ticks_per_step'), ('Performance', 'max_scroll_per_tick'), ('Performance', 'min_scroll_per_tick'),
             ('Performance', 'free_scroll_distance_px'), ('Performance', 'max_viewer_dimension'), ('Performance', 'preview_drag_sensitivity'),
             ('System', 'log_file'), ('System', 'temp_directory_base'),
         ]
@@ -2392,7 +2630,7 @@ class ConfigWindow(Gtk.Window):
         """窗口关闭时保存所有配置"""
         self._save_all_configs()
         global hotkey_listener
-        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and are_hotkeys_enabled:
+        if hotkey_listener and are_hotkeys_enabled:
             hotkey_listener.set_normal_keys_grabbed(True)
             logging.info("配置窗口关闭，全局热键已恢复")
         return False
@@ -2409,7 +2647,7 @@ class ConfigWindow(Gtk.Window):
         self.input_has_focus = True
         logging.info(f"输入控件 {type(widget).__name__} 获得焦点，全局热键暂停")
         global hotkey_listener
-        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor):
+        if hotkey_listener:
             hotkey_listener.set_normal_keys_grabbed(False)
         return False
 
@@ -2417,7 +2655,7 @@ class ConfigWindow(Gtk.Window):
         self.input_has_focus = False
         logging.info(f"输入控件 {type(widget).__name__} 失去焦点，全局热键恢复")
         global hotkey_listener
-        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and not self.capturing_hotkey_button and are_hotkeys_enabled:
+        if hotkey_listener and not self.capturing_hotkey_button and are_hotkeys_enabled:
             hotkey_listener.set_normal_keys_grabbed(True)
         return False
 
@@ -2571,7 +2809,7 @@ class ConfigWindow(Gtk.Window):
         self.capturing_hotkey_button = button
         button.set_label("请按下快捷键…")
         global hotkey_listener
-        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor):
+        if hotkey_listener:
             hotkey_listener.set_normal_keys_grabbed(False)
             logging.info("开始捕获快捷键，全局热键暂停")
 
@@ -2591,7 +2829,7 @@ class ConfigWindow(Gtk.Window):
             logging.warning(f"捕获到无效的按键释放 {event.keyval} (state={event.state})，取消本次捕获")
             self.capturing_hotkey_button.set_label(original_label)
             self.capturing_hotkey_button = None
-            if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and not self.input_has_focus and are_hotkeys_enabled:
+            if hotkey_listener and not self.input_has_focus and are_hotkeys_enabled:
                 hotkey_listener.set_normal_keys_grabbed(True)
                 logging.info("无效捕获，全局热键恢复")
             return True
@@ -2626,7 +2864,7 @@ class ConfigWindow(Gtk.Window):
         else:
             self.capturing_hotkey_button.set_label(hotkey_str)
         self.capturing_hotkey_button = None
-        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and not self.input_has_focus and are_hotkeys_enabled:
+        if hotkey_listener and not self.input_has_focus and are_hotkeys_enabled:
             hotkey_listener.set_normal_keys_grabbed(True)
             logging.info("快捷键捕获结束，全局热键恢复")
         return True
@@ -2925,6 +3163,7 @@ class ConfigWindow(Gtk.Window):
             ("capture", "截图"), ("finalize", "完成"),
             ("undo", "撤销"), ("cancel", "取消"),
             ("scroll_up", "后退"), ("scroll_down", "前进"),
+            ("auto_scroll_start", "开始自动滚动"), ("auto_scroll_stop", "停止自动滚动"),
             ("configure_scroll_unit", "配置滚动单位"), ("toggle_grid_mode", "切换整格模式"),
             ("open_config_editor", "激活/隐藏配置窗口"), ("toggle_hotkeys_enabled", "启用/禁用全局热键"), 
             ("preview_zoom_in", "预览窗口放大"), ("preview_zoom_out", "预览窗口缩小"),
@@ -3299,6 +3538,9 @@ class ConfigWindow(Gtk.Window):
             ('System', 'finalize_sound'),
             ('Performance', 'slider_sensitivity'),
             ('Performance', 'mouse_move_tolerance'),
+            ('Performance', 'auto_scroll_ticks_per_step'),
+            ('Performance', 'max_scroll_per_tick'),
+            ('Performance', 'min_scroll_per_tick'),
             ('Performance', 'free_scroll_distance_px'),
             ('Performance', 'max_viewer_dimension'),
             ('System', 'log_file'),
@@ -3412,6 +3654,9 @@ class ConfigWindow(Gtk.Window):
             ("grid_matching_max_overlap", "整格模式误差修正范围", 10, 20, "<b>整格模式</b>下的误差修正设置最大搜索范围"),
             ("free_scroll_matching_max_overlap", "自由模式误差修正范围", 20, 300, "<b>自由模式</b>下的误差修正设置最大搜索范围\n值越大，处理用时越长"),
             ("mouse_move_tolerance", "鼠标容差", 0, 50, "在使用“移动用户光标”方式滚动后，若用户鼠标的移动距离超过此像素值，程序将不会把光标移回原位"),
+            ("auto_scroll_ticks_per_step", "自动滚动步长（格数）", 1, 8, "自动模式下，每一步滚动几格\n值越大滚动越快"),
+            ("max_scroll_per_tick", "自动截图高度（每格）", 120, 240, "自动模式下，对应滚动一格的截图高度 (px)\n总截图高度 = 此值 * 滚动格数"),
+            ("min_scroll_per_tick", "最小滚动像素", 1, 60, "用于匹配和校准的最小滚动阈值 (px)"),
             ("free_scroll_distance_px", "自由滚动步长", 10, 500, "在<b>自由模式</b>下，“前进”/“后退”滚动的相对距离"),
             ("max_viewer_dimension", "图片尺寸阈值", -1, 131071, "最终图片长或宽超过此值时，会使用上面的“大尺寸图片打开命令”\n设为 <b>-1</b> 禁用此功能，总是用系统默认方式打开图片\n设为 <b>0</b> 总是用自定义命令打开图片"),
             ("preview_drag_sensitivity", "预览拖动灵敏度", 0.5, 10.0, "预览窗口中按住左键拖动图像的速度倍数")
@@ -4256,13 +4501,14 @@ class CaptureOverlay(Gtk.Window):
 
     def on_model_updated_ui(self, model_instance):
         """模型更新时刷新界面元素 (连接到 StitchModel 的信号)"""
+        can_undo = model_instance.capture_count > 0 and not self.controller.is_auto_scrolling
         if self.show_side_panel:
             self.side_panel.info_panel.update_info(
                 count=model_instance.capture_count,
                 width=model_instance.image_width,
                 height=model_instance.total_virtual_height
             )
-            self.side_panel.button_panel.set_undo_sensitive(model_instance.capture_count > 0)
+            self.side_panel.button_panel.set_undo_sensitive(can_undo)
         self.queue_draw()
 
     def _position_and_show_preview(self):
@@ -4343,7 +4589,7 @@ class CaptureOverlay(Gtk.Window):
         GLib.idle_add(activate_window_with_xlib, self.window_xid)
         self.is_dialog_open = True
         global hotkey_listener
-        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor):
+        if hotkey_listener:
             logging.info("打开退出对话框，暂停普通全局热键")
             hotkey_listener.set_normal_keys_grabbed(False)
         dialog = Gtk.MessageDialog(
@@ -4365,7 +4611,7 @@ class CaptureOverlay(Gtk.Window):
         response = dialog.run()
         self.is_dialog_open = False
         dialog.destroy()
-        if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and are_hotkeys_enabled:
+        if hotkey_listener and are_hotkeys_enabled:
             logging.info("关闭退出对话框，恢复普通全局热键")
             hotkey_listener.set_normal_keys_grabbed(True)
         return response
@@ -4834,7 +5080,7 @@ def toggle_config_window():
                     logging.info("配置窗口已激活，正在隐藏...")
                     config_window_instance.hide()
                     global hotkey_listener
-                    if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor) and are_hotkeys_enabled:
+                    if hotkey_listener and are_hotkeys_enabled:
                         hotkey_listener.set_normal_keys_grabbed(True)
                         logging.info("配置窗口隐藏，全局热键已恢复")
                 else:
@@ -4847,7 +5093,7 @@ def toggle_hotkeys_globally():
     global are_hotkeys_enabled
     are_hotkeys_enabled = not are_hotkeys_enabled
     state_str = "启用" if are_hotkeys_enabled else "禁用"
-    if hotkey_listener and isinstance(hotkey_listener, XlibHotkeyInterceptor):
+    if hotkey_listener:
         normal_keys = [k for k in hotkey_listener.keymap_tuples if not k[2]]
         if not normal_keys:
             logging.info("没有需要切换状态的普通热键。")
@@ -4921,6 +5167,8 @@ def setup_hotkey_listener(overlay):
         ('cancel', overlay.controller.quit_and_cleanup),
         ('scroll_up', lambda: overlay.controller.handle_movement_action('up')),
         ('scroll_down', lambda: overlay.controller.handle_movement_action('down')),
+        ('auto_scroll_start', overlay.controller.start_auto_scroll),
+        ('auto_scroll_stop', overlay.controller.stop_auto_scroll),
         ('toggle_grid_mode', overlay.controller.grid_mode_controller.toggle),
         ('configure_scroll_unit', overlay.controller.grid_mode_controller.start_calibration),
         ('open_config_editor', toggle_config_window),
