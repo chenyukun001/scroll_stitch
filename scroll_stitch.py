@@ -135,9 +135,9 @@ class Config:
         self.BACKWARD_ACTION = self.parser.get('Behavior', 'backward_action', fallback='scroll_delete')
         # Interface.Components
         self.ENABLE_BUTTONS = self.parser.getboolean('Interface.Components', 'enable_buttons', fallback=True)
-        self.ENABLE_SCROLL_BUTTONS = self.parser.getboolean('Interface.Components', 'enable_scroll_buttons', fallback=True)
-        self.ENABLE_FREE_SCROLL = self.parser.getboolean('Interface.Components', 'enable_free_scroll', fallback=True)
-        self.ENABLE_SLIDER = self.parser.getboolean('Interface.Components', 'enable_slider', fallback=True)
+        self.ENABLE_GRID_ACTION_BUTTONS = self.parser.getboolean('Interface.Components', 'enable_grid_action_buttons', fallback=True)
+        self.ENABLE_AUTO_SCROLL_BUTTONS = self.parser.getboolean('Interface.Components', 'enable_auto_scroll_buttons', fallback=True)
+        self.ENABLE_SIDE_PANEL = self.parser.getboolean('Interface.Components', 'enable_side_panel', fallback=True)
         self.SHOW_PREVIEW_ON_START = self.parser.getboolean('Interface.Components', 'show_preview_on_start', fallback=True)
         self.SHOW_CAPTURE_COUNT = self.parser.getboolean('Interface.Components', 'show_capture_count', fallback=True)
         self.SHOW_TOTAL_DIMENSIONS = self.parser.getboolean('Interface.Components', 'show_total_dimensions', fallback=True)
@@ -145,7 +145,7 @@ class Config:
         # Interface.Layout
         self.BORDER_WIDTH = self.parser.getint('Interface.Layout', 'border_width', fallback=5)
         self.HANDLE_HEIGHT = self.parser.getint('Interface.Layout', 'handle_height', fallback=10)
-        self.SLIDER_PANEL_WIDTH = self.parser.getint('Interface.Layout', 'slider_panel_width', fallback=55)
+        self.BUTTON_PANEL_WIDTH = self.parser.getint('Interface.Layout', 'button_panel_width', fallback=100)
         self.SIDE_PANEL_WIDTH = self.parser.getint('Interface.Layout', 'side_panel_width', fallback=100)
         self.BUTTON_SPACING = self.parser.getint('Interface.Layout', 'button_spacing', fallback=5)
         self.PROCESSING_DIALOG_WIDTH = self.parser.getint('Interface.Layout', 'processing_dialog_width', fallback=200)
@@ -157,16 +157,6 @@ class Config:
         self.BORDER_COLOR = tuple(float(c.strip()) for c in color_str.split(','))
         indicator_color_str = self.parser.get('Interface.Theme', 'matching_indicator_color', fallback='0.60, 0.76, 0.95, 1.00')
         self.MATCHING_INDICATOR_COLOR = tuple(float(c.strip()) for c in indicator_color_str.split(','))
-        self.SLIDER_MARKS_PER_SIDE = self.parser.getint('Interface.Theme', 'slider_marks_per_side', fallback=4)
-        self.SLIDER_MIN = -100
-        self.SLIDER_MAX = 100
-        self.SLIDER_PANEL_CSS = self.parser.get('Interface.Theme', 'slider_panel_css', fallback="""
- scale { color: #c0c0c0; font-size: 26px; }
- scale.vertical trough { background-color: rgba(30, 30, 50, 0.7); border: 1px solid #505070; border-radius: 5px; min-width: 5px; }
- scale mark indicator { background-color: #00d0ff; min-height: 2px; min-width: 8px; border-radius: 1px; }
- scale.vertical highlight { background-color: rgba(0, 208, 255, 0.6); border-radius: 5px; }
- scale label { color: white; text-shadow: 1px 1px 2px black; }
-        """.strip()).lstrip()
         self.PROCESSING_DIALOG_CSS = self.parser.get('Interface.Theme', 'processing_dialog_css', fallback="""
  .background { background-color: rgba(20, 20, 30, 0.85); border-radius: 8px; color: white; font-size: 14px; }
         """.strip()).lstrip()
@@ -183,9 +173,6 @@ class Config:
         self.DIALOG_QUIT_BTN_NO = self.parser.get('Interface.Strings', 'dialog_quit_button_no', fallback='否 ({key})')
         self.STR_CAPTURE_COUNT_FORMAT = self.parser.get('Interface.Strings', 'capture_count_format', fallback='截图: {count}')
         self.STR_PROCESSING_TEXT = self.parser.get('Interface.Strings', 'processing_dialog_text', fallback='正在处理…')
-        self.STR_SLIDER_MARK_MIDDLE = self.parser.get('Interface.Strings', 'slider_mark_middle', fallback='中')
-        self.STR_SLIDER_MARK_BOTTOM = self.parser.get('Interface.Strings', 'slider_mark_bottom', fallback='上')
-        self.STR_SLIDER_MARK_TOP = self.parser.get('Interface.Strings', 'slider_mark_top', fallback='下')
         # Output
         self.SAVE_DIRECTORY = Path(self.parser.get('Output', 'save_directory', fallback='~/Pictures/截图')).expanduser()
         self.SAVE_FORMAT = self.parser.get('Output', 'save_format', fallback='PNG').upper()
@@ -211,10 +198,8 @@ class Config:
         self.AUTO_SCROLL_TICKS_PER_STEP = self.parser.getint('Performance', 'auto_scroll_ticks_per_step', fallback=2)
         self.MIN_SCROLL_PER_TICK = self.parser.getint('Performance', 'min_scroll_per_tick', fallback=30)
         self.MAX_SCROLL_PER_TICK = self.parser.getint('Performance', 'max_scroll_per_tick', fallback=170)
-        self.SLIDER_SENSITIVITY = self.parser.getfloat('Performance', 'slider_sensitivity', fallback=1.8)
         self.MOUSE_MOVE_TOLERANCE = self.parser.getint('Performance', 'mouse_move_tolerance', fallback=5)
         self.MAX_VIEWER_DIMENSION = self.parser.getint('Performance', 'max_viewer_dimension', fallback=32767)
-        self.FREE_SCROLL_DISTANCE_PX = self.parser.getint('Performance', 'free_scroll_distance_px', fallback=17)
         self.PREVIEW_DRAG_SENSITIVITY = self.parser.getfloat('Performance', 'preview_drag_sensitivity', fallback=2.0)
         # Hotkeys
         self.str_capture = self.parser.get('Hotkeys', 'capture', fallback='space')
@@ -223,8 +208,8 @@ class Config:
         self.str_cancel = self.parser.get('Hotkeys', 'cancel', fallback='esc')
         self.str_dialog_confirm = self.parser.get('Hotkeys', 'dialog_confirm', fallback='space')
         self.str_dialog_cancel = self.parser.get('Hotkeys', 'dialog_cancel', fallback='esc')
-        self.str_scroll_up = self.parser.get('Hotkeys', 'scroll_up', fallback='b')
-        self.str_scroll_down = self.parser.get('Hotkeys', 'scroll_down', fallback='f')
+        self.str_grid_backward = self.parser.get('Hotkeys', 'grid_backward', fallback='b')
+        self.str_grid_forward = self.parser.get('Hotkeys', 'grid_forward', fallback='f')
         self.str_auto_scroll_start = self.parser.get('Hotkeys', 'auto_scroll_start', fallback='s')
         self.str_auto_scroll_stop = self.parser.get('Hotkeys', 'auto_scroll_stop', fallback='e')
         self.str_configure_scroll_unit = self.parser.get('Hotkeys', 'configure_scroll_unit', fallback='c')
@@ -237,8 +222,8 @@ class Config:
         self.HOTKEY_FINALIZE = self._parse_hotkey_string(self.str_finalize)
         self.HOTKEY_UNDO = self._parse_hotkey_string(self.str_undo)
         self.HOTKEY_CANCEL = self._parse_hotkey_string(self.str_cancel)
-        self.HOTKEY_SCROLL_UP = self._parse_hotkey_string(self.str_scroll_up)
-        self.HOTKEY_SCROLL_DOWN = self._parse_hotkey_string(self.str_scroll_down)
+        self.HOTKEY_GRID_BACKWARD = self._parse_hotkey_string(self.str_grid_backward)
+        self.HOTKEY_GRID_FORWARD = self._parse_hotkey_string(self.str_grid_forward)
         self.HOTKEY_AUTO_SCROLL_START = self._parse_hotkey_string(self.str_auto_scroll_start)
         self.HOTKEY_AUTO_SCROLL_STOP = self._parse_hotkey_string(self.str_auto_scroll_stop)
         self.HOTKEY_CONFIGURE_SCROLL_UNIT = self._parse_hotkey_string(self.str_configure_scroll_unit)
@@ -264,9 +249,9 @@ backward_action = scroll_delete
 
 [Interface.Components]
 enable_buttons = true
-enable_scroll_buttons = true
-enable_free_scroll = true
-enable_slider = true
+enable_grid_action_buttons = true
+enable_auto_scroll_buttons = true
+enable_side_panel = true
 show_preview_on_start = true
 show_capture_count = true
 show_total_dimensions = true
@@ -275,7 +260,7 @@ show_instruction_notification = true
 [Interface.Layout]
 border_width = 5
 handle_height = 10
-slider_panel_width = 55
+button_panel_width = 100
 side_panel_width = 100
 button_spacing = 5
 processing_dialog_width = 200
@@ -286,13 +271,6 @@ processing_dialog_border_width = 20
 [Interface.Theme]
 border_color = 0.73, 0.25, 0.25, 1.00
 matching_indicator_color = 0.60, 0.76, 0.95, 1.00
-slider_marks_per_side = 4
-slider_panel_css =
-    scale { color: #c0c0c0; font-size: 26px; }
-    scale.vertical trough { background-color: rgba(30, 30, 50, 0.7); border: 1px solid #505070; border-radius: 5px; min-width: 5px; }
-    scale mark indicator { background-color: #00d0ff; min-height: 2px; min-width: 8px; border-radius: 1px; }
-    scale.vertical highlight { background-color: rgba(0, 208, 255, 0.6); border-radius: 5px; }
-    scale label { color: white; text-shadow: 1px 1px 2px black; }
 processing_dialog_css =
     .background { background-color: rgba(20, 20, 30, 0.85); border-radius: 8px; color: white; font-size: 14px; }
 info_panel_css =
@@ -307,9 +285,6 @@ dialog_quit_message = 您已经截取了 {count} 张图片。确定要放弃它�
 dialog_quit_button_yes = 是 ({key})
 dialog_quit_button_no = 否 ({key})
 processing_dialog_text = 正在处理…
-slider_mark_middle = 中
-slider_mark_top = 下
-slider_mark_bottom = 上
 capture_count_format = 截图: {count}
 
 [Output]
@@ -336,10 +311,8 @@ free_scroll_matching_max_overlap = 200
 auto_scroll_ticks_per_step = 2
 max_scroll_per_tick = 170
 min_scroll_per_tick = 30
-slider_sensitivity = 1.8
 mouse_move_tolerance = 5
 max_viewer_dimension = 32767
-free_scroll_distance_px = 17
 preview_drag_sensitivity = 2.0
 
 [Hotkeys]
@@ -347,8 +320,8 @@ capture = space
 finalize = enter
 undo = backspace
 cancel = esc
-scroll_up = b
-scroll_down = f
+grid_backward = b
+grid_forward = f
 auto_scroll_start = s
 auto_scroll_stop = e
 configure_scroll_unit = c
@@ -1226,7 +1199,7 @@ class GridModeController:
             self.grid_unit = 0
             self.session.detected_app_class = None
             self.session.is_matching_enabled = False
-            self.view.side_panel.button_panel.set_scroll_buttons_visible(config.ENABLE_FREE_SCROLL)
+            self.view.button_panel.set_grid_action_buttons_visible(False)
             self.view.queue_draw()
             logging.info("整格模式已关闭")
             send_desktop_notification("整格模式已关闭", "边框拖动已恢复自由模式")
@@ -1242,7 +1215,7 @@ class GridModeController:
             self.grid_unit = grid_unit_from_config
             self.session.detected_app_class = app_class
             self.session.is_matching_enabled = matching_enabled
-            self.view.side_panel.button_panel.set_scroll_buttons_visible(True)
+            self.view.button_panel.set_grid_action_buttons_visible(True)
             match_status = "启用" if matching_enabled else "禁用"
             logging.info(f"为应用 '{app_class}' 启用整格模式，单位: {self.grid_unit}px, 模板匹配: {match_status}")
             send_desktop_notification("整格模式已启用", f"应用: {app_class}\n滚动单位: {self.grid_unit}px\n误差修正: {match_status}")
@@ -1532,39 +1505,6 @@ class ScrollManager:
                 logging.info("自动模式隐藏光标：滚动完成，保持光标在中心")
                 time.sleep(0.05)
 
-    def handle_slider_press(self, event):
-        event_x_root, event_y_root = event.get_root_coords()
-        win_x_root, win_y_root = self.view.get_position()
-        window_relative_x = event_x_root - win_x_root
-        window_relative_y = event_y_root - win_y_root
-        resize_edge = self.view.get_cursor_edge(window_relative_x, window_relative_y)
-        if resize_edge:
-            return False
-        self.is_fine_scrolling = True
-        return True
-
-    def handle_slider_motion(self, widget, event):
-        if self.is_fine_scrolling:
-            slider_height = widget.get_allocated_height()
-            mouse_y_in_slider = max(0, min(slider_height, event.y))
-            fraction = mouse_y_in_slider / slider_height if slider_height > 0 else 0
-            continuous_value = self.config.SLIDER_MAX - (fraction * (self.config.SLIDER_MAX - self.config.SLIDER_MIN))
-            self.view.slider_panel.adjustment.set_value(continuous_value)
-            return True
-        return False
-
-    def handle_slider_release(self, widget, event):
-        if self.is_fine_scrolling:
-            final_value = self.view.slider_panel.adjustment.get_value()
-            scroll_distance = -final_value * self.config.SLIDER_SENSITIVITY
-            if abs(scroll_distance) > 1:
-                GLib.timeout_add(20, self.scroll_smooth, scroll_distance)
-            self.is_fine_scrolling = False
-            GLib.idle_add(self.view.slider_panel.adjustment.set_value, 0)
-            return True
-        return False
-
-
 class ActionController:
     """处理所有用户操作和业务逻辑"""
     def __init__(self, session: CaptureSession, view: 'CaptureOverlay', config: Config):
@@ -1613,7 +1553,7 @@ class ActionController:
                 width=self.stitch_model.image_width,
                 height=self.stitch_model.total_virtual_height
             )
-            self.view.side_panel.button_panel.set_undo_sensitive(can_undo)
+            self.view.button_panel.set_undo_sensitive(can_undo)
         self._check_horizontal_lock_state()
 
     def _check_horizontal_lock_state(self):
@@ -1799,75 +1739,57 @@ class ActionController:
         if self.is_processing_movement:
             logging.warning("正在处理上一个移动动作，忽略新的请求")
             return
-        if not self.grid_mode_controller.is_active and not config.ENABLE_FREE_SCROLL:
-            send_desktop_notification("操作无效", "请先按 Shift 键启用整格模式，或在配置中开启非整格模式滚动按钮")
-            logging.warning("尝试在不允许的模式下执行移动操作，已取消")
+        if not self.grid_mode_controller.is_active:
+            logging.warning("非整格模式下，前进/后退动作无效")
+            send_desktop_notification("操作无效", "前进/后退操作仅在整格模式下可用")
             return
         self.is_processing_movement = True
-        if self.grid_mode_controller.is_active:
-            if self.grid_mode_controller.grid_unit <= 0:
-                logging.error("滚动单位无效，无法执行操作")
+        if self.grid_mode_controller.grid_unit <= 0:
+            logging.error("整格模式滚动单位无效，无法执行操作")
+            self.is_processing_movement = False
+            return
+        action_str = config.FORWARD_ACTION if direction == 'down' else config.BACKWARD_ACTION
+        actions = action_str.lower().replace(" ", "").split('_')
+        def do_scroll_action(callback):
+            region_height = self.session.geometry['h']
+            num_ticks = round(region_height / self.grid_mode_controller.grid_unit)
+            direction_sign = 1 if direction == 'up' else -1
+            total_ticks = num_ticks * direction_sign
+            self.scroll_manager.scroll_discrete(total_ticks)
+            GLib.timeout_add(self.SCROLL_TIME_MS, callback)
+            return False
+        def do_capture_action(callback):
+            logging.info("执行截图...")
+            self.take_capture()
+            GLib.timeout_add(self.CAPTURE_DELAY_MS, callback)
+            return False
+        def do_delete_action(callback):
+            logging.info("执行删除...")
+            self.delete_last_capture()
+            GLib.timeout_add(self.CAPTURE_DELAY_MS, callback)
+            return False
+        action_map = {
+            'scroll': do_scroll_action,
+            'capture': do_capture_action,
+            'delete': do_delete_action
+        }
+        action_queue = [action_map[act] for act in actions if act in action_map]
+        if not action_queue:
+            logging.warning(f"为方向 '{direction}' 配置了无效的动作: '{action_str}'")
+            return
+        def execute_next_in_queue(index=0):
+            if index >= len(action_queue):
                 self.is_processing_movement = False
-                return
-            action_str = config.FORWARD_ACTION if direction == 'down' else config.BACKWARD_ACTION
-            actions = action_str.lower().replace(" ", "").split('_')
-            def do_scroll_action(callback):
-                region_height = self.session.geometry['h']
-                num_ticks = round(region_height / self.grid_mode_controller.grid_unit)
-                direction_sign = 1 if direction == 'up' else -1
-                total_ticks = num_ticks * direction_sign
-                self.scroll_manager.scroll_discrete(total_ticks)
-                GLib.timeout_add(self.SCROLL_TIME_MS, callback)
                 return False
-            def do_capture_action(callback):
-                logging.info("执行截图...")
-                self.take_capture()
-                GLib.timeout_add(self.CAPTURE_DELAY_MS, callback)
-                return False
-            def do_delete_action(callback):
-                logging.info("执行删除...")
-                self.delete_last_capture()
-                GLib.timeout_add(self.CAPTURE_DELAY_MS, callback)
-                return False
-            action_map = {
-                'scroll': do_scroll_action,
-                'capture': do_capture_action,
-                'delete': do_delete_action
-            }
-            action_queue = [action_map[act] for act in actions if act in action_map]
-            if not action_queue:
-                logging.warning(f"为方向 '{direction}' 配置了无效的动作: '{action_str}'")
-                return
-            def execute_next_in_queue(index=0):
-                if index >= len(action_queue):
-                    self.is_processing_movement = False
-                    return False
-                action_func = action_queue[index]
-                action_func(lambda: execute_next_in_queue(index + 1))
-                return False
-            GLib.idle_add(execute_next_in_queue, 0)
-        else:
-            scroll_distance = config.FREE_SCROLL_DISTANCE_PX
-            final_distance = -scroll_distance if direction == 'down' else scroll_distance
-            self.scroll_manager.scroll_smooth(final_distance)
-            GLib.timeout_add(100, self._release_movement_lock)
+            action_func = action_queue[index]
+            action_func(lambda: execute_next_in_queue(index + 1))
+            return False
+        GLib.idle_add(execute_next_in_queue, 0)
 
     def _release_movement_lock(self):
          if self.is_processing_movement:
              self.is_processing_movement = False
          return False
-
-    def handle_slider_press(self, event):
-        if self.is_auto_scrolling:
-            logging.warning("自动滚动模式下忽略滑块按下事件")
-            return False
-        return self.scroll_manager.handle_slider_press(event)
-
-    def handle_slider_motion(self, widget, event):
-        return self.scroll_manager.handle_slider_motion(widget, event)
-
-    def handle_slider_release(self, widget, event):
-        return self.scroll_manager.handle_slider_release(widget, event)
 
     def take_capture(self, widget=None, auto_mode=False):
         """执行截图的核心逻辑"""
@@ -1994,12 +1916,11 @@ class ActionController:
             self.is_first_auto_capture = False
             self._auto_scroll_step()
         send_desktop_notification("自动模式已启动", f"按 {config.str_auto_scroll_stop.upper()} 或移动鼠标停止", level="low")
-        btn_panel = self.view.side_panel.button_panel
+        btn_panel = self.view.button_panel
         btn_panel.btn_capture.set_sensitive(False)
         btn_panel.btn_undo.set_sensitive(False)
         btn_panel.btn_scroll_up.set_sensitive(False)
         btn_panel.btn_scroll_down.set_sensitive(False)
-        self.view.slider_panel.set_sensitive(False)
 
     def stop_auto_scroll(self, reason_message=None):
         if not self.is_auto_scrolling:
@@ -2024,12 +1945,11 @@ class ActionController:
             send_desktop_notification("自动滚动已停止", reason_message, level="normal")
         else:
             send_desktop_notification("自动模式已停止", "用户手动停止", level="normal")
-        btn_panel = self.view.side_panel.button_panel
+        btn_panel = self.view.button_panel
         btn_panel.btn_capture.set_sensitive(True)
         btn_panel.set_undo_sensitive(self.stitch_model.capture_count > 0)
         btn_panel.btn_scroll_up.set_sensitive(True)
         btn_panel.btn_scroll_down.set_sensitive(True)
-        self.view.slider_panel.set_sensitive(True)
 
     def _auto_scroll_step(self):
         if self.last_auto_scroll_cursor_pos:
@@ -2342,15 +2262,24 @@ class ButtonPanel(Gtk.Box):
         'undo-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
         'finalize-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
         'cancel-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
-        'scroll-up-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
-        'scroll-down-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'grid-backward-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'grid-forward-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'auto-scroll-start-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'auto-scroll-stop-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=config.BUTTON_SPACING)
-        self.btn_scroll_up = Gtk.Button(label="后退")
-        self.btn_scroll_down = Gtk.Button(label="前进")
-        self.btn_scroll_up.connect("clicked", lambda w: self.emit('scroll-up-clicked'))
-        self.btn_scroll_down.connect("clicked", lambda w: self.emit('scroll-down-clicked'))
+        # 整格模式按钮
+        self.btn_grid_backward = Gtk.Button(label="后退")
+        self.btn_grid_forward = Gtk.Button(label="前进")
+        self.btn_grid_backward.connect("clicked", lambda w: self.emit('grid-backward-clicked'))
+        self.btn_grid_forward.connect("clicked", lambda w: self.emit('grid-forward-clicked'))
+        # 自动滚动按钮
+        self.btn_auto_start = Gtk.Button(label="开始")
+        self.btn_auto_stop = Gtk.Button(label="停止")
+        self.btn_auto_start.connect("clicked", lambda w: self.emit('auto-scroll-start-clicked'))
+        self.btn_auto_stop.connect("clicked", lambda w: self.emit('auto-scroll-stop-clicked'))
+        # 主操作按钮
         self.btn_capture = Gtk.Button(label="截图")
         self.btn_capture.connect("clicked", lambda w: self.emit('capture-clicked'))
         self.btn_undo = Gtk.Button(label="撤销")
@@ -2360,80 +2289,86 @@ class ButtonPanel(Gtk.Box):
         self.btn_cancel = Gtk.Button(label="取消")
         self.btn_cancel.connect("clicked", lambda w: self.emit('cancel-clicked'))
         all_buttons = [
-            self.btn_scroll_up, self.btn_scroll_down,
+            self.btn_grid_backward, self.btn_grid_forward,
+            self.btn_auto_start, self.btn_auto_stop,
             self.btn_capture, self.btn_undo, self.btn_finalize, self.btn_cancel
         ]
         for btn in all_buttons:
             btn.set_can_focus(False)
             btn.show()
-        if config.ENABLE_SCROLL_BUTTONS:
-            initial_visible = config.ENABLE_FREE_SCROLL
-            self.btn_scroll_up.set_visible(initial_visible)
-            self.btn_scroll_down.set_visible(initial_visible)
+        if config.ENABLE_GRID_ACTION_BUTTONS:
+            self.btn_grid_backward.set_visible(False)
+            self.btn_grid_forward.set_visible(False)
         else:
-             self.btn_scroll_up.set_no_show_all(True)
-             self.btn_scroll_down.set_no_show_all(True)
-             self.btn_scroll_up.hide()
-             self.btn_scroll_down.hide()
+            self.btn_grid_backward.set_no_show_all(True)
+            self.btn_grid_forward.set_no_show_all(True)
+            self.btn_grid_backward.hide()
+            self.btn_grid_forward.hide()
+        if config.ENABLE_AUTO_SCROLL_BUTTONS:
+            self.btn_auto_start.set_visible(True)
+            self.btn_auto_stop.set_visible(True)
+        else:
+            self.btn_auto_start.set_no_show_all(True)
+            self.btn_auto_stop.set_no_show_all(True)
+            self.btn_auto_start.hide()
+            self.btn_auto_stop.hide()
         self.btn_undo.set_sensitive(False)
-        self.pack_start(self.btn_scroll_up, True, True, 0)
-        self.pack_start(self.btn_scroll_down, True, True, 0)
-        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        self.pack_start(separator, False, False, 0)
+        self.pack_start(self.btn_grid_backward, True, True, 0)
+        self.pack_start(self.btn_grid_forward, True, True, 0)
+        self.separator_grid_auto = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        self.pack_start(self.separator_grid_auto, False, False, 2)
+        self.pack_start(self.btn_auto_start, True, True, 0)
+        self.pack_start(self.btn_auto_stop, True, True, 0)
+        self.separator_auto_main = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        self.pack_start(self.separator_auto_main, False, False, 2)
         self.pack_start(self.btn_capture, True, True, 0)
         self.pack_start(self.btn_undo, True, True, 0)
         self.pack_start(self.btn_finalize, True, True, 0)
         self.pack_start(self.btn_cancel, True, True, 0)
+        self.set_size_request(config.BUTTON_PANEL_WIDTH, -1)
+        self.show()
+        self.btn_grid_backward.set_visible(False)
+        self.btn_grid_forward.set_visible(False)
+        self.separator_grid_auto.set_visible(False)
+        self.btn_auto_start.set_visible(config.ENABLE_AUTO_SCROLL_BUTTONS)
+        self.btn_auto_stop.set_visible(config.ENABLE_AUTO_SCROLL_BUTTONS)
+        self.separator_auto_main.set_visible(config.ENABLE_AUTO_SCROLL_BUTTONS)
+        _, self._button_natural_h_normal = self.get_preferred_height()
+        logging.info(f"缓存的 ButtonPanel 普通模式自然高度: {self._button_natural_h_normal}")
+        self.btn_grid_backward.set_visible(config.ENABLE_GRID_ACTION_BUTTONS)
+        self.btn_grid_forward.set_visible(config.ENABLE_GRID_ACTION_BUTTONS)
+        self.separator_grid_auto.set_visible(config.ENABLE_GRID_ACTION_BUTTONS)
+        self.btn_auto_start.set_visible(False)
+        self.btn_auto_stop.set_visible(False)
+        self.separator_auto_main.set_visible(False)
+        _, self._button_natural_h_grid = self.get_preferred_height()
+        logging.info(f"缓存的 ButtonPanel 整格模式自然高度: {self._button_natural_h_grid}")
+        self.set_grid_action_buttons_visible(False)
 
-    def set_scroll_buttons_visible(self, visible: bool):
-        if not config.ENABLE_SCROLL_BUTTONS:
-            return
-        self.btn_scroll_up.set_visible(visible)
-        self.btn_scroll_down.set_visible(visible)
-        children = self.get_children()
-        if len(children) > 2 and isinstance(children[2], Gtk.Separator):
-            children[2].set_visible(visible)
+    def set_grid_action_buttons_visible(self, visible: bool):
+        is_grid_mode = visible
+        grid_buttons_show = is_grid_mode and config.ENABLE_GRID_ACTION_BUTTONS
+        self.btn_grid_backward.set_visible(grid_buttons_show)
+        self.btn_grid_forward.set_visible(grid_buttons_show)
+        auto_buttons_show = (not is_grid_mode) and config.ENABLE_AUTO_SCROLL_BUTTONS
+        self.btn_auto_start.set_visible(auto_buttons_show)
+        self.btn_auto_stop.set_visible(auto_buttons_show)
+        self.separator_grid_auto.set_visible(grid_buttons_show)
+        self.separator_auto_main.set_visible(auto_buttons_show)
 
     def set_undo_sensitive(self, sensitive: bool):
         self.btn_undo.set_sensitive(sensitive)
 
-class SliderPanel(Gtk.Scale):
-    def __init__(self):
-        if config.SLIDER_MARKS_PER_SIDE > 0:
-            page_increment_value = config.SLIDER_MAX / config.SLIDER_MARKS_PER_SIDE
+    def update_visibility_by_height(self, available_height: int, is_grid_mode: bool):
+        should_show_buttons_base = config.ENABLE_BUTTONS
+        if not should_show_buttons_base:
+            self.hide()
+            return
+        required_h = self._button_natural_h_grid if is_grid_mode else self._button_natural_h_normal
+        if available_height >= required_h:
+            self.show()
         else:
-            page_increment_value = config.SLIDER_MAX
-        self.adjustment = Gtk.Adjustment(
-            value=0, 
-            lower=config.SLIDER_MIN, 
-            upper=config.SLIDER_MAX, 
-            step_increment=10, 
-            page_increment=page_increment_value, 
-            page_size=0
-        )
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, adjustment=self.adjustment)
-        self.set_inverted(True)
-        self.set_draw_value(False)
-        self.set_can_focus(False)
-        self._add_marks()
-        self._apply_css()
-        self.show()
-
-    def _add_marks(self):
-        self.add_mark(0, Gtk.PositionType.LEFT, config.STR_SLIDER_MARK_MIDDLE)
-        self.add_mark(config.SLIDER_MAX, Gtk.PositionType.LEFT, config.STR_SLIDER_MARK_TOP)
-        self.add_mark(config.SLIDER_MIN, Gtk.PositionType.LEFT, config.STR_SLIDER_MARK_BOTTOM)
-        if config.SLIDER_MARKS_PER_SIDE > 1:
-            for i in range(1, config.SLIDER_MARKS_PER_SIDE):
-                self.add_mark((config.SLIDER_MAX / config.SLIDER_MARKS_PER_SIDE) * i, Gtk.PositionType.LEFT, None)
-                self.add_mark((config.SLIDER_MIN / config.SLIDER_MARKS_PER_SIDE) * i, Gtk.PositionType.LEFT, None)
-
-    def _apply_css(self):
-        css_provider = Gtk.CssProvider()
-        css_string = config.SLIDER_PANEL_CSS
-        css_provider.load_from_data(css_string.encode('utf-8'))
-        style_context = self.get_style_context()
-        style_context.add_provider(css_provider, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+            self.hide()
 
 class InfoPanel(Gtk.Box):
     def __init__(self):
@@ -2486,43 +2421,20 @@ class SidePanel(Gtk.Box):
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=config.BUTTON_SPACING)
         self.info_panel = InfoPanel()
-        self.button_panel = ButtonPanel()
         self.info_panel.set_size_request(config.SIDE_PANEL_WIDTH, -1)
         self.pack_start(self.info_panel, False, False, 0)
-        self.pack_start(self.button_panel, True, True, 0)
         self.info_panel.show()
-        self.button_panel.show()
         _, self._info_natural_h = self.info_panel.get_preferred_height()
         logging.info(f"缓存的 InfoPanel 自然高度: {self._info_natural_h}")
-        _, self._button_natural_h_normal = self.button_panel.get_preferred_height()
-        logging.info(f"缓存的 ButtonPanel 普通模式自然高度: {self._button_natural_h_normal}")
-        self.button_panel.set_scroll_buttons_visible(True)
-        _, self._button_natural_h_grid = self.button_panel.get_preferred_height()
-        logging.info(f"缓存的 ButtonPanel 整格模式自然高度: {self._button_natural_h_grid}")
-        self.button_panel.set_scroll_buttons_visible(config.ENABLE_FREE_SCROLL)
 
     def update_visibility_by_height(self, available_height: int, is_grid_mode: bool):
-        should_show_info_base = config.SHOW_CAPTURE_COUNT or config.SHOW_TOTAL_DIMENSIONS
-        should_show_buttons_base = config.ENABLE_BUTTONS
-        if not should_show_info_base and not should_show_buttons_base:
+        should_show_info_base = config.ENABLE_SIDE_PANEL and (config.SHOW_CAPTURE_COUNT or config.SHOW_TOTAL_DIMENSIONS)
+        if not should_show_info_base:
             self.info_panel.hide()
-            self.button_panel.hide()
             return
         required_h_for_info = self._info_natural_h if should_show_info_base else 0
-        if should_show_buttons_base:
-            scroll_buttons_are_visible = is_grid_mode or config.ENABLE_FREE_SCROLL
-            required_h_for_buttons = self._button_natural_h_grid if scroll_buttons_are_visible else self._button_natural_h_normal
-        else:
-            required_h_for_buttons = 0
-        required_spacing = self.get_spacing() if (should_show_info_base and should_show_buttons_base) else 0
-        threshold_for_all_enabled = required_h_for_info + required_h_for_buttons + required_spacing
         threshold_for_info_only = required_h_for_info
-        can_show_all_enabled = available_height >= threshold_for_all_enabled
         can_show_info_panel = available_height >= threshold_for_info_only
-        if should_show_buttons_base and can_show_all_enabled:
-            self.button_panel.show()
-        else:
-            self.button_panel.hide()
         if should_show_info_base and can_show_info_panel:
             self.info_panel.show()
         else:
@@ -2560,28 +2472,28 @@ class ConfigWindow(Gtk.Window):
             ('Output', 'save_directory'), ('Output', 'save_format'),
             ('Output', 'jpeg_quality'), ('Output', 'filename_template'),
             ('Output', 'filename_timestamp_format'),
-            ('Interface.Components', 'enable_buttons'), ('Interface.Components', 'enable_scroll_buttons'),
-            ('Interface.Components', 'enable_free_scroll'), ('Interface.Components', 'enable_slider'),
+            ('Interface.Components', 'enable_buttons'),
+            ('Interface.Components', 'enable_grid_action_buttons'), ('Interface.Components', 'enable_auto_scroll_buttons'),
+            ('Interface.Components', 'enable_side_panel'),
             ('Interface.Components', 'show_preview_on_start'),
             ('Interface.Components', 'show_capture_count'), ('Interface.Components', 'show_total_dimensions'),
             ('Interface.Components', 'show_instruction_notification'),
             ('Behavior', 'enable_free_scroll_matching'), ('Behavior', 'capture_with_cursor'), ('Behavior', 'scroll_method'), ('Behavior', 'reuse_invisible_cursor'),
             ('Behavior', 'forward_action'), ('Behavior', 'backward_action'),
             ('Interface.Theme', 'border_color'), ('Interface.Theme', 'matching_indicator_color'),
-            ('Interface.Theme', 'slider_marks_per_side'),
             ('Interface.Layout', 'border_width'),
-            ('Interface.Layout', 'handle_height'), ('Interface.Layout', 'slider_panel_width'),
+            ('Interface.Layout', 'handle_height'), ('Interface.Layout', 'button_panel_width'),
             ('Interface.Layout', 'side_panel_width'), ('Interface.Layout', 'button_spacing'),
             ('Interface.Layout', 'processing_dialog_width'), ('Interface.Layout', 'processing_dialog_height'),
             ('Interface.Layout', 'processing_dialog_spacing'), ('Interface.Layout', 'processing_dialog_border_width'),
-            ('Interface.Theme', 'slider_panel_css'), ('Interface.Theme', 'processing_dialog_css'),
+            ('Interface.Theme', 'processing_dialog_css'),
             ('Interface.Theme', 'info_panel_css'),
             ('System', 'copy_to_clipboard_on_finish'), ('System', 'notification_click_action'),
             ('System', 'large_image_opener'), ('System', 'sound_theme'),
             ('System', 'capture_sound'), ('System', 'undo_sound'), ('System', 'finalize_sound'),
-            ('Performance', 'grid_matching_max_overlap'), ('Performance', 'free_scroll_matching_max_overlap'), ('Performance', 'slider_sensitivity'), ('Performance', 'mouse_move_tolerance'),
+            ('Performance', 'grid_matching_max_overlap'), ('Performance', 'free_scroll_matching_max_overlap'), ('Performance', 'mouse_move_tolerance'),
             ('Performance', 'auto_scroll_ticks_per_step'), ('Performance', 'max_scroll_per_tick'), ('Performance', 'min_scroll_per_tick'),
-            ('Performance', 'free_scroll_distance_px'), ('Performance', 'max_viewer_dimension'), ('Performance', 'preview_drag_sensitivity'),
+            ('Performance', 'max_viewer_dimension'), ('Performance', 'preview_drag_sensitivity'),
             ('System', 'log_file'), ('System', 'temp_directory_base'),
         ]
         self.sound_data = self._discover_sound_themes()
@@ -3162,7 +3074,7 @@ class ConfigWindow(Gtk.Window):
         self.hotkey_configs = [
             ("capture", "截图"), ("finalize", "完成"),
             ("undo", "撤销"), ("cancel", "取消"),
-            ("scroll_up", "后退"), ("scroll_down", "前进"),
+            ("grid_backward", "整格后退"), ("grid_forward", "整格前进"),
             ("auto_scroll_start", "开始自动滚动"), ("auto_scroll_stop", "停止自动滚动"),
             ("configure_scroll_unit", "配置滚动单位"), ("toggle_grid_mode", "切换整格模式"),
             ("open_config_editor", "激活/隐藏配置窗口"), ("toggle_hotkeys_enabled", "启用/禁用全局热键"), 
@@ -3203,9 +3115,9 @@ class ConfigWindow(Gtk.Window):
         scrolled.add(vbox)
         interface_page_settings = [
             ('Interface.Components', 'enable_buttons'),
-            ('Interface.Components', 'enable_scroll_buttons'),
-            ('Interface.Components', 'enable_free_scroll'),
-            ('Interface.Components', 'enable_slider'),
+            ('Interface.Components', 'enable_grid_action_buttons'),
+            ('Interface.Components', 'enable_auto_scroll_buttons'),
+            ('Interface.Components', 'enable_side_panel'),
             ('Interface.Components', 'show_preview_on_start'),
             ('Interface.Components', 'show_capture_count'),
             ('Interface.Components', 'show_total_dimensions'),
@@ -3232,9 +3144,9 @@ class ConfigWindow(Gtk.Window):
         frame1.add(vbox1)
         component_configs = [
             ("enable_buttons", "启用主操作按钮", "控制是否显示“截图”、“完成”、“撤销”、“取消”这四个功能按钮"),
-            ("enable_scroll_buttons", "启用“前进/后退”按钮", "控制是否显示“前进”和“后退”按钮\n禁用后，仍能通过快捷键或滑块进行滚动"),
-            ("enable_free_scroll", "自由模式启用滚动功能", "控制在<b>自由模式</b>下，“前进/后退”按钮及其快捷键是否可用"),
-            ("enable_slider", "启用左侧滑块条", "是否在截图区域左侧显示一个用于平滑滚动的拖动条"),
+            ("enable_grid_action_buttons", "启用前进/后退按钮", "控制在<b>整格模式</b>下是否显示“前进”和“后退”按钮\n禁用后，仍能通过快捷键操作"),
+            ("enable_auto_scroll_buttons", "启用开始/停止按钮", "控制在<b>自由模式</b>下是否显示“开始”和“停止”按钮"),
+            ("enable_side_panel", "启用侧边栏", "是否在截图区域旁边显示一个用于显示信息面板和功能面板的侧边栏"),
             ("show_preview_on_start", "启动时显示预览窗口", "控制是否在截图会话开始时自动打开预览窗口"),
             ("show_capture_count", "显示已截图数量", "是否在侧边栏信息面板中显示当前已截取的图片数量"),
             ("show_total_dimensions", "显示最终图片总尺寸", "是否在侧边栏信息面板中显示拼接后图片的总宽度和总高度"),
@@ -3332,16 +3244,13 @@ class ConfigWindow(Gtk.Window):
             ('Interface.Theme', 'border_color'),
             ('Interface.Theme', 'matching_indicator_color'),
             ('Interface.Layout', 'border_width'),
-            ('Interface.Theme', 'slider_marks_per_side'),
             ('Interface.Layout', 'handle_height'),
-            ('Interface.Layout', 'slider_panel_width'),
             ('Interface.Layout', 'side_panel_width'),
             ('Interface.Layout', 'button_spacing'),
             ('Interface.Layout', 'processing_dialog_width'),
             ('Interface.Layout', 'processing_dialog_height'),
             ('Interface.Layout', 'processing_dialog_spacing'),
             ('Interface.Layout', 'processing_dialog_border_width'),
-            ('Interface.Theme', 'slider_panel_css'),
             ('Interface.Theme', 'processing_dialog_css'),
             ('Interface.Theme', 'info_panel_css'),
         ]
@@ -3383,16 +3292,6 @@ class ConfigWindow(Gtk.Window):
         self.border_width_spin.set_halign(Gtk.Align.START)
         grid1.attach(label, 0, 2, 1, 1)
         grid1.attach(self.border_width_spin, 1, 2, 1, 1)
-        # 滑块刻度数量
-        label = Gtk.Label(label="滑块刻度数量:", xalign=0)
-        self.slider_marks_spin = Gtk.SpinButton()
-        self._connect_focus_handlers(self.slider_marks_spin)
-        self.slider_marks_spin.connect("scroll-event", lambda widget, event: True)
-        self.slider_marks_spin.set_range(0, 20)
-        self.slider_marks_spin.set_increments(1, 2)
-        self.slider_marks_spin.set_halign(Gtk.Align.START)
-        grid1.attach(label, 0, 3, 1, 1)
-        grid1.attach(self.slider_marks_spin, 1, 3, 1, 1)
         # 布局微调
         frame2 = Gtk.Frame(label="布局微调（像素）")
         vbox.pack_start(frame2, False, False, 0)
@@ -3406,8 +3305,8 @@ class ConfigWindow(Gtk.Window):
         frame2.add(grid2)
         layout_configs = [
             ("handle_height", "拖动手柄高度", 3, 50, "在截图选区上下边缘，可用于拖动调整高度的区域大小"),
-            ("slider_panel_width", "滑块面板宽度", 40, 150, "左侧滑块面板的宽度"),
-            ("side_panel_width", "侧边栏宽度", 80, 200, "功能按钮和信息面板的总宽度"),
+            ("button_panel_width", "按钮面板宽度", 80, 200, "右侧按钮面板的宽度"),
+            ("side_panel_width", "侧边栏宽度", 80, 200, "功能面板和信息面板的总宽度"),
             ("button_spacing", "按钮间距", 0, 20, "侧边栏中各个按钮之间的垂直间距"),
             ("processing_dialog_width", "处理中对话框宽度", 100, 400, "完成截图后弹出的对话框的宽度"),
             ("processing_dialog_height", "处理中对话框高度", 50, 200, "完成截图后弹出的对话框的宽度"),
@@ -3441,7 +3340,6 @@ class ConfigWindow(Gtk.Window):
         css_expander.add(css_vbox)
         self.css_textviews = {}
         css_configs = [
-            ("slider_panel_css", "滑块样式"),
             ("processing_dialog_css", "处理中对话框样式"), 
             ("info_panel_css", "信息面板样式")
         ]
@@ -3450,7 +3348,7 @@ class ConfigWindow(Gtk.Window):
             label.set_tooltip_markup("在此处输入自定义 CSS 代码以调整组件外观")
             scrolled_css = Gtk.ScrolledWindow()
             scrolled_css.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-            scrolled_css.set_size_request(-1, 250)
+            scrolled_css.set_size_request(-1, 170)
             scrolled_css.set_margin_start(10)
             scrolled_css.set_margin_end(5)
             scrolled_css.set_margin_top(5)
@@ -3536,12 +3434,10 @@ class ConfigWindow(Gtk.Window):
             ('System', 'capture_sound'),
             ('System', 'undo_sound'),
             ('System', 'finalize_sound'),
-            ('Performance', 'slider_sensitivity'),
             ('Performance', 'mouse_move_tolerance'),
             ('Performance', 'auto_scroll_ticks_per_step'),
             ('Performance', 'max_scroll_per_tick'),
             ('Performance', 'min_scroll_per_tick'),
-            ('Performance', 'free_scroll_distance_px'),
             ('Performance', 'max_viewer_dimension'),
             ('System', 'log_file'),
             ('System', 'temp_directory_base'),
@@ -3657,7 +3553,6 @@ class ConfigWindow(Gtk.Window):
             ("auto_scroll_ticks_per_step", "自动滚动步长（格数）", 1, 8, "自动模式下，每一步滚动几格\n值越大滚动越快"),
             ("max_scroll_per_tick", "自动截图高度（每格）", 120, 240, "自动模式下，对应滚动一格的截图高度 (px)\n总截图高度 = 此值 * 滚动格数"),
             ("min_scroll_per_tick", "最小滚动像素", 1, 60, "用于匹配和校准的最小滚动阈值 (px)"),
-            ("free_scroll_distance_px", "自由滚动步长", 10, 500, "在<b>自由模式</b>下，“前进”/“后退”滚动的相对距离"),
             ("max_viewer_dimension", "图片尺寸阈值", -1, 131071, "最终图片长或宽超过此值时，会使用上面的“大尺寸图片打开命令”\n设为 <b>-1</b> 禁用此功能，总是用系统默认方式打开图片\n设为 <b>0</b> 总是用自定义命令打开图片"),
             ("preview_drag_sensitivity", "预览拖动灵敏度", 0.5, 10.0, "预览窗口中按住左键拖动图像的速度倍数")
         ]
@@ -3813,9 +3708,6 @@ class ConfigWindow(Gtk.Window):
             ("dialog_quit_button_no", "退出确认按钮 (否)"),
             ("capture_count_format", "截图数量格式"),
             ("processing_dialog_text", "处理中对话框文本"),
-            ("slider_mark_middle", "滑块标记 (中)"),
-            ("slider_mark_top", "滑块标记 (上)"),
-            ("slider_mark_bottom", "滑块标记 (下)")
         ]
         self.string_entries = {}
         for i, (key, desc) in enumerate(string_configs):
@@ -3895,8 +3787,6 @@ class ConfigWindow(Gtk.Window):
             'border_color': self.border_color_button,
             'matching_indicator_color': self.indicator_color_button,
             'border_width': self.border_width_spin,
-            'slider_marks_per_side': self.slider_marks_spin,
-            'slider_sensitivity': self.sensitivity_spin,
             'copy_to_clipboard_on_finish': self.clipboard_checkbox,
             'notification_click_action': self.notification_combo,
             'large_image_opener': self.large_opener_entry,
@@ -3935,7 +3825,7 @@ class ConfigWindow(Gtk.Window):
         elif isinstance(widget, Gtk.ComboBoxText):
             return widget.get_active_id()
         elif isinstance(widget, Gtk.SpinButton):
-            if key in ('slider_sensitivity', 'preview_drag_sensitivity'):
+            if key in ('preview_drag_sensitivity'):
                  return f"{widget.get_value():.1f}"
             else:
                  return str(widget.get_value_as_int())
@@ -4398,37 +4288,32 @@ class CaptureOverlay(Gtk.Window):
         self.touchpad_controller = None
         self.invisible_scroller = None
         self.screen_rect = self._get_current_monitor_geometry()
-        if config.ENABLE_SLIDER:
-            try:
-                if config.SCROLL_METHOD == 'invisible_cursor':
-                    self.invisible_scroller = InvisibleCursorScroller(
-                        self.screen_rect.width, self.screen_rect.height, config
-                    )
-                    self.invisible_scroller.setup()
-                    logging.info("InvisibleCursorScroller.setup() 正在后台线程中执行")
-                else:
-                    self.touchpad_controller = VirtualTouchpadController()
-            except Exception as err:
-                logging.error(f"创建虚拟滚动设备失败: {err}")
-                send_desktop_notification(
-                    "设备错误", f"无法创建虚拟设备: {err}，滑块微调功能将使用备用模式或不可用", level="critical"
+        try:
+            if config.SCROLL_METHOD == 'invisible_cursor':
+                self.invisible_scroller = InvisibleCursorScroller(
+                    self.screen_rect.width, self.screen_rect.height, config
                 )
-                self.touchpad_controller = None
-                self.invisible_scroller = None
+                self.invisible_scroller.setup()
+                logging.info("InvisibleCursorScroller.setup() 正在后台线程中执行")
+            else:
+                self.touchpad_controller = VirtualTouchpadController()
+        except Exception as err:
+            logging.error(f"创建虚拟滚动设备失败: {err}")
+            send_desktop_notification(
+                "设备错误", f"无法创建虚拟设备: {err}，滑块微调功能将使用备用模式或不可用", level="critical"
+            )
+            self.touchpad_controller = None
+            self.invisible_scroller = None
         self.window_xid = None # 用于存储窗口的 X11 ID
         self.is_dialog_open = False
-        self.show_slider = True
         self.show_side_panel = True
-        self.panel_on_left = False
+        self.show_button_panel = True
+        self.side_panel_on_left = True
         self._setup_window_properties()
         self.fixed_container = Gtk.Fixed()
         self.add(self.fixed_container)
         self.fixed_container.show()
-        self.create_slider_panel()
-        self.create_side_panel()
-        self._slider_min_h, _ = self.slider_panel.get_preferred_height()
-        logging.info(f"缓存的 SliderPanel 最小高度: {self._slider_min_h}")
-        self.slider_panel.set_size_request(config.SLIDER_PANEL_WIDTH, self.session.geometry['h']) 
+        self.create_panels()
         self.update_layout()
         self._initialize_cursors()
         self._connect_events()
@@ -4508,7 +4393,8 @@ class CaptureOverlay(Gtk.Window):
                 width=model_instance.image_width,
                 height=model_instance.total_virtual_height
             )
-            self.side_panel.button_panel.set_undo_sensitive(can_undo)
+        if self.show_button_panel:
+            self.button_panel.set_undo_sensitive(can_undo)
         self.queue_draw()
 
     def _position_and_show_preview(self):
@@ -4628,8 +4514,6 @@ class CaptureOverlay(Gtk.Window):
         dialog.add_button("好的", Gtk.ResponseType.OK)
         dialog.add_button("不再显示", Gtk.ResponseType.CLOSE)
         instruction_lines = ["拼长图操作指南："]
-        if config.ENABLE_SLIDER:
-            instruction_lines.append("左侧滑块条：按住并拖动滑块，松开滚动界面")
         hotkeys = [
             f"截图：{config.str_capture.upper()}",
             f"完成：{config.str_finalize.upper()}",
@@ -4649,33 +4533,19 @@ class CaptureOverlay(Gtk.Window):
         dialog.destroy()
         return False
 
-    def create_slider_panel(self):
-        self.slider_panel = SliderPanel()
-        self.slider_panel.connect("button-press-event", self.on_slider_press)
-        self.slider_panel.connect("motion-notify-event", self.on_slider_motion)
-        self.slider_panel.connect("button-release-event", self.on_slider_release)
-        self.fixed_container.put(self.slider_panel, 0, config.BORDER_WIDTH)
-
-
-    def on_slider_press(self, widget, event):
-        return self.controller.handle_slider_press(event)
-
-    def on_slider_motion(self, widget, event):
-        return self.controller.handle_slider_motion(widget, event)
-
-    def on_slider_release(self, widget, event):
-        return self.controller.handle_slider_release(widget, event)
-
-    def create_side_panel(self):
+    def create_panels(self):
         self.side_panel = SidePanel()
-        button_panel = self.side_panel.button_panel
-        button_panel.connect("scroll-up-clicked", lambda w: self.controller.handle_movement_action('up'))
-        button_panel.connect("scroll-down-clicked", lambda w: self.controller.handle_movement_action('down'))
-        button_panel.connect("capture-clicked", self.controller.take_capture)
-        button_panel.connect("undo-clicked", self.controller.delete_last_capture)
-        button_panel.connect("finalize-clicked", self.controller.finalize_and_quit)
-        button_panel.connect("cancel-clicked", self.controller.quit_and_cleanup)
         self.fixed_container.put(self.side_panel, 0, 0)
+        self.button_panel = ButtonPanel()
+        self.button_panel.connect("grid-backward-clicked", lambda w: self.controller.handle_movement_action('up'))
+        self.button_panel.connect("grid-forward-clicked", lambda w: self.controller.handle_movement_action('down'))
+        self.button_panel.connect("auto-scroll-start-clicked", self.controller.start_auto_scroll)
+        self.button_panel.connect("auto-scroll-stop-clicked", self.controller.stop_auto_scroll)
+        self.button_panel.connect("capture-clicked", self.controller.take_capture)
+        self.button_panel.connect("undo-clicked", self.controller.delete_last_capture)
+        self.button_panel.connect("finalize-clicked", self.controller.finalize_and_quit)
+        self.button_panel.connect("cancel-clicked", self.controller.quit_and_cleanup)
+        self.fixed_container.put(self.button_panel, 0, 0)
 
     def on_dialog_key_press(self, widget, event):
         """处理确认对话框的按键事件"""
@@ -4780,14 +4650,10 @@ class CaptureOverlay(Gtk.Window):
         final_input_region = cairo.Region()
         # 1. 计算左侧面板区域
         left_panel_w = 0
-        if self.show_slider:
-            slider_region = cairo.Region(cairo.RectangleInt(0, 0, config.SLIDER_PANEL_WIDTH, win_h))
-            final_input_region.union(slider_region)
-            left_panel_w += config.SLIDER_PANEL_WIDTH
-        if self.panel_on_left:
-            btn_region = cairo.Region(cairo.RectangleInt(left_panel_w, 0, config.SIDE_PANEL_WIDTH, win_h))
-            final_input_region.union(btn_region)
-            left_panel_w += config.SIDE_PANEL_WIDTH
+        if self.show_side_panel and self.side_panel_on_left:
+            left_panel_w = config.SIDE_PANEL_WIDTH
+            left_region = cairo.Region(cairo.RectangleInt(0, 0, left_panel_w, win_h))
+            final_input_region.union(left_region)
         # 2. 计算边框区域
         border_area_x_start = left_panel_w
         border_area_width = self.session.geometry['w'] + 2 * config.BORDER_WIDTH
@@ -4800,11 +4666,16 @@ class CaptureOverlay(Gtk.Window):
         )
         border_full_region.subtract(inner_transparent_region)
         final_input_region.union(border_full_region)
-        # 3. 计算右侧面板区域 (如果按钮在右边)
-        if not self.panel_on_left:
-            btn_x_start = border_area_x_start + border_area_width
-            btn_region = cairo.Region(cairo.RectangleInt(btn_x_start, 0, config.SIDE_PANEL_WIDTH, win_h))
-            final_input_region.union(btn_region)
+        # 3. 计算右侧面板区域
+        right_panel_w = 0
+        btn_x_start = border_area_x_start + border_area_width
+        if self.show_button_panel:
+            right_panel_w = config.BUTTON_PANEL_WIDTH
+        elif self.show_side_panel and not self.side_panel_on_left:
+            right_panel_w = config.SIDE_PANEL_WIDTH
+        if right_panel_w > 0:
+            right_region = cairo.Region(cairo.RectangleInt(btn_x_start, 0, right_panel_w, win_h))
+            final_input_region.union(right_region)
         self.input_shape_combine_region(final_input_region)
 
     def get_cursor_edge(self, x, y):
@@ -4835,73 +4706,77 @@ class CaptureOverlay(Gtk.Window):
 
     @property
     def left_panel_w(self):
-        """ 根据当前状态计算左侧所有面板的总宽度 """
-        width = 0
-        if self.show_slider:
-            width += config.SLIDER_PANEL_WIDTH
-        if self.show_side_panel and self.panel_on_left:
-            width += config.SIDE_PANEL_WIDTH
-        return width
+        if self.show_side_panel and self.side_panel_on_left:
+            return config.SIDE_PANEL_WIDTH
+        return 0
 
     def update_layout(self):
         """根据屏幕和选区位置，动态计算并应用窗口布局和几何属性"""
         screen_w = self.screen_rect.width
-        # 1. 决策：整个侧边面板是否显示
+        side_panel_needed_w = config.SIDE_PANEL_WIDTH
+        button_panel_needed_w = config.BUTTON_PANEL_WIDTH
         should_show_info = config.SHOW_CAPTURE_COUNT or config.SHOW_TOTAL_DIMENSIONS
-        self.show_side_panel = config.ENABLE_BUTTONS or should_show_info
-        # 2. 侧边面板位置决策
-        if self.show_side_panel:
-            side_panel_width = config.SIDE_PANEL_WIDTH
-            has_space_right = (self.session.geometry['x'] + self.session.geometry['w'] + config.BORDER_WIDTH + side_panel_width) <= screen_w
-            has_space_left = (self.session.geometry['x'] - config.BORDER_WIDTH - side_panel_width) >= 0
-            if has_space_right:
-                self.panel_on_left = False
-            elif has_space_left:
-                self.panel_on_left = True
+        should_show_side_panel_base = config.ENABLE_SIDE_PANEL and should_show_info
+        should_show_side_panel_base = should_show_info
+        should_show_button_panel_base = config.ENABLE_BUTTONS
+        has_space_right_for_button_panel = (self.session.geometry['x'] + self.session.geometry['w'] + config.BORDER_WIDTH + button_panel_needed_w) <= screen_w
+        has_space_right_for_side_panel = (self.session.geometry['x'] + self.session.geometry['w'] + config.BORDER_WIDTH + side_panel_needed_w) <= screen_w
+        has_space_left_for_side_panel = (self.session.geometry['x'] - config.BORDER_WIDTH - side_panel_needed_w) >= 0
+        self.show_side_panel = False
+        self.show_button_panel = False
+        self.side_panel_on_left = True
+        if should_show_side_panel_base and has_space_left_for_side_panel:
+            self.show_side_panel = True
+            self.side_panel_on_left = True
+            if should_show_button_panel_base and has_space_right_for_button_panel:
+                self.show_button_panel = True
             else:
-                self.show_side_panel = False # 两边都没空间，强制隐藏
+                self.show_button_panel = False
+        elif should_show_side_panel_base and has_space_right_for_side_panel:
+            self.show_side_panel = True
+            self.side_panel_on_left = False
+            self.show_button_panel = False
+        elif should_show_button_panel_base and has_space_right_for_button_panel:
+            self.show_side_panel = False
+            self.show_button_panel = True
         else:
-            self.panel_on_left = False
-        # 3. 滑块决策
-        if config.ENABLE_SLIDER:
-            has_horizontal_space = (self.session.geometry['x'] - config.BORDER_WIDTH - config.SLIDER_PANEL_WIDTH) >= 0
-            has_vertical_space = self.session.geometry['h'] >= self._slider_min_h
-            self.show_slider = has_horizontal_space and has_vertical_space and not self.panel_on_left
-        else:
-            self.show_slider = False
-        # 4. 根据决策计算几何属性
+            self.show_side_panel = False
+            self.show_button_panel = False
         left_total_w = 0
-        if self.show_slider:
-            left_total_w += config.SLIDER_PANEL_WIDTH
-        if self.show_side_panel and self.panel_on_left:
-            left_total_w += config.SIDE_PANEL_WIDTH
+        if self.show_side_panel and self.side_panel_on_left:
+            left_total_w = side_panel_needed_w
         right_total_w = 0
-        if self.show_side_panel and not self.panel_on_left:
-            right_total_w = config.SIDE_PANEL_WIDTH
+        if self.show_button_panel:
+            right_total_w = button_panel_needed_w
+        elif self.show_side_panel and not self.side_panel_on_left:
+            right_total_w = side_panel_needed_w
         win_x = self.session.geometry['x'] - left_total_w - config.BORDER_WIDTH
         win_y = self.session.geometry['y'] - config.BORDER_WIDTH
         win_w = left_total_w + self.session.geometry['w'] + 2 * config.BORDER_WIDTH + right_total_w
         win_h = self.session.geometry['h'] + 2 * config.BORDER_WIDTH
         self.move(win_x, win_y)
         self.resize(win_w, win_h)
-        # 5. 更新子组件的可见性和位置
-        self.slider_panel.set_visible(self.show_slider)
+        # 更新子组件的可见性和位置
+        capture_height = self.session.geometry['h']
         if self.show_side_panel:
             capture_height = self.session.geometry['h']
             self.side_panel.update_visibility_by_height(capture_height, self.controller.grid_mode_controller.is_active)
             self.side_panel.show()
-            slider_w = config.SLIDER_PANEL_WIDTH if self.show_slider else 0
-            if self.panel_on_left:
-                panel_x = slider_w
+            if self.side_panel_on_left:
+                panel_x = 0
             else:
                 panel_x = left_total_w + self.session.geometry['w'] + 2 * config.BORDER_WIDTH
             panel_y = config.BORDER_WIDTH
             self.fixed_container.move(self.side_panel, panel_x, panel_y)
         else:
             self.side_panel.hide()
-        self.fixed_container.move(self.slider_panel, 0, config.BORDER_WIDTH)
-        slider_new_height = self.session.geometry['h']
-        self.slider_panel.set_size_request(config.SLIDER_PANEL_WIDTH, max(0, slider_new_height))
+        if self.show_button_panel:
+            self.button_panel.update_visibility_by_height(capture_height, self.controller.grid_mode_controller.is_active)
+            panel_x = left_total_w + self.session.geometry['w'] + 2 * config.BORDER_WIDTH
+            panel_y = config.BORDER_WIDTH
+            self.fixed_container.move(self.button_panel, panel_x, panel_y)
+        else:
+            self.button_panel.hide()
 
     def on_motion_notify(self, widget, event):
             if self.controller.is_dragging:
