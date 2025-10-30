@@ -11,6 +11,7 @@ import logging
 import queue
 import collections
 import threading
+import itertools
 from pathlib import Path
 from datetime import datetime
 import time
@@ -78,7 +79,7 @@ class Config:
             'backspace': Gdk.KEY_BackSpace, 'esc': Gdk.KEY_Escape,
             'up': Gdk.KEY_Up, 'down': Gdk.KEY_Down,
             'left': Gdk.KEY_Left, 'right': Gdk.KEY_Right,
-            'minus': Gdk.KEY_minus, 'equal': Gdk.KEY_equal,
+            'minus': Gdk.KEY_minus, 'equal': Gdk.KEY_equal, 'plus': Gdk.KEY_plus,
             'f1': Gdk.KEY_F1, 'f2': Gdk.KEY_F2, 'f3': Gdk.KEY_F3, 'f4': Gdk.KEY_F4,
             'f5': Gdk.KEY_F5, 'f6': Gdk.KEY_F6, 'f7': Gdk.KEY_F7, 'f8': Gdk.KEY_F8,
             'f9': Gdk.KEY_F9, 'f10': Gdk.KEY_F10, 'f11': Gdk.KEY_F11, 'f12': Gdk.KEY_F12,
@@ -146,12 +147,13 @@ class Config:
         self.SHOW_PREVIEW_ON_START = self.parser.getboolean('Interface.Components', 'show_preview_on_start', fallback=True)
         self.SHOW_CAPTURE_COUNT = self.parser.getboolean('Interface.Components', 'show_capture_count', fallback=True)
         self.SHOW_TOTAL_DIMENSIONS = self.parser.getboolean('Interface.Components', 'show_total_dimensions', fallback=True)
+        self.SHOW_CURRENT_MODE = self.parser.getboolean('Interface.Components', 'show_current_mode', fallback=True)
         self.SHOW_INSTRUCTION_NOTIFICATION = self.parser.getboolean('Interface.Components', 'show_instruction_notification', fallback=True)
         # Interface.Layout
         self.BORDER_WIDTH = self.parser.getint('Interface.Layout', 'border_width', fallback=5)
         self.HANDLE_HEIGHT = self.parser.getint('Interface.Layout', 'handle_height', fallback=10)
         self.BUTTON_PANEL_WIDTH = self.parser.getint('Interface.Layout', 'button_panel_width', fallback=100)
-        self.SIDE_PANEL_WIDTH = self.parser.getint('Interface.Layout', 'side_panel_width', fallback=100)
+        self.SIDE_PANEL_WIDTH = self.parser.getint('Interface.Layout', 'side_panel_width', fallback=150)
         self.BUTTON_SPACING = self.parser.getint('Interface.Layout', 'button_spacing', fallback=5)
         self.PROCESSING_DIALOG_WIDTH = self.parser.getint('Interface.Layout', 'processing_dialog_width', fallback=200)
         self.PROCESSING_DIALOG_HEIGHT = self.parser.getint('Interface.Layout', 'processing_dialog_height', fallback=90)
@@ -170,6 +172,7 @@ class Config:
  .info-panel label { font-weight: bold; }
  .info-panel #label_dimensions { font-size: 26px; color: #948bc1; }
  .info-panel #label_count { font-size: 24px; opacity: 0.9; }
+ .info-panel #label_mode { font-size: 23px; opacity: 0.9; }
         """.strip()).lstrip()
         # Interface.Strings
         self.DIALOG_QUIT_TITLE = self.parser.get('Interface.Strings', 'dialog_quit_title', fallback='确认放弃截图？')
@@ -220,6 +223,7 @@ class Config:
         self.str_configure_scroll_unit = self.parser.get('Hotkeys', 'configure_scroll_unit', fallback='c')
         self.str_toggle_grid_mode = self.parser.get('Hotkeys', 'toggle_grid_mode', fallback='<shift>')
         self.str_open_config_editor = self.parser.get('Hotkeys', 'open_config_editor', fallback='g')
+        self.str_toggle_preview = self.parser.get('Hotkeys', 'toggle_preview', fallback='w')
         self.str_preview_zoom_in = self.parser.get('Hotkeys', 'preview_zoom_in', fallback='<ctrl>+equal')
         self.str_preview_zoom_out = self.parser.get('Hotkeys', 'preview_zoom_out', fallback='<ctrl>+minus')
         self.str_toggle_hotkeys_enabled = self.parser.get('Hotkeys', 'toggle_hotkeys_enabled', fallback='f4')
@@ -233,6 +237,7 @@ class Config:
         self.HOTKEY_AUTO_SCROLL_STOP = self._parse_hotkey_string(self.str_auto_scroll_stop)
         self.HOTKEY_CONFIGURE_SCROLL_UNIT = self._parse_hotkey_string(self.str_configure_scroll_unit)
         self.HOTKEY_TOGGLE_GRID_MODE = self._parse_hotkey_string(self.str_toggle_grid_mode)
+        self.HOTKEY_TOGGLE_PREVIEW = self._parse_hotkey_string(self.str_toggle_preview)
         self.HOTKEY_OPEN_CONFIG_EDITOR = self._parse_hotkey_string(self.str_open_config_editor)
         self.HOTKEY_TOGGLE_HOTKEYS_ENABLED = self._parse_hotkey_string(self.str_toggle_hotkeys_enabled)
         self.HOTKEY_PREVIEW_ZOOM_IN = self._parse_hotkey_string(self.str_preview_zoom_in)
@@ -260,13 +265,14 @@ enable_side_panel = true
 show_preview_on_start = true
 show_capture_count = true
 show_total_dimensions = true
+show_current_mode = true
 show_instruction_notification = true
 
 [Interface.Layout]
 border_width = 5
 handle_height = 10
 button_panel_width = 100
-side_panel_width = 100
+side_panel_width = 150
 button_spacing = 5
 processing_dialog_width = 200
 processing_dialog_height = 90
@@ -283,6 +289,7 @@ info_panel_css =
     .info-panel label { font-weight: bold; }
     .info-panel #label_dimensions { font-size: 26px; color: #948bc1; }
     .info-panel #label_count { font-size: 24px; opacity: 0.9; }
+    .info-panel #label_mode { font-size: 23px; opacity: 0.9; }
 
 [Interface.Strings]
 dialog_quit_title = 确认放弃截图？
@@ -332,6 +339,7 @@ auto_scroll_stop = e
 configure_scroll_unit = c
 toggle_grid_mode = <shift>
 open_config_editor = g
+toggle_preview = w
 toggle_hotkeys_enabled = f4
 preview_zoom_in = <ctrl>+equal
 preview_zoom_out = <ctrl>+minus
@@ -875,6 +883,149 @@ def activate_window_with_xlib(xid):
             disp.close()
     return False
 
+def get_window_visibility(target_xid):
+    """检查指定 XID 窗口的可见性，返回一个可见比例 (0.0 = 完全不可见, 1.0 = 基本完全可见)"""
+    if not target_xid:
+        return 0.0
+    disp = None
+    try:
+        disp = display.Display()
+        root = disp.screen().root
+        target_window = disp.create_resource_object('window', target_xid)
+        if not target_window:
+            logging.warning(f"get_window_visibility: 无法为 XID {target_xid} 创建资源对象。")
+            return 0.0
+        # 1. 检查窗口是否映射状态和未最小化
+        try:
+            attrs = target_window.get_attributes()
+            if attrs.map_state != X.IsViewable:
+                logging.info(f"get_window_visibility: 窗口 {target_xid} 未映射 (map_state != IsViewable)。")
+                return 0.0
+            state_atom = disp.intern_atom('_NET_WM_STATE')
+            hidden_atom = disp.intern_atom('_NET_WM_STATE_HIDDEN')
+            state_prop = target_window.get_full_property(state_atom, X.AnyPropertyType)
+            if state_prop and state_prop.value and hidden_atom in state_prop.value:
+                logging.info(f"get_window_visibility: 窗口 {target_xid} 处于 'hidden' (最小化) 状态。")
+                return 0.0
+        except Exception as e:
+            logging.warning(f"get_window_visibility: 检查窗口状态时出错: {e}")
+            return 0.0
+        # 2. 检查窗口是否在当前桌面上
+        try:
+            current_desktop_atom = disp.intern_atom('_NET_CURRENT_DESKTOP')
+            prop = root.get_full_property(current_desktop_atom, X.AnyPropertyType)
+            current_desktop = prop.value[0] if (prop and prop.value) else 0
+            window_desktop_atom = disp.intern_atom('_NET_WM_DESKTOP')
+            prop = target_window.get_full_property(window_desktop_atom, X.AnyPropertyType)
+            window_desktop = prop.value[0] if (prop and prop.value) else 0
+            if window_desktop != 0xFFFFFFFF and window_desktop != -1 and window_desktop != current_desktop:
+                logging.info(f"get_window_visibility: 窗口 {target_xid} 不在当前桌面 ({current_desktop}) 上。")
+                return 0.0
+        except Exception as e:
+            logging.warning(f"get_window_visibility: 检查桌面时出错: {e}")
+        # 3. 获取目标窗口的完整几何信息 (包括边框)
+        target_wm_class = None
+        try:
+            target_wm_class = target_window.get_wm_class()
+        except Exception:
+            pass
+        try:
+            geom = target_window.get_geometry()
+            translated = target_window.translate_coords(root, 0, 0)
+            client_x = -translated.x
+            client_y = -translated.y
+            extents_atom = disp.intern_atom('_NET_FRAME_EXTENTS')
+            prop = target_window.get_full_property(extents_atom, X.AnyPropertyType)
+            extents = tuple(prop.value[:4]) if (prop and prop.value and len(prop.value) >= 4) else (0, 0, 0, 0)
+            x1 = client_x - extents[0]
+            y1 = client_y - extents[2]
+            width = geom.width + extents[0] + extents[1]
+            height = geom.height + extents[2] + extents[3]
+            target_rect = (x1, y1, x1 + width, y1 + height)
+            target_area = width * height
+            if target_area <= 0:
+                logging.info(f"get_window_visibility: 窗口 {target_xid} 面积为 0。")
+                return 0.0
+        except Exception as e:
+            logging.error(f"get_window_visibility: 获取窗口几何信息失败: {e}")
+            return 0.0
+        # 4. 获取堆叠顺序中在目标窗口之上的所有窗口
+        try:
+            stacking_atom = disp.intern_atom('_NET_CLIENT_LIST_STACKING')
+            prop = root.get_full_property(stacking_atom, X.AnyPropertyType)
+            if prop and prop.value:
+                stacked_window_ids = prop.value
+            else:
+                stacked_window_ids = [win.id for win in root.query_tree().children]
+            target_index = stacked_window_ids.index(target_xid)
+            windows_above_ids = stacked_window_ids[target_index + 1:]
+        except ValueError:
+            logging.warning(f"get_window_visibility: 窗口 {target_xid} 不在 _NET_CLIENT_LIST_STACKING 中。")
+            return 1.0
+        except Exception as e:
+            logging.error(f"get_window_visibility: 获取窗口堆叠顺序失败: {e}")
+            return 0.0
+        # 5. 计算遮挡
+        covering_rects = []
+        for wid in windows_above_ids:
+            try:
+                window = disp.create_resource_object('window', wid)
+                if not window: continue
+                if target_wm_class:
+                    try:
+                        wm_class = window.get_wm_class()
+                        if wm_class == target_wm_class:
+                            continue
+                    except Exception:
+                        pass
+                attrs = window.get_attributes()
+                if attrs.map_state != X.IsViewable: continue
+                state_prop = window.get_full_property(state_atom, X.AnyPropertyType)
+                if state_prop and state_prop.value and hidden_atom in state_prop.value: continue
+                prop = window.get_full_property(window_desktop_atom, X.AnyPropertyType)
+                win_desktop = prop.value[0] if (prop and prop.value) else 0
+                if win_desktop != 0xFFFFFFFF and win_desktop != -1 and win_desktop != current_desktop: continue
+                geom = window.get_geometry()
+                translated = window.translate_coords(root, 0, 0)
+                client_x = -translated.x
+                client_y = -translated.y
+                prop = window.get_full_property(extents_atom, X.AnyPropertyType)
+                extents = tuple(prop.value[:4]) if (prop and prop.value and len(prop.value) >= 4) else (0, 0, 0, 0)
+                cx1 = client_x - extents[0]
+                cy1 = client_y - extents[2]
+                cwidth = geom.width + extents[0] + extents[1]
+                cheight = geom.height + extents[2] + extents[3]
+                if cwidth > 0 and cheight > 0:
+                    covering_rects.append((cx1, cy1, cx1 + cwidth, cy1 + cheight))
+            except Exception:
+                continue
+        # 6. 使用容斥原理计算被覆盖面积
+        if not covering_rects:
+            logging.info(f"get_window_visibility: 窗口 {target_xid} 可见且未被遮挡。")
+            return 1.0
+        covered_area = 0
+        n = len(covering_rects)
+        for k in range(1, n + 1):
+            sign = (-1) ** (k - 1)
+            for combo in itertools.combinations(covering_rects, k):
+                all_rects = list(combo) + [target_rect]
+                # 计算交集
+                ix1 = max(r[0] for r in all_rects)
+                iy1 = max(r[1] for r in all_rects)
+                ix2 = min(r[2] for r in all_rects)
+                iy2 = min(r[3] for r in all_rects)
+                intersection_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                covered_area += sign * intersection_area
+        visibility_ratio = max(0.0, 1.0 - covered_area / target_area)
+        logging.info(f"get_window_visibility: 窗口 {target_xid} 可见度: {visibility_ratio*100:.1f}%")
+        return visibility_ratio
+    except Exception as e:
+        logging.error(f"get_window_visibility 发生严重错误: {e}")
+        return 0.0
+    finally:
+        if disp:
+            disp.close()
+
 def create_feedback_dialog(parent_window, text, show_progress_bar=False, position=None):
     win = Gtk.Window(type=Gtk.WindowType.POPUP)
     win.set_transient_for(parent_window)
@@ -1056,6 +1207,12 @@ class GridModeController:
                     attrs = win_obj.get_attributes()
                     if attrs.map_state != X.IsViewable:
                         continue
+                    state_atom = d.intern_atom('_NET_WM_STATE')
+                    hidden_atom = d.intern_atom('_NET_WM_STATE_HIDDEN')
+                    state_prop = win_obj.get_full_property(state_atom, X.AnyPropertyType)
+                    if state_prop and state_prop.value:
+                        if hidden_atom in state_prop.value:
+                            continue
                     geom = win_obj.get_geometry()
                     translated = win_obj.translate_coords(root, 0, 0)
                     abs_x, abs_y = -translated.x, -translated.y
@@ -1098,6 +1255,7 @@ class GridModeController:
             self.session.detected_app_class = None
             self.session.is_matching_enabled = False
             self.view.button_panel.set_grid_action_buttons_visible(False)
+            self.view.controller.set_current_mode("自由模式")
             self.view.queue_draw()
             logging.info("整格模式已关闭")
             send_desktop_notification("整格模式已关闭", "边框拖动已恢复自由模式")
@@ -1115,6 +1273,7 @@ class GridModeController:
             self.session.is_matching_enabled = matching_enabled
             self.view.button_panel.set_grid_action_buttons_visible(True)
             match_status = "启用" if matching_enabled else "禁用"
+            self.view.controller.set_current_mode("整格模式")
             logging.info(f"为应用 '{app_class}' 启用整格模式，单位: {self.grid_unit}px, 模板匹配: {match_status}")
             send_desktop_notification("整格模式已启用", f"应用: {app_class}\n滚动单位: {self.grid_unit}px\n误差修正: {match_status}")
             self._snap_current_height()
@@ -1380,6 +1539,7 @@ class ActionController:
         self.session = session
         self.view = view
         self.config = config
+        self.current_mode_str = "自由模式"
         self.final_notification = None
         self.is_dragging = False
         self.is_processing_movement = False
@@ -1415,15 +1575,24 @@ class ActionController:
         self.stitch_model.connect('model-updated', self._on_model_updated)
 
     def _on_model_updated(self, model_instance):
+        self.update_info_panel()
         can_undo = self.stitch_model.capture_count > 0 and not self.is_auto_scrolling
         if self.view.show_side_panel:
+            self.view.button_panel.set_undo_sensitive(can_undo)
+        self._check_horizontal_lock_state()
+
+    def set_current_mode(self, mode_str: str):
+        self.current_mode_str = mode_str
+        self.update_info_panel()
+
+    def update_info_panel(self):
+        if self.view.show_side_panel and self.view.side_panel:
             self.view.side_panel.info_panel.update_info(
                 count=self.stitch_model.capture_count,
                 width=self.stitch_model.image_width,
-                height=self.stitch_model.total_virtual_height
+                height=self.stitch_model.total_virtual_height,
+                mode_str=self.current_mode_str
             )
-            self.view.button_panel.set_undo_sensitive(can_undo)
-        self._check_horizontal_lock_state()
 
     def _check_horizontal_lock_state(self):
         should_be_locked = self.stitch_model.capture_count > 0
@@ -1771,6 +1940,7 @@ class ActionController:
         self.is_auto_scrolling = True
         self.last_auto_scroll_cursor_pos = None
         self.auto_scroll_original_cursor_pos = None
+        self.set_current_mode("自动模式")
         if not self.config.CAPTURE_WITH_CURSOR and self.config.SCROLL_METHOD == 'move_user_cursor':
             self.auto_scroll_original_cursor_pos = self.scroll_manager._get_pointer_position()
             logging.info(f"自动模式隐藏光标：记录原始光标位置 {self.auto_scroll_original_cursor_pos}")
@@ -1813,6 +1983,10 @@ class ActionController:
             send_desktop_notification("自动滚动已停止", reason_message, level="normal")
         else:
             send_desktop_notification("自动模式已停止", "用户手动停止", level="normal")
+        if self.grid_mode_controller.is_active:
+            self.set_current_mode("整格模式")
+        else:
+            self.set_current_mode("自由模式")
         btn_panel = self.view.button_panel
         btn_panel.btn_capture.set_sensitive(True)
         btn_panel.set_undo_sensitive(self.stitch_model.capture_count > 0)
@@ -2244,12 +2418,15 @@ class InfoPanel(Gtk.Box):
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.START)
         self.get_style_context().add_class("info-panel")
         self.label_count = Gtk.Label()
         self.label_dimensions = Gtk.Label()
+        self.label_mode = Gtk.Label()
         self.label_count.set_name("label_count")
         self.label_dimensions.set_name("label_dimensions")
-        for label in [self.label_count, self.label_dimensions]:
+        self.label_mode.set_name("label_mode")
+        for label in [self.label_count, self.label_dimensions, self.label_mode]:
             label.set_can_focus(False)
             label.get_style_context().add_class("info-label")
             label.set_no_show_all(True)
@@ -2258,7 +2435,7 @@ class InfoPanel(Gtk.Box):
             label.set_justify(Gtk.Justification.CENTER)
             label.set_xalign(0.5)
             self.pack_start(label, False, False, 0)
-        self.update_info(0, 0, 0)
+        self.update_info(0, 0, 0, "自由模式")
         self._apply_css()
 
     def _apply_css(self):
@@ -2271,44 +2448,98 @@ class InfoPanel(Gtk.Box):
             self.get_screen(), css_provider, Gtk.STYLE_PROVIDER_PRIORITY_USER
         )
 
-    def update_info(self, count: int, width: int, height: int):
+    def update_info(self, count: int, width: int, height: int, mode_str: str):
         if config.SHOW_CAPTURE_COUNT:
             self.label_count.set_text(config.STR_CAPTURE_COUNT_FORMAT.format(count=count))
             self.label_count.show()
         else:
             self.label_count.hide()
         if config.SHOW_TOTAL_DIMENSIONS:
+            pango_attrs = "line_height='0.8'"
             if count > 0:
-                dim_text = f"{width}\nx\n{height}"
+                dim_markup = f"<span {pango_attrs}>{width}\nx\n{height}</span>"
             else:
-                dim_text = "宽\nx\n高"
-            self.label_dimensions.set_text(dim_text)
+                dim_markup = f"<span {pango_attrs}>宽\nx\n高</span>"
+            self.label_dimensions.set_markup(dim_markup)
             self.label_dimensions.show()
         else:
             self.label_dimensions.hide()
+        self.label_mode.set_text(mode_str)
+        if config.SHOW_CURRENT_MODE:
+        	self.label_mode.show()
+        else:
+        	self.label_mode.hide()
+
+class FunctionPanel(Gtk.Box):
+   __gsignals__ = {
+       'toggle-grid-mode-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+       'toggle-preview-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+       'open-config-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+       'toggle-hotkeys-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+   }
+   def __init__(self):
+       super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=config.BUTTON_SPACING)
+       self.set_valign(Gtk.Align.START)
+       self.btn_toggle_grid = Gtk.Button(label=f"整格模式")
+       self.btn_toggle_grid.connect("clicked", lambda w: self.emit('toggle-grid-mode-clicked'))
+       self.btn_toggle_preview = Gtk.Button(label=f"预览窗口")
+       self.btn_toggle_preview.connect("clicked", lambda w: self.emit('toggle-preview-clicked'))
+       self.btn_open_config = Gtk.Button(label=f"配置窗口")
+       self.btn_open_config.connect("clicked", lambda w: self.emit('open-config-clicked'))
+       self.btn_toggle_hotkeys = Gtk.Button(label=f"热键开关")
+       self.btn_toggle_hotkeys.connect("clicked", lambda w: self.emit('toggle-hotkeys-clicked'))
+       buttons = [self.btn_toggle_grid, self.btn_toggle_preview, self.btn_open_config, self.btn_toggle_hotkeys]
+       for btn in buttons:
+           btn.set_can_focus(False)
+           self.pack_start(btn, False, False, 0)
+           btn.show()
+       self.show()
 
 class SidePanel(Gtk.Box):
+    __gsignals__ = {
+        'toggle-grid-mode-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'toggle-preview-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'open-config-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'toggle-hotkeys-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+    }
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=config.BUTTON_SPACING)
         self.info_panel = InfoPanel()
         self.info_panel.set_size_request(config.SIDE_PANEL_WIDTH, -1)
         self.pack_start(self.info_panel, False, False, 0)
+        self.function_panel = FunctionPanel()
+        self.function_panel.set_size_request(config.SIDE_PANEL_WIDTH, -1)
+        self.pack_start(self.function_panel, False, False, 0)
+        self.function_panel.connect("toggle-grid-mode-clicked", lambda w: self.emit('toggle-grid-mode-clicked'))
+        self.function_panel.connect("toggle-preview-clicked", lambda w: self.emit('toggle-preview-clicked'))
+        self.function_panel.connect("open-config-clicked", lambda w: self.emit('open-config-clicked'))
+        self.function_panel.connect("toggle-hotkeys-clicked", lambda w: self.emit('toggle-hotkeys-clicked'))
         self.info_panel.show()
+        self.function_panel.show()
         _, self._info_natural_h = self.info_panel.get_preferred_height()
         logging.info(f"缓存的 InfoPanel 自然高度: {self._info_natural_h}")
+        _, self._func_natural_h = self.function_panel.get_preferred_height()
+        logging.info(f"缓存的 FunctionPanel 自然高度: {self._func_natural_h}")
 
     def update_visibility_by_height(self, available_height: int, is_grid_mode: bool):
-        should_show_info_base = config.ENABLE_SIDE_PANEL and (config.SHOW_CAPTURE_COUNT or config.SHOW_TOTAL_DIMENSIONS)
+        should_show_info_base = config.ENABLE_SIDE_PANEL and (config.SHOW_CAPTURE_COUNT or config.SHOW_TOTAL_DIMENSIONS or config.SHOW_CURRENT_MODE)
+        should_show_func_base = config.ENABLE_SIDE_PANEL
         if not should_show_info_base:
             self.info_panel.hide()
-            return
         required_h_for_info = self._info_natural_h if should_show_info_base else 0
+        required_h_for_func = self._func_natural_h if should_show_func_base else 0
         threshold_for_info_only = required_h_for_info
+        threshold_for_both = required_h_for_info + required_h_for_func
         can_show_info_panel = available_height >= threshold_for_info_only
+        can_show_func_panel = available_height >= threshold_for_both
         if should_show_info_base and can_show_info_panel:
             self.info_panel.show()
         else:
             self.info_panel.hide()
+        if should_show_func_base and can_show_func_panel:
+            self.function_panel.show()
+        else:
+            self.function_panel.hide()
 
 class QueueHandler(logging.Handler):
     def __init__(self, log_queue):
@@ -2346,7 +2577,7 @@ class ConfigWindow(Gtk.Window):
             ('Interface.Components', 'enable_grid_action_buttons'), ('Interface.Components', 'enable_auto_scroll_buttons'),
             ('Interface.Components', 'enable_side_panel'),
             ('Interface.Components', 'show_preview_on_start'),
-            ('Interface.Components', 'show_capture_count'), ('Interface.Components', 'show_total_dimensions'),
+            ('Interface.Components', 'show_capture_count'), ('Interface.Components', 'show_total_dimensions'), ('Interface.Components', 'show_current_mode'),
             ('Interface.Components', 'show_instruction_notification'),
             ('Behavior', 'enable_free_scroll_matching'), ('Behavior', 'capture_with_cursor'), ('Behavior', 'scroll_method'), ('Behavior', 'reuse_invisible_cursor'),
             ('Behavior', 'forward_action'), ('Behavior', 'backward_action'),
@@ -2561,13 +2792,11 @@ class ConfigWindow(Gtk.Window):
              if 'alt' in key_name_lower and '<shift>' not in mods and '<ctrl>' not in mods and '<super>' not in mods:
                  return '<alt>'
         rev_map = {v: k for k, v in self.config._key_map_gtk_special.items()}
-        print(keyval)
         main_key_str = ""
         if keyval in rev_map:
             main_key_str = rev_map[keyval]
         else:
             codepoint = Gdk.keyval_to_unicode(keyval)
-            print(codepoint)
             if codepoint != 0:
                 char = chr(codepoint)
                 if char.isprintable():
@@ -2947,6 +3176,7 @@ class ConfigWindow(Gtk.Window):
             ("grid_backward", "整格后退"), ("grid_forward", "整格前进"),
             ("auto_scroll_start", "开始自动滚动"), ("auto_scroll_stop", "停止自动滚动"),
             ("configure_scroll_unit", "配置滚动单位"), ("toggle_grid_mode", "切换整格模式"),
+            ("toggle_preview", "激活/隐藏预览窗口"),
             ("open_config_editor", "激活/隐藏配置窗口"), ("toggle_hotkeys_enabled", "启用/禁用全局热键"), 
             ("preview_zoom_in", "预览窗口放大"), ("preview_zoom_out", "预览窗口缩小"),
             ("dialog_confirm", "退出对话框确认"), ("dialog_cancel", "退出对话框取消")
@@ -2991,6 +3221,7 @@ class ConfigWindow(Gtk.Window):
             ('Interface.Components', 'show_preview_on_start'),
             ('Interface.Components', 'show_capture_count'),
             ('Interface.Components', 'show_total_dimensions'),
+            ('Interface.Components', 'show_current_mode'),
             ('Interface.Components', 'show_instruction_notification'),
             ('Behavior', 'capture_with_cursor'),
             ('Behavior', 'scroll_method'),
@@ -3020,6 +3251,7 @@ class ConfigWindow(Gtk.Window):
             ("show_preview_on_start", "启动时显示预览窗口", "控制是否在截图会话开始时自动打开预览窗口"),
             ("show_capture_count", "显示已截图数量", "是否在侧边栏信息面板中显示当前已截取的图片数量"),
             ("show_total_dimensions", "显示最终图片总尺寸", "是否在侧边栏信息面板中显示拼接后图片的总宽度和总高度"),
+            ("show_current_mode", "显示当前模式", "是否在侧边栏信息面板中显示当前所处的模式（自由/整格/自动）"),
             ("show_instruction_notification", "启动时显示操作说明", "每次启动截图会话时，是否弹出一个包含基本操作指南的通知")
         ]
         self.component_checkboxes = {}
@@ -3404,30 +3636,22 @@ class ConfigWindow(Gtk.Window):
         grid3.set_row_spacing(10)
         grid3.set_column_spacing(10)
         frame3.add(grid3)
-        # 滑块灵敏度
-        label = Gtk.Label(label="滑块灵敏度:", xalign=0)
-        label.set_tooltip_markup("数值越大，拖动左侧滑块时滚动的距离越远")
-        self.sensitivity_spin = Gtk.SpinButton()
-        self.sensitivity_spin.set_tooltip_markup(label.get_tooltip_markup())
-        self._connect_focus_handlers(self.sensitivity_spin)
-        self.sensitivity_spin.set_range(0.1, 20.0)
-        self.sensitivity_spin.set_increments(0.1, 1.0)
-        self.sensitivity_spin.set_digits(1)
-        self.sensitivity_spin.set_halign(Gtk.Align.START)
-        grid3.attach(label, 0, 0, 1, 1)
-        grid3.attach(self.sensitivity_spin, 1, 0, 1, 1)
         performance_configs = [
             ("grid_matching_max_overlap", "整格模式误差修正范围", 10, 20, "<b>整格模式</b>下的误差修正设置最大搜索范围"),
             ("free_scroll_matching_max_overlap", "自由模式误差修正范围", 20, 300, "<b>自由模式</b>下的误差修正设置最大搜索范围\n值越大，处理用时越长"),
-            ("mouse_move_tolerance", "鼠标容差", 0, 50, "在使用“移动用户光标”方式滚动后，若用户鼠标的移动距离超过此像素值，程序将不会把光标移回原位"),
             ("auto_scroll_ticks_per_step", "自动滚动步长（格数）", 1, 8, "自动模式下，每一步滚动几格\n值越大滚动越快"),
             ("max_scroll_per_tick", "自动截图高度（每格）", 120, 240, "自动模式下，对应滚动一格的截图高度 (px)\n总截图高度 = 此值 * 滚动格数"),
             ("min_scroll_per_tick", "最小滚动像素", 1, 60, "用于匹配和校准的最小滚动阈值 (px)"),
+            ("mouse_move_tolerance", "鼠标容差", 0, 50, "在使用“移动用户光标”方式滚动后，若用户鼠标的移动距离超过此像素值，程序将不会把光标移回原位"),
             ("max_viewer_dimension", "图片尺寸阈值", -1, 131071, "最终图片长或宽超过此值时，会使用上面的“大尺寸图片打开命令”\n设为 <b>-1</b> 禁用此功能，总是用系统默认方式打开图片\n设为 <b>0</b> 总是用自定义命令打开图片"),
             ("preview_drag_sensitivity", "预览拖动灵敏度", 0.5, 10.0, "预览窗口中按住左键拖动图像的速度倍数")
         ]
         self.performance_spins = {}
+        num_items = len(performance_configs)
+        mid_point = (num_items + 1) // 2
         for i, (key, desc, min_val, max_val, tooltip) in enumerate(performance_configs):
+            row = i % mid_point
+            col_base = (i // mid_point) * 2
             label = Gtk.Label(label=f"{desc}:", xalign=0)
             label.set_tooltip_markup(tooltip)
             spin = Gtk.SpinButton()
@@ -3440,8 +3664,8 @@ class ConfigWindow(Gtk.Window):
                 spin.set_digits(1)
                 spin.set_increments(0.1, 1.0)
             spin.set_halign(Gtk.Align.START)
-            grid3.attach(label, 0, i + 1, 1, 1)
-            grid3.attach(spin, 1, i + 1, 1, 1)
+            grid3.attach(label, col_base, row, 1, 1)
+            grid3.attach(spin, col_base + 1, row, 1, 1)
             self.performance_spins[key] = spin
         # 路径
         frame4 = Gtk.Frame(label="路径")
@@ -3807,6 +4031,7 @@ class PreviewWindow(Gtk.Window):
         self.set_transient_for(parent_overlay)
         self.set_destroy_with_parent(True)
         self.set_default_size(500, 800)
+        self.xid = None
         self.set_position(Gtk.WindowPosition.NONE)
         self.zoom_level = 1.0
         self.manual_zoom_active = False
@@ -3876,6 +4101,7 @@ class PreviewWindow(Gtk.Window):
         self.drawing_area.connect("button-press-event", self._on_drawing_area_button_press)
         self.drawing_area.connect("motion-notify-event", self._on_drawing_area_motion_notify)
         self.drawing_area.connect("button-release-event", self._on_drawing_area_button_release)
+        self.connect("realize", self._on_realize)
         self.scrolled_window.connect("size-allocate", self.on_viewport_resized)
         self.connect("key-press-event", self._on_key_press)
         self._setup_cursors()
@@ -3883,6 +4109,12 @@ class PreviewWindow(Gtk.Window):
         self._update_button_sensitivity()
         main_vbox.show_all()
         logging.info("预览窗口已初始化")
+
+    def _on_realize(self, widget):
+        try:
+            self.xid = self.get_window().get_xid()
+        except Exception as e:
+            logging.error(f"PreviewWindow: 获取 XID 失败: {e}")
 
     def _on_preview_window_destroy(self, widget):
         """预览窗口自身销毁时的处理"""
@@ -4261,13 +4493,8 @@ class CaptureOverlay(Gtk.Window):
 
     def on_model_updated_ui(self, model_instance):
         """模型更新时刷新界面元素 (连接到 StitchModel 的信号)"""
+        self.controller.update_info_panel()
         can_undo = model_instance.capture_count > 0 and not self.controller.is_auto_scrolling
-        if self.show_side_panel:
-            self.side_panel.info_panel.update_info(
-                count=model_instance.capture_count,
-                width=model_instance.image_width,
-                height=model_instance.total_virtual_height
-            )
         if self.show_button_panel:
             self.button_panel.set_undo_sensitive(can_undo)
         self.queue_draw()
@@ -4398,7 +4625,9 @@ class CaptureOverlay(Gtk.Window):
         instruction_lines.append("，".join(hotkeys))
         instruction_lines.append(f"切换整格/自由模式：{config.str_toggle_grid_mode.upper()}，（自由模式下）配置滚动单位：{config.str_configure_scroll_unit.upper()}")
         instruction_lines.append(f"前进：{config.str_grid_forward.upper()}，后退：{config.str_grid_backward.upper()}")
-        instruction_lines.append(f"打开/激活配置窗口：{config.str_open_config_editor.upper()}，开启/禁用全局热键：{config.str_toggle_hotkeys_enabled.upper()}")
+        instruction_lines.append(f"开始: {config.str_auto_scroll_start.upper()}，停止: {config.str_auto_scroll_stop.upper()}")
+        instruction_lines.append(f"激活/隐藏预览窗口: {config.str_toggle_preview.upper()}，激活/隐藏配置窗口：{config.str_open_config_editor.upper()}")
+        instruction_lines.append(f"开启/禁用全局热键：{config.str_toggle_hotkeys_enabled.upper()}")
         instructions = "\n".join(instruction_lines)
         dialog.format_secondary_text(instructions)
         response = dialog.run()
@@ -4411,6 +4640,10 @@ class CaptureOverlay(Gtk.Window):
     def create_panels(self):
         self.side_panel = SidePanel()
         self.fixed_container.put(self.side_panel, 0, 0)
+        self.side_panel.connect("toggle-grid-mode-clicked", lambda w: self.controller.grid_mode_controller.toggle())
+        self.side_panel.connect("toggle-preview-clicked", lambda w: self.toggle_preview_window())
+        self.side_panel.connect("open-config-clicked", lambda w: toggle_config_window())
+        self.side_panel.connect("toggle-hotkeys-clicked", lambda w: toggle_hotkeys_globally())
         self.button_panel = ButtonPanel()
         self.button_panel.connect("grid-backward-clicked", lambda w: self.controller.handle_movement_action('up'))
         self.button_panel.connect("grid-forward-clicked", lambda w: self.controller.handle_movement_action('down'))
@@ -4421,6 +4654,31 @@ class CaptureOverlay(Gtk.Window):
         self.button_panel.connect("finalize-clicked", self.controller.finalize_and_quit)
         self.button_panel.connect("cancel-clicked", self.controller.quit_and_cleanup)
         self.fixed_container.put(self.button_panel, 0, 0)
+
+    def toggle_preview_window(self):
+        """创建或切换预览窗口的可见性"""
+        if self.preview_window is None:
+            logging.info("预览窗口不存在，正在创建并显示...")
+            self.preview_window = PreviewWindow(self.controller.stitch_model, config, self)
+            self.preview_window.connect("destroy", self._on_preview_destroyed)
+            GLib.idle_add(self._position_and_show_preview)
+        else:
+            win_xid = self.preview_window.xid
+            if not win_xid:
+                logging.warning("toggle_preview_window: 预览窗口实例存在但 XID 为空，可能尚未 'realize'。回退到 show()")
+                self.preview_window.show()
+                return
+
+            visibility_ratio = get_window_visibility(win_xid)
+            is_visually_on_screen = visibility_ratio > 0.50
+
+            if is_visually_on_screen:
+                logging.info(f"预览窗口可视 (可见度: {visibility_ratio*100:.1f}%)，正在隐藏...")
+                self.preview_window.hide()
+            else:
+                logging.info(f"预览窗口不可视 (可见度: {visibility_ratio*100:.1f}%)，正在显示并激活...")
+                self.preview_window.show()
+                GLib.idle_add(activate_window_with_xlib, win_xid)
 
     def on_dialog_key_press(self, widget, event):
         """处理确认对话框的按键事件"""
@@ -4590,9 +4848,7 @@ class CaptureOverlay(Gtk.Window):
         screen_w = self.screen_rect.width
         side_panel_needed_w = config.SIDE_PANEL_WIDTH
         button_panel_needed_w = config.BUTTON_PANEL_WIDTH
-        should_show_info = config.SHOW_CAPTURE_COUNT or config.SHOW_TOTAL_DIMENSIONS
-        should_show_side_panel_base = config.ENABLE_SIDE_PANEL and should_show_info
-        should_show_side_panel_base = should_show_info
+        should_show_side_panel_base = config.ENABLE_SIDE_PANEL
         should_show_button_panel_base = config.ENABLE_BUTTONS
         has_space_right_for_button_panel = (self.session.geometry['x'] + self.session.geometry['w'] + config.BORDER_WIDTH + button_panel_needed_w) <= screen_w
         has_space_right_for_side_panel = (self.session.geometry['x'] + self.session.geometry['w'] + config.BORDER_WIDTH + side_panel_needed_w) <= screen_w
@@ -4820,22 +5076,23 @@ def toggle_config_window():
             logging.info("配置窗口已创建并显示")
         else:
             win_xid = config_window_instance.xid
-            if not config_window_instance.is_visible():
-                logging.info("配置窗口已隐藏，正在显示并激活...")
+            if not win_xid:
+                logging.warning("toggle_config_window: 窗口实例存在但 XID 为空，可能尚未 'realize'")
+                return
+            # 检查窗口是否在视觉上可见（未最小化、在当前桌面、未被完全遮挡）
+            visibility_ratio = get_window_visibility(win_xid)
+            is_visually_on_screen = visibility_ratio > 0.50
+            if is_visually_on_screen:
+                logging.info(f"配置窗口可视 (可见度: {visibility_ratio*100:.1f}%)，正在隐藏...")
+                config_window_instance.hide()
+                global hotkey_listener
+                if hotkey_listener and are_hotkeys_enabled:
+                    hotkey_listener.set_normal_keys_grabbed(True)
+                    logging.info("配置窗口隐藏，全局热键已恢复")
+            else:
+                logging.info(f"配置窗口不可视 (可见度: {visibility_ratio*100:.1f}%)，正在显示并激活...")
                 config_window_instance.show()
                 GLib.idle_add(activate_window_with_xlib, win_xid)
-            else:
-                active_xid = get_active_window_xid()
-                if win_xid == active_xid:
-                    logging.info("配置窗口已激活，正在隐藏...")
-                    config_window_instance.hide()
-                    global hotkey_listener
-                    if hotkey_listener and are_hotkeys_enabled:
-                        hotkey_listener.set_normal_keys_grabbed(True)
-                        logging.info("配置窗口隐藏，全局热键已恢复")
-                else:
-                    logging.info("配置窗口可见但未激活，正在激活...")
-                    GLib.idle_add(activate_window_with_xlib, win_xid)
     GLib.idle_add(task)
 
 def toggle_hotkeys_globally():
@@ -4921,6 +5178,7 @@ def setup_hotkey_listener(overlay):
         ('auto_scroll_stop', overlay.controller.stop_auto_scroll),
         ('toggle_grid_mode', overlay.controller.grid_mode_controller.toggle),
         ('configure_scroll_unit', overlay.controller.grid_mode_controller.start_calibration),
+        ('toggle_preview', overlay.toggle_preview_window),
         ('open_config_editor', toggle_config_window),
         ('toggle_hotkeys_enabled', toggle_hotkeys_globally),
     ]
@@ -4959,7 +5217,7 @@ def setup_hotkey_listener(overlay):
 def cleanup_stale_temp_dirs(config):
     """在启动时清理由已退出的旧进程留下的临时目录"""
     try:
-        raw_template = config.parser.get('Paths', 'temp_directory_base', fallback='/tmp/scroll_stitch_{pid}')
+        raw_template = config.parser.get('System', 'temp_directory_base', fallback='/tmp/scroll_stitch_{pid}')
         template_path = Path(raw_template)
         parent_dir = template_path.parent
         name_template = template_path.name
