@@ -30,6 +30,11 @@ from gi.repository import Gtk, Gdk, GLib, GObject, Notify, Pango, PangoCairo, Gd
 import cairo
 from Xlib import display, X, protocol, XK
 from Xlib.ext import xtest
+try:
+    from evdev import UInput, ecodes as e, AbsInfo
+    EVDEV_AVAILABLE = True
+except ImportError:
+    EVDEV_AVAILABLE = False
 # 全局实例
 hotkey_listener = None
 config_window_instance = None
@@ -383,67 +388,6 @@ dialog_cancel = esc
             logging.error(f"写入配置文件失败: {e}")
             return False
 
-class EvdevTouchpadSimulator:
-    def __init__(self, uinput_device, touchpad_width=1023, touchpad_height=767):
-        self.ui = uinput_device
-        self.TOUCHPAD_WIDTH = touchpad_width
-        self.TOUCHPAD_HEIGHT = touchpad_height
-
-    def scroll(self, distance, steps=25):
-        from evdev import ecodes as e
-        e = e
-        max_swipe_dist = self.TOUCHPAD_HEIGHT // 3 
-        remaining_distance = distance
-        sign = 1 if distance > 0 else -1
-        while abs(remaining_distance) > 0.1:
-            current_swipe_dist = min(max_swipe_dist, abs(remaining_distance)) * sign
-            remaining_distance -= current_swipe_dist
-            start_x1, start_y1 = self.TOUCHPAD_WIDTH // 2 - 50, self.TOUCHPAD_HEIGHT // 2
-            start_x2, start_y2 = self.TOUCHPAD_WIDTH // 2 + 50, self.TOUCHPAD_HEIGHT // 2
-            base_tracking_id = int(time.time()) & 0xFFFF
-            pressure, touch_major = 128, 15
-            # 触摸开始
-            # 触摸点 1
-            self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 0)
-            self.ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, base_tracking_id)
-            self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_X, start_x1)
-            self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_Y, start_y1)
-            self.ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, pressure)
-            self.ui.write(e.EV_ABS, e.ABS_MT_TOUCH_MAJOR, touch_major)
-            # 触摸点 2
-            self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 1)
-            self.ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, base_tracking_id + 1)
-            self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_X, start_x2)
-            self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_Y, start_y2)
-            self.ui.write(e.EV_ABS, e.ABS_MT_PRESSURE, pressure)
-            self.ui.write(e.EV_ABS, e.ABS_MT_TOUCH_MAJOR, touch_major)
-            self.ui.write(e.EV_KEY, e.BTN_TOUCH, 1)
-            self.ui.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 1)
-            self.ui.syn()
-            time.sleep(0.05)
-            # 移动过程
-            for i in range(1, steps + 1):
-                progress = i / steps
-                delta_y = int(current_swipe_dist * progress)
-                current_y1 = max(0, min(self.TOUCHPAD_HEIGHT, start_y1 + delta_y))
-                current_y2 = max(0, min(self.TOUCHPAD_HEIGHT, start_y2 + delta_y))
-                self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 0)
-                self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_Y, current_y1)
-                self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 1)
-                self.ui.write(e.EV_ABS, e.ABS_MT_POSITION_Y, current_y2)
-                self.ui.syn()
-                time.sleep(0.008)
-            # 触摸结束
-            self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 0)
-            self.ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
-            self.ui.write(e.EV_ABS, e.ABS_MT_SLOT, 1)
-            self.ui.write(e.EV_ABS, e.ABS_MT_TRACKING_ID, -1)
-            self.ui.write(e.EV_KEY, e.BTN_TOOL_DOUBLETAP, 0)
-            self.ui.write(e.EV_KEY, e.BTN_TOUCH, 0)
-            self.ui.syn()
-            if abs(remaining_distance) > 0.1:
-                time.sleep(0.01)
-
 class InvisibleCursorScroller:
     def __init__(self, screen_w, screen_h, config: Config):
         self.config = config
@@ -451,7 +395,6 @@ class InvisibleCursorScroller:
         self.screen_h = screen_h
         self.master_id = None
         self.ui_mouse = None
-        self.ui_touchpad = None
         self.unique_name = "scroll-stitch-cursor"
         self.park_position = (self.screen_w - 1, self.screen_h - 1)
         self.is_ready = False
@@ -496,7 +439,6 @@ class InvisibleCursorScroller:
         try:
             master_pointer_name = f"{self.unique_name} pointer"
             mouse_dev_name = f"VirtualMouse-{self.unique_name}"
-            touchpad_dev_name = f"VirtualTouchpad-{self.unique_name}"
             existing_master_ids = self._get_all_master_ids(self.unique_name)
             master_id_to_use = None
             if not self.config.REUSE_INVISIBLE_CURSOR:
@@ -555,7 +497,7 @@ class InvisibleCursorScroller:
                         raise RuntimeError(f"创建主设备后无法可靠地识别其 ID。创建前: {ids_before}, 当前: {ids_now}")
                 self.master_id = new_master_id
                 self._create_virtual_devices()
-                if not self._wait_for_device(mouse_dev_name) or not self._wait_for_device(touchpad_dev_name):
+                if not self._wait_for_device(mouse_dev_name):
                     logging.error("虚拟设备未能及时被 X Server 识别。尝试清理...")
                     try:
                         subprocess.run(['xinput', 'remove-master', str(self.master_id)], check=False)
@@ -563,14 +505,12 @@ class InvisibleCursorScroller:
                         logging.warning(f"清理失败的主设备 {self.master_id} 时出错: {e_cleanup}")
                 logging.info(f"将新虚拟设备附加到主设备 ID {self.master_id}")
                 subprocess.check_call(['xinput', 'reattach', mouse_dev_name, str(self.master_id)])
-                subprocess.check_call(['xinput', 'reattach', touchpad_dev_name, str(self.master_id)])
             else:
                 self.master_id = master_id_to_use
                 try:
                     self._create_virtual_devices()
                     logging.info(f"尝试重新打开 UInput 句柄以复用设备 (Master ID: {self.master_id})。")
                     subprocess.check_call(['xinput', 'reattach', mouse_dev_name, str(self.master_id)])
-                    subprocess.check_call(['xinput', 'reattach', touchpad_dev_name, str(self.master_id)])
                     logging.info(f"已重新附加虚拟设备到 Master ID: {self.master_id}")
                 except Exception as e_reopen:
                     logging.warning(f"复用设备 (Master ID: {self.master_id}) 时重新打开 UInput 或重新附加失败: {e_reopen}。滚动功能可能无效。")
@@ -589,8 +529,6 @@ class InvisibleCursorScroller:
         logging.info(f"隐形光标已停放至 {self.park_position}")
 
     def _create_virtual_devices(self):
-        # 导入 evdev 库
-        from evdev import UInput, ecodes as e, AbsInfo
         # 虚拟鼠标 (用于移动光标)
         mouse_caps = {
             e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT],
@@ -601,35 +539,14 @@ class InvisibleCursorScroller:
             ],
         }
         self.ui_mouse = UInput(mouse_caps, name=f'VirtualMouse-{self.unique_name}')
-        # 虚拟触摸板 (用于滚动)
-        self.TOUCHPAD_WIDTH = 1023
-        self.TOUCHPAD_HEIGHT = 767
-        MAX_SLOTS = 5
-        MAX_PRESSURE = 255
-        MAX_TOUCH_MAJOR = 255
-        touchpad_caps = {
-            e.EV_KEY: [e.BTN_TOUCH, e.BTN_TOOL_FINGER, e.BTN_TOOL_DOUBLETAP],
-            e.EV_ABS: [
-                (e.ABS_MT_SLOT, AbsInfo(value=0, min=0, max=MAX_SLOTS-1, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_MT_TRACKING_ID, AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_MT_POSITION_X, AbsInfo(value=0, min=0, max=self.TOUCHPAD_WIDTH, fuzz=0, flat=0, resolution=15)),
-                (e.ABS_MT_POSITION_Y, AbsInfo(value=0, min=0, max=self.TOUCHPAD_HEIGHT, fuzz=0, flat=0, resolution=15)),
-                (e.ABS_MT_PRESSURE, AbsInfo(value=0, min=0, max=MAX_PRESSURE, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_MT_TOUCH_MAJOR, AbsInfo(value=0, min=0, max=MAX_TOUCH_MAJOR, fuzz=0, flat=0, resolution=0)),
-            ],
-        }
-        self.ui_touchpad = UInput(touchpad_caps, name=f'VirtualTouchpad-{self.unique_name}')
-        self.touchpad_simulator = EvdevTouchpadSimulator(self.ui_touchpad)
 
     def move(self, x, y):
-        from evdev import ecodes as e
         self.ui_mouse.write(e.EV_ABS, e.ABS_X, x)
         self.ui_mouse.write(e.EV_ABS, e.ABS_Y, y)
         self.ui_mouse.syn()
 
     def discrete_scroll(self, num_clicks):
         """模拟鼠标滚轮进行离散滚动"""
-        from evdev import ecodes as e
         if num_clicks == 0:
             return
         value = -1 if num_clicks < 0 else 1
@@ -638,18 +555,12 @@ class InvisibleCursorScroller:
             self.ui_mouse.syn()
             time.sleep(0.01)
 
-    def scroll(self, distance, steps=25):
-        self.touchpad_simulator.scroll(distance, steps)
-
     def cleanup(self):
         if not self.config.REUSE_INVISIBLE_CURSOR:
             logging.info("清理隐形光标资源")
             if self.ui_mouse:
                 self.ui_mouse.close()
                 self.ui_mouse = None
-            if self.ui_touchpad:
-                self.ui_touchpad.close()
-                self.ui_touchpad = None
             if self.master_id is not None:
                 try:
                      command = ['xinput', 'remove-master', str(self.master_id)]
@@ -663,44 +574,31 @@ class InvisibleCursorScroller:
             if self.is_ready:
                 self.park()
 
-class VirtualTouchpadController:
-    """ 只有在其实例被创建时，才会尝试导入 evdev 库 """
+class EvdevWheelScroller:
+    """一个虚拟鼠标，用于触发滚轮事件"""
     def __init__(self):
-        try:
-            from evdev import UInput, ecodes as e, AbsInfo
-            self.e = e
-        except ImportError:
-            logging.error("可选依赖 evdev 未安装。滑块滚动功能将不可用")
-            logging.info("你可以通过 'pip install evdev' 来安装它")
-            raise ImportError("evdev library not found.")
-        self.TOUCHPAD_WIDTH = 1023
-        self.TOUCHPAD_HEIGHT = 767
-        MAX_SLOTS = 5
-        MAX_PRESSURE = 255
-        MAX_TOUCH_MAJOR = 255
         capabilities = {
-            e.EV_KEY: [e.BTN_TOUCH, e.BTN_TOOL_FINGER, e.BTN_TOOL_DOUBLETAP],
-            e.EV_ABS: [
-                (e.ABS_MT_SLOT, AbsInfo(value=0, min=0, max=MAX_SLOTS-1, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_MT_TRACKING_ID, AbsInfo(value=0, min=0, max=65535, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_MT_POSITION_X, AbsInfo(value=0, min=0, max=self.TOUCHPAD_WIDTH, fuzz=0, flat=0, resolution=15)),
-                (e.ABS_MT_POSITION_Y, AbsInfo(value=0, min=0, max=self.TOUCHPAD_HEIGHT, fuzz=0, flat=0, resolution=15)),
-                (e.ABS_MT_PRESSURE, AbsInfo(value=0, min=0, max=MAX_PRESSURE, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_MT_TOUCH_MAJOR, AbsInfo(value=0, min=0, max=MAX_TOUCH_MAJOR, fuzz=0, flat=0, resolution=0)),
-            ],
+            e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT],
+            e.EV_REL: [e.REL_WHEEL],
         }
         # UInput 的初始化
-        self.ui_device = UInput(capabilities, name='scroll_stitch-virtual-touchpad', version=0x1)
-        self.simulator = EvdevTouchpadSimulator(self.ui_device)
-        logging.info("VirtualTouchpadController 初始化成功，虚拟触摸板设备已创建")
+        self.ui_device = UInput(capabilities, name='scroll_stitch-wheel-mouse', version=0x1)
+        logging.info("EvdevWheelScroller 初始化成功，虚拟滚轮鼠标已创建")
 
-    def scroll(self, distance, steps=25):
-        self.simulator.scroll(distance, steps)
+    def scroll_discrete(self, num_clicks):
+        """模拟鼠标滚轮进行离散滚动"""
+        if num_clicks == 0:
+            return
+        value = -1 if num_clicks < 0 else 1
+        for _ in range(abs(num_clicks)):
+            self.ui_device.write(e.EV_REL, e.REL_WHEEL, value)
+            self.ui_device.syn()
+            time.sleep(0.01)
 
     def close(self):
         if self.ui_device:
             self.ui_device.close()
-            logging.info("虚拟触摸板设备已关闭")
+            logging.info("虚拟滚轮鼠标已关闭")
 
 def play_sound(sound_name: str, theme_name: str = None):
     if not sound_name:
@@ -1410,46 +1308,6 @@ class ScrollManager:
         except Exception as e:
             logging.error(f"GDK warp 失败: {e}")
 
-    def scroll_smooth(self, scroll_distance):
-        win_x, win_y = self.view.get_position()
-        _, win_h = self.view.get_size()
-        center_x = win_x + self.view.left_panel_w + self.config.BORDER_WIDTH + self.session.geometry['w'] / 2
-        center_y = win_y + self.config.BORDER_WIDTH + (win_h - 2 * self.config.BORDER_WIDTH) / 2
-        center_x_int, center_y_int = int(center_x), int(center_y)
-        if self.config.SCROLL_METHOD == 'invisible_cursor' and self.view.invisible_scroller.is_ready:
-            scroller = self.view.invisible_scroller
-            try:
-                scroller.move(center_x_int, center_y_int)
-                time.sleep(0.05)
-                logging.info(f"触发高级滚动，距离: {scroll_distance}")
-                scroller.scroll(scroll_distance)
-            except Exception as e:
-                logging.error(f"隐形光标滚动时发生错误: {e}")
-            finally:
-                time.sleep(0.05)
-                scroller.park()
-        elif self.view.touchpad_controller:
-            logging.info("使用'移动用户光标'模式执行滚动...")
-            origin_pos = self._get_pointer_position()
-            scroll_exec_pos = (center_x_int, center_y_int)
-            time.sleep(0.08)
-            self._set_pointer_position(*scroll_exec_pos)
-            time.sleep(0.05)
-            logging.info(f"触发高级滚动，距离: {scroll_distance}")
-            self.view.touchpad_controller.scroll(scroll_distance)
-            time.sleep(0.1)
-            current_pos_after_scroll = self._get_pointer_position()
-            tolerance = self.config.MOUSE_MOVE_TOLERANCE 
-            user_intervened = (
-                abs(current_pos_after_scroll[0] - scroll_exec_pos[0]) > tolerance or
-                abs(current_pos_after_scroll[1] - scroll_exec_pos[1]) > tolerance
-            )
-            if not user_intervened:
-                logging.info("用户未移动鼠标，恢复原始鼠标位置")
-                self._set_pointer_position(*origin_pos)
-            else:
-                logging.info("检测到用户在滚动期间手动移动鼠标，放弃恢复原始鼠标位置")
-
     def scroll_discrete(self, ticks, is_auto_scroll=False):
         if ticks == 0:
             return
@@ -1474,22 +1332,33 @@ class ScrollManager:
             self._set_pointer_position(center_x, center_y)
             time.sleep(0.05)
             try:
-                disp = display.Display()
-                button_code = 4 if ticks > 0 else 5
-                num_clicks = abs(ticks)
-                for i in range(num_clicks):
-                    xtest.fake_input(disp, X.ButtonPress, button_code)
-                    disp.sync()
-                    time.sleep(0.005)
-                    xtest.fake_input(disp, X.ButtonRelease, button_code)
-                    disp.sync()
-                    if i < num_clicks - 1:
-                         time.sleep(0.015)
-                disp.close()
+                if self.view.evdev_wheel_scroller:
+                    logging.info(f"使用 Evdev 执行离散滚动: {ticks} 格")
+                    try:
+                        self.view.evdev_wheel_scroller.scroll_discrete(ticks)
+                    except Exception as e:
+                        logging.error(f"使用 Evdev 模拟滚动失败: {e}")
+                else:
+                    logging.warning("Evdev 模块不可用，回退到 XTest 滚动")
+                    try:
+                        disp = display.Display()
+                        button_code = 4 if ticks > 0 else 5
+                        num_clicks = abs(ticks)
+                        for i in range(num_clicks):
+                            xtest.fake_input(disp, X.ButtonPress, button_code)
+                            disp.sync()
+                            time.sleep(0.005)
+                            xtest.fake_input(disp, X.ButtonRelease, button_code)
+                            disp.sync()
+                            if i < num_clicks - 1:
+                                time.sleep(0.015)
+                        disp.close()
+                    except Exception as e:
+                        logging.error(f"使用 XTest 模拟滚动失败: {e}")
+                        try: disp.close()
+                        except: pass
             except Exception as e:
-                logging.error(f"使用 XTest 模拟滚动失败: {e}")
-                try: disp.close()
-                except: pass
+                logging.error(f"模拟滚动失败: {e}")
             hide_and_auto = is_auto_scroll and not self.config.CAPTURE_WITH_CURSOR
             if not hide_and_auto:
                time.sleep(0.05)
@@ -1895,7 +1764,7 @@ class ActionController:
         task = {'type': 'POP'}
         self.task_queue.put(task)
 
-    def start_auto_scroll(self):
+    def start_auto_scroll(self, widget=None):
         if self.is_auto_scrolling:
             logging.warning("自动滚动已在运行中")
             return
@@ -1919,8 +1788,7 @@ class ActionController:
         btn_panel = self.view.button_panel
         btn_panel.btn_capture.set_sensitive(False)
         btn_panel.btn_undo.set_sensitive(False)
-        btn_panel.btn_scroll_up.set_sensitive(False)
-        btn_panel.btn_scroll_down.set_sensitive(False)
+        btn_panel.btn_auto_start.set_sensitive(False)
 
     def stop_auto_scroll(self, reason_message=None):
         if not self.is_auto_scrolling:
@@ -1948,8 +1816,9 @@ class ActionController:
         btn_panel = self.view.button_panel
         btn_panel.btn_capture.set_sensitive(True)
         btn_panel.set_undo_sensitive(self.stitch_model.capture_count > 0)
-        btn_panel.btn_scroll_up.set_sensitive(True)
-        btn_panel.btn_scroll_down.set_sensitive(True)
+        btn_panel.btn_grid_forward.set_sensitive(True)
+        btn_panel.btn_grid_backward.set_sensitive(True)
+        btn_panel.btn_auto_start.set_sensitive(True)
 
     def _auto_scroll_step(self):
         if self.last_auto_scroll_cursor_pos:
@@ -2149,12 +2018,13 @@ class ActionController:
              self.task_queue.put({'type': 'EXIT'})
              self.stitch_worker.join(timeout=0.5)
              self.stitch_worker_running = False
-        if self.view.touchpad_controller:
-            self.view.touchpad_controller.close()
         if self.view.invisible_scroller:
             cleanup_thread = threading.Thread(target=self.view.invisible_scroller.cleanup)
             cleanup_thread.start()
             logging.info("InvisibleCursorScroller.cleanup() 正在后台线程中执行")
+        if self.view.evdev_wheel_scroller:
+            self.view.evdev_wheel_scroller.close()
+            logging.info("EvdevWheelScroller 已关闭")
         global config_window_instance
         if config_window_instance:
             logging.info("检测到配置窗口仍然打开，正在销毁它...")
@@ -2183,10 +2053,10 @@ class ActionController:
         elif is_match(config.HOTKEY_UNDO):
             self.delete_last_capture()
             return True
-        elif is_match(config.HOTKEY_SCROLL_UP):
+        elif is_match(config.HOTKEY_GRID_BACKWARD):
             self.handle_movement_action('up')
             return True
-        elif is_match(config.HOTKEY_SCROLL_DOWN):
+        elif is_match(config.HOTKEY_GRID_FORWARD):
             self.handle_movement_action('down')
             return True
         elif is_match(config.HOTKEY_AUTO_SCROLL_START):
@@ -2270,10 +2140,10 @@ class ButtonPanel(Gtk.Box):
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=config.BUTTON_SPACING)
         # 整格模式按钮
-        self.btn_grid_backward = Gtk.Button(label="后退")
         self.btn_grid_forward = Gtk.Button(label="前进")
-        self.btn_grid_backward.connect("clicked", lambda w: self.emit('grid-backward-clicked'))
+        self.btn_grid_backward = Gtk.Button(label="后退")
         self.btn_grid_forward.connect("clicked", lambda w: self.emit('grid-forward-clicked'))
+        self.btn_grid_backward.connect("clicked", lambda w: self.emit('grid-backward-clicked'))
         # 自动滚动按钮
         self.btn_auto_start = Gtk.Button(label="开始")
         self.btn_auto_stop = Gtk.Button(label="停止")
@@ -2313,8 +2183,8 @@ class ButtonPanel(Gtk.Box):
             self.btn_auto_start.hide()
             self.btn_auto_stop.hide()
         self.btn_undo.set_sensitive(False)
-        self.pack_start(self.btn_grid_backward, True, True, 0)
         self.pack_start(self.btn_grid_forward, True, True, 0)
+        self.pack_start(self.btn_grid_backward, True, True, 0)
         self.separator_grid_auto = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         self.pack_start(self.separator_grid_auto, False, False, 2)
         self.pack_start(self.btn_auto_start, True, True, 0)
@@ -4285,24 +4155,29 @@ class CaptureOverlay(Gtk.Window):
         self.preview_window = None
         self.stitch_model = self.controller.stitch_model
         self.stitch_model.connect('model-updated', self.on_model_updated_ui)
-        self.touchpad_controller = None
+        self.evdev_wheel_scroller = None
         self.invisible_scroller = None
         self.screen_rect = self._get_current_monitor_geometry()
         try:
-            if config.SCROLL_METHOD == 'invisible_cursor':
-                self.invisible_scroller = InvisibleCursorScroller(
-                    self.screen_rect.width, self.screen_rect.height, config
-                )
-                self.invisible_scroller.setup()
-                logging.info("InvisibleCursorScroller.setup() 正在后台线程中执行")
+            if EVDEV_AVAILABLE:
+                if config.SCROLL_METHOD == 'invisible_cursor':
+                    self.invisible_scroller = InvisibleCursorScroller(
+                        self.screen_rect.width, self.screen_rect.height, config
+                    )
+                    self.invisible_scroller.setup()
+                    logging.info("InvisibleCursorScroller.setup() 正在后台线程中执行")
+                else:
+                    self.evdev_wheel_scroller = EvdevWheelScroller()
             else:
-                self.touchpad_controller = VirtualTouchpadController()
+                send_desktop_notification("endev 未导入", f"基于 evdev 的滚动功能将不可用")
+                self.evdev_wheel_scroller = None
+                self.invisible_scroller = None
         except Exception as err:
             logging.error(f"创建虚拟滚动设备失败: {err}")
             send_desktop_notification(
-                "设备错误", f"无法创建虚拟设备: {err}，滑块微调功能将使用备用模式或不可用", level="critical"
+                "设备错误", f"无法创建虚拟设备: {err}，基于 evdev 的滚动功能将不可用", level="critical"
             )
-            self.touchpad_controller = None
+            self.evdev_wheel_scroller = None
             self.invisible_scroller = None
         self.window_xid = None # 用于存储窗口的 X11 ID
         self.is_dialog_open = False
@@ -4522,7 +4397,7 @@ class CaptureOverlay(Gtk.Window):
         ]
         instruction_lines.append("，".join(hotkeys))
         instruction_lines.append(f"切换整格/自由模式：{config.str_toggle_grid_mode.upper()}，（自由模式下）配置滚动单位：{config.str_configure_scroll_unit.upper()}")
-        instruction_lines.append(f"前进：{config.str_scroll_down.upper()}，后退：{config.str_scroll_up.upper()}")
+        instruction_lines.append(f"前进：{config.str_grid_forward.upper()}，后退：{config.str_grid_backward.upper()}")
         instruction_lines.append(f"打开/激活配置窗口：{config.str_open_config_editor.upper()}，开启/禁用全局热键：{config.str_toggle_hotkeys_enabled.upper()}")
         instructions = "\n".join(instruction_lines)
         dialog.format_secondary_text(instructions)
@@ -5040,8 +4915,8 @@ def setup_hotkey_listener(overlay):
         ('finalize', overlay.controller.finalize_and_quit),
         ('undo', overlay.controller.delete_last_capture),
         ('cancel', overlay.controller.quit_and_cleanup),
-        ('scroll_up', lambda: overlay.controller.handle_movement_action('up')),
-        ('scroll_down', lambda: overlay.controller.handle_movement_action('down')),
+        ('grid_backward', lambda: overlay.controller.handle_movement_action('up')),
+        ('grid_forward', lambda: overlay.controller.handle_movement_action('down')),
         ('auto_scroll_start', overlay.controller.start_auto_scroll),
         ('auto_scroll_stop', overlay.controller.stop_auto_scroll),
         ('toggle_grid_mode', overlay.controller.grid_mode_controller.toggle),
