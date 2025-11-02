@@ -716,23 +716,140 @@ def send_desktop_notification(title, message, sound_name=None, level="normal", a
         if controller:
             GLib.idle_add(controller._perform_cleanup)
 
+class AreaSelectionWindow(Gtk.Window):
+    """一个全屏、半透明的窗口，用于拖拽选择初始截图区域"""
+    def __init__(self, config_obj):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.config = config_obj
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_app_paintable(True)
+        visual = self.get_screen().get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor()
+        if not monitor:
+            monitor = display.get_monitor(0)
+        geo = monitor.get_geometry()
+        self.move(geo.x, geo.y)
+        self.resize(geo.width, geo.height)
+        self.config_border_color = self.config.BORDER_COLOR
+        self.config_border_width = self.config.BORDER_WIDTH
+        self.start_x_root = 0
+        self.start_y_root = 0
+        self.current_x_root = 0
+        self.current_y_root = 0
+        self.is_dragging = False
+        self.geometry = None 
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK |
+            Gdk.EventMask.BUTTON_RELEASE_MASK |
+            Gdk.EventMask.POINTER_MOTION_MASK
+        )
+        self.connect("draw", self.on_draw)
+        self.connect("button-press-event", self.on_button_press)
+        self.connect("motion-notify-event", self.on_motion_notify)
+        self.connect("button-release-event", self.on_button_release)
+        self.connect("key-press-event", self.on_key_press)
+        self.connect("realize", self._on_realize)
+        self.connect("map-event", self._on_map_event)
+
+    def _on_realize(self, widget):
+        gdk_window = self.get_window()
+        if gdk_window:
+            gdk_window.set_override_redirect(True)
+
+    def _on_map_event(self, widget, event):
+        display = Gdk.Display.get_default()
+        seat = display.get_default_seat()
+        cursor = Gdk.Cursor.new_from_name(display, "crosshair")
+        grab_status = seat.grab(
+            self.get_window(), Gdk.SeatCapabilities.ALL,
+            True, cursor, None, None, None
+        )
+        if grab_status != Gdk.GrabStatus.SUCCESS:
+            logging.error(f"无法抓取输入: {grab_status}")
+            self.geometry = None
+            self.destroy()
+        return True
+
+    def on_key_press(self, widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            logging.info("选择被 Esc 取消")
+            self.geometry = None
+            Gdk.Display.get_default().get_default_seat().ungrab()
+            self.destroy()
+            return True
+        return False
+
+    def on_draw(self, widget, cr):
+        win_x, win_y = self.get_position()
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.4)
+        cr.paint()
+        if self.is_dragging:
+            x1 = self.start_x_root - win_x
+            y1 = self.start_y_root - win_y
+            x2 = self.current_x_root - win_x
+            y2 = self.current_y_root - win_y
+            x = min(x1, x2)
+            y = min(y1, y2)
+            w = abs(x1 - x2)
+            h = abs(y1 - y2)
+            cr.set_operator(cairo.OPERATOR_CLEAR)
+            cr.rectangle(x, y, w, h)
+            cr.fill()
+            cr.set_operator(cairo.OPERATOR_OVER)
+            r, g, b, a = self.config_border_color
+            cr.set_source_rgba(r, g, b, a)
+            cr.set_line_width(self.config_border_width)
+            cr.rectangle(x, y, w, h)
+            cr.stroke()
+
+    def on_button_press(self, widget, event):
+        if event.button == 1:
+            self.is_dragging = True
+            self.start_x_root, self.start_y_root = event.get_root_coords()
+            self.current_x_root, self.current_y_root = self.start_x_root, self.start_y_root
+            self.queue_draw()
+            return True
+        return False
+
+    def on_motion_notify(self, widget, event):
+        if self.is_dragging:
+            self.current_x_root, self.current_y_root = event.get_root_coords()
+            self.queue_draw()
+            return True
+        return False
+
+    def on_button_release(self, widget, event):
+        if event.button == 1 and self.is_dragging:
+            self.is_dragging = False
+            x1, y1 = self.start_x_root, self.start_y_root
+            x2, y2 = event.get_root_coords()
+            final_x = min(x1, x2)
+            final_y = min(y1, y2)
+            raw_w = abs(x1 - x2)
+            raw_h = abs(y1 - y2)
+            min_size = 2 * self.config.HANDLE_HEIGHT
+            final_w = max(raw_w, min_size)
+            final_h = max(raw_h, min_size)
+            self.geometry = {'x': int(final_x), 'y': int(final_y), 'w': int(final_w), 'h': int(final_h)}
+            logging.info(f"选区完成 (raw w/h: {raw_w}/{raw_h}). 应用最小尺寸 {min_size}px 后: {self.geometry}")
+            Gdk.Display.get_default().get_default_seat().ungrab()
+            self.destroy() 
+            return True
+        return False
+
 def select_area():
-    """使用 slop 选择一个区域，并返回其几何信息字符串"""
-    try:
-        border_width_str = str(config.BORDER_WIDTH)
-        color_str = ",".join(map(str, config.BORDER_COLOR))
-        logging.info(f"正在使用配置调用 slop: border={border_width_str}, color={color_str}")
-        cmd = ["slop", "-b", border_width_str, "-c", color_str ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True)
-        geometry = result.stdout.strip()
-        return geometry if geometry else None
-    except FileNotFoundError:
-        logging.error("`slop` 命令未找到。请确保 slop 已经安装并位于 PATH 中")
-        send_desktop_notification("错误：依赖缺失", "`slop` 命令未找到，程序无法启动")
-        raise
-    except subprocess.CalledProcessError as e:
-        logging.warning(f"slop 选择被取消或失败: {e.stderr}")
-        return None
+    logging.info("启动全屏蒙版进行区域选择...")
+    selection_window = AreaSelectionWindow(config)
+    selection_window.connect("destroy", Gtk.main_quit)
+    selection_window.show_all()
+    Gtk.main()
+    geometry = selection_window.geometry
+    logging.info(f"区域选择完成: {geometry}")
+    return geometry
 
 def capture_area(x: int, y: int, w: int, h: int, filepath: Path) -> bool:
     """使用 GDK 从根窗口截取指定区域并保存到文件"""
@@ -1325,19 +1442,12 @@ class StitchModel(GObject.Object):
 
 class CaptureSession:
     """管理一次滚动截图会话的数据和状态"""
-    def __init__(self, geometry_str: str):
+    def __init__(self, geometry_dict: dict):
         self.is_horizontally_locked: bool = False
-        self.geometry: dict = self._parse_geometry(geometry_str)
+        self.geometry: dict = geometry_dict
         self.detected_app_class: str = None
         self.is_matching_enabled: bool = False
         self.known_scroll_distances = []
-
-    def _parse_geometry(self, geometry_str: str):
-        """从 "WxH+X+Y" 格式的字符串中解析出几何信息"""
-        parts = geometry_str.strip().split('+')
-        dims, x_str, y_str = parts[0], parts[1], parts[2]
-        w_str, h_str = dims.split('x')
-        return {'x': int(x_str), 'y': int(y_str), 'w': int(w_str), 'h': int(h_str)}
 
     def update_geometry(self, new_geometry):
         """更新捕获区域的几何信息，并确保所有值为整数"""
@@ -5067,9 +5177,9 @@ class PreviewWindow(Gtk.Window):
         return True
 
 class CaptureOverlay(Gtk.Window):
-    def __init__(self, geometry_str, config: Config):
+    def __init__(self, geometry_dict, config: Config):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
-        self.session = CaptureSession(geometry_str)
+        self.session = CaptureSession(geometry_dict)
         self.controller = ActionController(self.session, self, config)
         self.preview_window = None
         self.preview_window_last_geometry = None
@@ -5959,29 +6069,15 @@ def cleanup_stale_temp_dirs(config):
 
 def check_dependencies():
     """在脚本启动时检查所有必需和可选的命令行依赖项"""
-    critical_deps = {
-        'slop': '用于启动时选择截图区域的核心工具'
-    }
     optional_deps = {
         'paplay': '用于播放截图、撤销和完成时的音效',
         'xdg-open': '用于在截图完成后从通知中打开文件或目录',
         'xinput': '用于“隐形光标”滚动模式，提供无干扰的滚动体验'
     }
-    missing_critical = []
     missing_optional = []
-    for dep, reason in critical_deps.items():
-        if not shutil.which(dep):
-            missing_critical.append(f"关键依赖 '{dep}' 缺失: {reason}")
     for dep, reason in optional_deps.items():
         if not shutil.which(dep):
             missing_optional.append(f"可选依赖 '{dep}' 缺失: {reason}")
-    if missing_critical:
-        logging.error("错误：缺少关键依赖项，程序无法启动")
-        for item in missing_critical:
-            logging.error(item)
-        logging.error("\n请确保已安装上述程序，并将其路径添加至系统的 PATH 环境变量中")
-        Notify.Notification.new("错误：依赖缺失", "\n".join(missing_critical), "dialog-error").show()
-        sys.exit(1)
     if missing_optional:
         logging.warning("警告：检测到缺少可选依赖项，部分功能可能无法使用或表现异常")
         for item in missing_optional:
@@ -6034,14 +6130,15 @@ def main():
         sys.exit(1)
     logging.info("等待用户使用 slop 选择初始区域...")
     try:
-        geometry_str = select_area()
-        if not geometry_str:
+        geometry_dict = select_area()
+        if not geometry_dict:
+            logging.info("未选择任何区域，程序退出")
             sys.exit()
     except Exception as e:
-        logging.error(f"slop 选择失败或被取消。错误: {e}")
+        logging.error(f"区域选择失败或被取消。错误: {e}")
         sys.exit()
     config.TMP_DIR.mkdir(parents=True, exist_ok=True)
-    overlay = CaptureOverlay(geometry_str, config)
+    overlay = CaptureOverlay(geometry_dict, config)
     overlay.connect("destroy", Gtk.main_quit)
     overlay.show()
     setup_hotkey_listener(overlay)

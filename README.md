@@ -632,9 +632,9 @@ sudo zypper install --no-recommends python3-python-xlib python3-Pillow python3-e
 
 ### 外部依赖
 
-程序的外部依赖有 `slop`、`xdg-open`、`paplay` 、`xinput` ，可以先检查一下是否安装了这些命令行工具（`command -v` 后面跟命令行工具名字，有输出就是存在）。  
+程序的外部依赖有 `xdg-open`、`paplay` 、`xinput` ，可以先检查一下是否安装了这些命令行工具（`command -v` 后面跟命令行工具名字，有输出就是存在）。  
 
-`slop` 是核心依赖，必须安装，`xdg-open` 用来打开文件或目录，`paplay` 播放音效（`sound-theme-freedesktop` 提供音效），`xinput` 启用隐形光标模式，可以根据需要安装。
+`xdg-open` 用来打开文件或目录，`paplay` 播放音效（`sound-theme-freedesktop` 提供音效），`xinput` 启用隐形光标模式，可以根据需要安装。
 
 #### `Ubuntu/Debian` 外部依赖安装
 
@@ -642,7 +642,7 @@ sudo zypper install --no-recommends python3-python-xlib python3-Pillow python3-e
 <summary>安装命令</summary>
 
 ```shell
-sudo apt install slop xdg-utils pulseaudio-utils sound-theme-freedesktop xinput
+sudo apt install xdg-utils pulseaudio-utils sound-theme-freedesktop xinput
 ```
 
 </details>
@@ -653,7 +653,7 @@ sudo apt install slop xdg-utils pulseaudio-utils sound-theme-freedesktop xinput
 <summary>安装命令</summary>
 
 ```shell
-sudo dnf install slop xdg-utils pulseaudio-utils sound-theme-freedesktop xinput
+sudo dnf install xdg-utils pulseaudio-utils sound-theme-freedesktop xinput
 ```
 
 </details>
@@ -664,7 +664,7 @@ sudo dnf install slop xdg-utils pulseaudio-utils sound-theme-freedesktop xinput
 <summary>安装命令</summary>
 
 ```shell
-sudo pacman -S --needed slop xdg-utils pipewire-pulse sound-theme-freedesktop xorg-xinput
+sudo pacman -S --needed xdg-utils pipewire-pulse sound-theme-freedesktop xorg-xinput
 ```
 
 </details>
@@ -675,7 +675,7 @@ sudo pacman -S --needed slop xdg-utils pipewire-pulse sound-theme-freedesktop xo
 <summary>安装命令</summary>
 
 ```shell
-sudo zypper install  --no-recommends slop xdg-utils pipewire-pulseaudio sound-theme-freedesktop
+sudo zypper install  --no-recommends xdg-utils pipewire-pulseaudio sound-theme-freedesktop
 ```
 
 </details>
