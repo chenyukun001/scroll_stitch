@@ -789,36 +789,46 @@ def _find_overlap_pyramid(img_top, img_bottom, max_overlap_search):
         return estimated_overlap, 0.0
     return _find_overlap_brute_force(img_top, img_bottom, min_fine_search, max_fine_search)
 
-def stitch_images_in_memory_from_model(entries: list, image_width: int, total_height: int, progress_callback=None):
-    if not entries:
+def stitch_images_in_memory_from_model(render_plan: list, image_width: int, total_height: int, progress_callback=None):
+    if not render_plan:
         return None
-    num_images = len(entries)
-    logging.info(f"开始从 {num_images} 个条目拼接图像，最终尺寸: {image_width}x{total_height}")
+    num_pieces = len(render_plan)
+    final_width_int = int(round(image_width))
+    final_height_int = int(round(total_height))
+    logging.info(f"开始从 {num_pieces} 个渲染片段拼接图像，最终尺寸: {final_width_int}x{final_height_int} (原始浮点高度: {total_height})")
+    pil_cache = {}
     try:
-        stitched_image = Image.new('RGBA', (image_width, total_height))
+        stitched_image = Image.new('RGBA', (final_width_int, final_height_int))
         y_offset = 0
-        for i, entry in enumerate(entries):
-            filepath = entry['filepath']
-            height = entry['height']
-            overlap_with_next = entry['overlap']
-            logging.info(f"粘贴 {Path(filepath).name} 到 Y={int(round(y_offset))}")
+        for i, piece in enumerate(render_plan):
+            filepath = piece['filepath']
+            src_y = piece['src_y']
+            src_height = piece['height']
+            dest_y = piece['render_y_start']
             try:
-                img_pil = Image.open(filepath)
-                if img_pil.width != image_width:
-                    logging.warning(f"图片 {filepath} 宽度 {img_pil.width} 与预期 {image_width} 不符，可能导致错位")
-                stitched_image.paste(img_pil, (0, int(round(y_offset))))
-                img_pil.close()
+                if filepath not in pil_cache:
+                    pil_cache[filepath] = Image.open(filepath)
+                img_pil = pil_cache[filepath]
+                box_upper = int(round(src_y))
+                box_lower = int(round(src_y + src_height))
+                box = (0, box_upper, img_pil.width, box_lower)
+                cropped_img = img_pil.crop(box)
+                if cropped_img.width != final_width_int:
+                    logging.warning(f"图片片段 {filepath} 宽度 {cropped_img.width} 与预期 {final_width_int} 不符")
+                stitched_image.paste(cropped_img, (0, int(round(dest_y))))
             except Exception as e_load:
-                logging.error(f"加载或粘贴图片失败 {filepath}: {e_load}")
-            if i < num_images - 1:
-                y_offset += height - overlap_with_next
+                logging.error(f"加载/裁剪/粘贴图片失败 {filepath} (src_y={src_y}): {e_load}")
             if progress_callback:
-                GLib.idle_add(progress_callback, (i + 1) / num_images)
+                GLib.idle_add(progress_callback, (i + 1) / num_pieces)
         logging.info("图像拼接完成")
         return stitched_image
     except Exception as e:
         logging.exception(f"拼接图像时发生严重错误: {e}")
         return None
+    finally:
+        for img in pil_cache.values():
+            img.close()
+        logging.info(f"PIL 缓存中的 {len(pil_cache)} 张图片已关闭")
 
 def copy_to_clipboard(image_path: Path) -> bool:
     """使用 Gtk.Clipboard 将图片复制到剪贴板"""
@@ -1062,13 +1072,18 @@ class StitchModel(GObject.Object):
     """管理拼接数据的模型，支持异步更新和信号通知"""
     __gsignals__ = {
         'model-updated': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'modification-stack-changed': (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
     def __init__(self):
         super().__init__()
         self.entries = []
         self.image_width = 0
         self.total_virtual_height = 0
-        self.y_positions = []
+        self.modifications = []
+        self.redo_stack = []
+        self.absolute_plan = []   # 基础层
+        self.collapsed_plan = [] # 中间层
+        self.render_plan = [] # 渲染层
         self.pixbuf_cache = collections.OrderedDict()
         self.CACHE_SIZE = config.parser.getint('Performance', 'preview_cache_size', fallback=10)
 
@@ -1098,31 +1113,198 @@ class StitchModel(GObject.Object):
                  del self.pixbuf_cache[filepath]
             return None
 
+    def _regenerate_plans(self):
+        """依次生成三层：Absolute, Collapsed, Render"""
+        if not self.entries:
+            self.total_virtual_height = 0
+            self.absolute_plan = []
+            self.collapsed_plan = []
+            self.render_plan = []
+            GLib.idle_add(self.emit, 'model-updated')
+            return
+        self._generate_absolute_plan()
+        self._generate_collapsed_plan()
+        self._generate_render_plan()
+        GLib.idle_add(self.emit, 'model-updated')
+
+    def _generate_absolute_plan(self):
+        self.absolute_plan = []
+        current_a_y = 0
+        if not self.entries:
+            self.total_absolute_height = 0
+            return
+        for i, entry in enumerate(self.entries):
+            self.absolute_plan.append({
+                'entry_index': i,
+                'filepath': entry['filepath'],
+                'absolute_y_start': current_a_y,
+                'height': entry['height'],
+                'overlap_with_next': entry['overlap'] if i < len(self.entries) - 1 else 0
+            })
+            current_a_y += entry['height']
+        self.total_absolute_height = current_a_y
+
+    def _generate_collapsed_plan(self):
+        self.collapsed_plan = []
+        current_c_y = 0
+        if not self.absolute_plan:
+            self.total_collapsed_height = 0
+            return
+        restored_seams = {mod['seam_index'] for mod in self.modifications if mod['type'] == 'restore'}
+        for i, abs_piece in enumerate(self.absolute_plan):
+            is_last = (i == len(self.absolute_plan) - 1)
+            if is_last:
+                effective_overlap = 0
+            elif i in restored_seams:
+                effective_overlap = 0
+                logging.info(f"接缝 {i} 已恢复，设置 effective_overlap = 0")
+            else:
+                effective_overlap = abs_piece['overlap_with_next']
+            visible_height = abs_piece['height'] - effective_overlap
+            self.collapsed_plan.append({
+                'entry_index': abs_piece['entry_index'],
+                'filepath': abs_piece['filepath'],
+                'absolute_y_start': abs_piece['absolute_y_start'],
+                'absolute_y_end': abs_piece['absolute_y_start'] + abs_piece['height'],
+                'collapsed_y_start': current_c_y,
+                'height': visible_height,
+                'src_y': 0,
+                'original_height': abs_piece['height']
+            })
+            current_c_y += visible_height
+        self.total_collapsed_height = current_c_y
+
+    def _generate_render_plan(self):
+        self.render_plan = []
+        current_r_y = 0
+        if not self.collapsed_plan:
+            self.total_virtual_height = 0
+            return
+        delete_regions = [(mod['y_start_abs'], mod['y_end_abs']) 
+                          for mod in self.modifications if mod['type'] == 'delete']
+        for collapsed_piece in self.collapsed_plan:
+            piece_abs_start = collapsed_piece['absolute_y_start']
+            piece_abs_end = collapsed_piece['absolute_y_start'] + collapsed_piece['original_height']
+            visible_intervals = [(piece_abs_start, piece_abs_end)]
+            for del_start, del_end in delete_regions:
+                new_intervals = []
+                for vis_start, vis_end in visible_intervals:
+                    if del_start < vis_end and del_end > vis_start:
+                        if vis_start < del_start:
+                            new_intervals.append((vis_start, del_start))
+                        if vis_end > del_end:
+                            new_intervals.append((del_end, vis_end))
+                    else:
+                        new_intervals.append((vis_start, vis_end))
+                visible_intervals = new_intervals
+            final_render_intervals = []
+            c_visible_abs_start = collapsed_piece['absolute_y_start']
+            c_visible_abs_end = collapsed_piece['absolute_y_start'] + collapsed_piece['height']
+            for vis_start, vis_end in visible_intervals:
+                final_abs_start = max(vis_start, c_visible_abs_start)
+                final_abs_end = min(vis_end, c_visible_abs_end)
+                if final_abs_end > final_abs_start:
+                    final_render_intervals.append((final_abs_start, final_abs_end))
+            for abs_start, abs_end in final_render_intervals:
+                height = abs_end - abs_start
+                if height <= 1e-5:
+                    continue
+                src_y = abs_start - collapsed_piece['absolute_y_start']
+                self.render_plan.append({
+                    'entry_index': collapsed_piece['entry_index'],
+                    'filepath': collapsed_piece['filepath'],
+                    'absolute_y_start': abs_start,
+                    'absolute_y_end': abs_end,
+                    'render_y_start': current_r_y,
+                    'height': height,
+                    'src_y': src_y,
+                })
+                current_r_y += height
+        self.total_virtual_height = current_r_y
+
+    def undo(self):
+        """撤销上一个修改"""
+        if not self.modifications:
+            logging.info("StitchModel: 撤销栈为空，无操作")
+            return
+        mod = self.modifications.pop()
+        self.redo_stack.append(mod)
+        logging.info(f"StitchModel: 撤销操作 {mod.get('type')}")
+        GLib.idle_add(self._regenerate_plans)
+        GLib.idle_add(self.emit, 'modification-stack-changed')
+
+    def redo(self):
+        """重做上一个撤销的修改"""
+        if not self.redo_stack:
+            logging.info("StitchModel: 重做栈为空，无操作")
+            return
+        mod = self.redo_stack.pop()
+        self.modifications.append(mod)
+        logging.info(f"StitchModel: 重做操作 {mod.get('type')}")
+        GLib.idle_add(self._regenerate_plans)
+        GLib.idle_add(self.emit, 'modification-stack-changed')
+
+    def add_modification(self, mod: dict):
+        logging.info(f"StitchModel: 添加新修改: {mod}")
+        self.modifications.append(mod)
+        if self.redo_stack:
+            logging.info("StitchModel: 新修改导致重做栈被清空")
+            self.redo_stack.clear()
+        GLib.idle_add(self.emit, 'modification-stack-changed')
+        GLib.idle_add(self._regenerate_plans)
+
     def add_entry(self, filepath: str, width: int, height: int, overlap_with_previous: int):
         logging.info(f"主线程: 收到添加请求: {filepath}, h={height}, overlap={overlap_with_previous}")
         if not self.entries:
             self.image_width = width
-            self.total_virtual_height = height
-            self.y_positions = [0]
             self.entries.append({'filepath': filepath, 'height': height, 'overlap': 0})
-            logging.info(f"添加首张截图，当前总高: {self.total_virtual_height}")
         else:
             self.entries[-1]['overlap'] = overlap_with_previous
-            last_entry = self.entries[-1]
-            last_y_pos = self.y_positions[-1]
-            new_y_pos = last_y_pos + last_entry['height'] - overlap_with_previous
-            self.y_positions.append(new_y_pos)
             self.entries.append({'filepath': filepath, 'height': height, 'overlap': 0})
-            self.total_virtual_height = new_y_pos + height
-            logging.info(f"添加新截图，上一张重叠: {overlap_with_previous}px, 当前总高: {self.total_virtual_height}")
-        self.emit('model-updated')
+        logging.info(f"添加第 {len(self.entries)} 张截图, 上一张重叠: {overlap_with_previous}px")
+        GLib.idle_add(self._regenerate_plans)
 
     def pop_entry(self):
         if not self.entries:
             return
         logging.info("主线程: 收到移除最后一个条目的请求")
+        last_entry_index = len(self.entries) - 1
+        last_abs_piece = None
+        if self.absolute_plan and len(self.absolute_plan) > last_entry_index:
+            last_abs_piece = self.absolute_plan[last_entry_index]
+        elif self.absolute_plan:
+            logging.warning(f"pop_entry: absolute_plan (len {len(self.absolute_plan)}) 与 entries (len {len(self.entries)}) 不同步")
+        if last_abs_piece:
+            entry_abs_start = last_abs_piece['absolute_y_start']
+            entry_abs_end = last_abs_piece['absolute_y_start'] + last_abs_piece['height']
+            seam_index_to_remove = last_entry_index - 1
+            logging.info(f"正在清理与截图 {last_entry_index} (AbsY: [{entry_abs_start}, {entry_abs_end}], SeamIdx: {seam_index_to_remove}) 相关的修改")
+            new_modifications = []
+            removed_count = 0
+            for mod in self.modifications:
+                mod_applies = False
+                if mod['type'] == 'delete':
+                    mod_start = mod['y_start_abs']
+                    mod_end = mod['y_end_abs']
+                    if max(entry_abs_start, mod_start) < min(entry_abs_end, mod_end):
+                        mod_applies = True
+                        logging.info(f"删除操作 {mod} 与被删除截图重叠，将被移除")
+                elif mod['type'] == 'restore':
+                    if mod['seam_index'] == seam_index_to_remove:
+                         mod_applies = True
+                         logging.info(f"恢复操作 {mod} 与被删除截图相关，将被移除")
+                if mod_applies:
+                    removed_count += 1
+                else:
+                    new_modifications.append(mod)
+            if removed_count > 0:
+                self.modifications = new_modifications
+                logging.info(f"已移除 {removed_count} 个与被删除截图相关的修改")
+                if self.redo_stack:
+                    self.redo_stack.clear()
+                    logging.info("由于删除了截图，重做栈已清空")
+                GLib.idle_add(self.emit, 'modification-stack-changed')
         popped_entry = self.entries.pop()
-        self.y_positions.pop()
         if popped_entry['filepath'] in self.pixbuf_cache:
             del self.pixbuf_cache[popped_entry['filepath']]
             logging.info(f"从缓存中移除 {popped_entry['filepath']}")
@@ -1136,14 +1318,10 @@ class StitchModel(GObject.Object):
         if self.entries:
             self.entries[-1]['overlap'] = 0
             last_entry = self.entries[-1]
-            last_y_pos = self.y_positions[-1] if self.y_positions else 0
-            self.total_virtual_height = last_y_pos + last_entry['height']
-            logging.info(f"移除截图后，当前总高: {self.total_virtual_height}")
         else:
             self.image_width = 0
-            self.total_virtual_height = 0
             logging.info("所有截图已移除")
-        self.emit('model-updated')
+        GLib.idle_add(self._regenerate_plans)
 
 class CaptureSession:
     """管理一次滚动截图会话的数据和状态"""
@@ -1715,12 +1893,12 @@ class ActionController:
                                 if search_range > 0:
                                     logging.info(f"StitchWorker: 预测失败，执行全范围搜索 (max={search_range}px)...")
                                     found_overlap, score = _find_overlap_pyramid(img_top_np, img_new_np, search_range)
+                                    s_new = h_new - found_overlap
                                     QUALITY_THRESHOLD = 0.95
                                     bottom_check_height = config.MIN_SCROLL_PER_TICK
-                                    if score >= QUALITY_THRESHOLD and found_overlap >= config.MIN_SCROLL_PER_TICK:
+                                    if score >= QUALITY_THRESHOLD and s_new >= ticks_scrolled*config.MIN_SCROLL_PER_TICK:
                                         overlap = found_overlap
-                                        logging.info(f"StitchWorker: 计算重叠成功: {overlap}px, score={score:.3f}")
-                                        s_new = h_new - overlap
+                                        logging.info(f"StitchWorker: 计算重叠成功: 滚动距离{s_new}px, score={score:.3f}")
                                         is_stuck = False
                                         KNOWN_SCROLL_DEVIATION_LOW = 0.5
                                         KNOWN_SCROLL_DEVIATION_HIGH = 1.5
@@ -1739,7 +1917,7 @@ class ActionController:
                                         if s_new > 0 and s_new not in known_scroll_distances:
                                             result_queue.put(('LEARNED_SCROLL', s_new))
                                     else:
-                                        logging.warning(f"StitchWorker: 计算重叠失败 (score {score:.3f} < {QUALITY_THRESHOLD})")
+                                        logging.warning(f"StitchWorker: 计算重叠失败 (score={score:.3f}, s_new={s_new}px). 阈值未满足 (score>={QUALITY_THRESHOLD} and s_new>={ticks_scrolled*config.MIN_SCROLL_PER_TICK})")
                                         if auto_mode_context is not None:
                                             if ActionController._check_if_bottom_reached(img_top_np, img_new_np, bottom_check_height):
                                                 logging.info("StitchWorker: 检测到底部，发送 BOTTOM_REACHED 信号")
@@ -2062,12 +2240,16 @@ class ActionController:
              logging.info("检测到预览窗口仍然打开，正在销毁它...")
              GLib.idle_add(self.view.preview_window.destroy)
              self.view.preview_window = None
-        entries_snapshot = list(self.stitch_model.entries)
+        render_plan_snapshot = list(self.stitch_model.render_plan)
         image_width_snapshot = self.stitch_model.image_width
-        total_height_snapshot = self.stitch_model.total_virtual_height
+        if render_plan_snapshot:
+            last_piece = render_plan_snapshot[-1]
+            total_height_snapshot = last_piece['render_y_start'] + last_piece['height']
+        else:
+            total_height_snapshot = 0
         thread = threading.Thread(
             target=self._perform_final_stitch_and_save,
-            args=(processing_window, progress_bar, entries_snapshot, image_width_snapshot, total_height_snapshot),
+            args=(processing_window, progress_bar, render_plan_snapshot, image_width_snapshot, total_height_snapshot),
             daemon=True
         )
         thread.start()
@@ -2079,7 +2261,7 @@ class ActionController:
             self._perform_cleanup()
         return GLib.SOURCE_REMOVE
 
-    def _perform_final_stitch_and_save(self, processing_window, progress_bar, entries, image_width, total_height):
+    def _perform_final_stitch_and_save(self, processing_window, progress_bar, render_plan, image_width, total_height):
         """在后台线程中执行拼接和保存"""
         finalize_start_time = time.perf_counter()
         label_widget = None
@@ -2100,8 +2282,8 @@ class ActionController:
             copy_to_clipboard(path_to_copy)
             return GLib.SOURCE_REMOVE
         try:
-            if not entries:
-                logging.warning("Finalize BG: 传入的截图列表为空，退出处理")
+            if not render_plan:
+                logging.warning("传入的截图列表为空，退出处理")
                 return
             now = datetime.now()
             timestamp_str = now.strftime(config.FILENAME_TIMESTAMP_FORMAT)
@@ -2112,7 +2294,7 @@ class ActionController:
             output_file.parent.mkdir(parents=True, exist_ok=True)
             stitch_start_time = time.perf_counter()
             stitched_image = stitch_images_in_memory_from_model(
-                 entries=entries,
+                 render_plan=render_plan,
                  image_width=image_width,
                  total_height=total_height,
                  progress_callback=update_progress
@@ -2243,6 +2425,12 @@ class ActionController:
             return True
         elif is_match(config.HOTKEY_TOGGLE_GRID_MODE):
             self.grid_mode_controller.toggle()
+            return True
+        elif is_match(config.HOTKEY_TOGGLE_PREVIEW):
+            self.view.toggle_preview_window()
+            return True
+        elif is_match(config.HOTKEY_OPEN_CONFIG_EDITOR):
+            toggle_config_window()
             return True
         return False
 
@@ -2457,7 +2645,9 @@ class InfoPanel(Gtk.Box):
         if config.SHOW_TOTAL_DIMENSIONS:
             pango_attrs = "line_height='0.8'"
             if count > 0:
-                dim_markup = f"<span {pango_attrs}>{width}\nx\n{height}</span>"
+                width_int = int(round(width))
+                height_int = int(round(height))
+                dim_markup = f"<span {pango_attrs}>{width_int}\nx\n{height_int}</span>"
             else:
                 dim_markup = f"<span {pango_attrs}>宽\nx\n高</span>"
             self.label_dimensions.set_markup(dim_markup)
@@ -2610,6 +2800,7 @@ class ConfigWindow(Gtk.Window):
         self.connect("realize", self._on_realize)
         self.connect("delete-event", self._on_delete_event)
         self.connect("map-event", self._on_map_event)
+        self.is_destroyed = False
         self.log_queue = log_queue
         self.log_text_buffer = None
         self.log_timer_id = None
@@ -2650,6 +2841,7 @@ class ConfigWindow(Gtk.Window):
 
     def _on_destroy(self, widget):
         """窗口销毁时的清理操作"""
+        self.is_destroyed = True
         if self.log_timer_id:
             GLib.source_remove(self.log_timer_id)
             self.log_timer_id = None
@@ -2716,6 +2908,9 @@ class ConfigWindow(Gtk.Window):
 
     def _scroll_to_end_of_log(self):
         """将日志视图滚动到末尾"""
+        if self.is_destroyed:
+            logging.info("_scroll_to_end_of_log: 窗口已销毁，放弃滚动")
+            return False
         if self.log_text_buffer:
             end_iter = self.log_text_buffer.get_end_iter()
             self.log_textview.scroll_to_iter(end_iter, 0.0, True, 0.0, 1.0)
@@ -3450,7 +3645,7 @@ class ConfigWindow(Gtk.Window):
             label.set_tooltip_markup("在此处输入自定义 CSS 代码以调整组件外观")
             scrolled_css = Gtk.ScrolledWindow()
             scrolled_css.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-            scrolled_css.set_size_request(-1, 170)
+            scrolled_css.set_size_request(-1, 190)
             scrolled_css.set_margin_start(10)
             scrolled_css.set_margin_end(5)
             scrolled_css.set_margin_top(5)
@@ -4047,8 +4242,60 @@ class PreviewWindow(Gtk.Window):
         self.drag_start_y = 0
         self.drag_start_hadj_value = 0
         self.drag_start_vadj_value = 0
+        self.is_selection_mode = False
+        self.is_drawing_selection = False
+        self.is_resizing_selection = None
+        self.selection_absolute_start_y = None
+        self.selection_absolute_end_y = None
+        self.resize_handle_size = 10 # 边缘拖动手柄的像素容差
+        self.selection_autoscroll_timer = None
+        self.selection_autoscroll_direction = 0
+        self.AUTOSCROLL_BORDER_SIZE = 40
+        self.AUTOSCROLL_STEP = 20
+        self.AUTOSCROLL_INTERVAL = 50
+        self.initial_y_offset = 0
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(main_vbox)
+        top_button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        top_button_box.set_margin_top(0)
+        top_button_box.set_margin_bottom(0)
+        top_button_box.set_margin_start(4)
+        top_button_box.set_margin_end(4)
+        main_vbox.pack_start(top_button_box, False, False, 0)
+        top_button_box.set_halign(Gtk.Align.CENTER)
+        self.btn_start_selection = Gtk.Button(label="选择")
+        self.btn_start_selection.set_tooltip_text("选择区域")
+        self.btn_start_selection.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
+        self.btn_start_selection.connect("clicked", self._on_start_selection_mode)
+        self.btn_cancel_selection = Gtk.Button(label="取消")
+        self.btn_cancel_selection.set_tooltip_text("退出选择")
+        self.btn_cancel_selection.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
+        self.btn_cancel_selection.connect("clicked", self._on_cancel_selection_mode)
+        self.btn_cancel_selection.set_sensitive(False)
+        self.btn_delete_selection = Gtk.Button(label="删除")
+        self.btn_delete_selection.set_tooltip_text("删除选定区域（修复内容重复）")
+        self.btn_delete_selection.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
+        self.btn_delete_selection.connect("clicked", self._on_delete_clicked)
+        self.btn_delete_selection.set_sensitive(False)
+        self.btn_restore_selection = Gtk.Button(label="恢复")
+        self.btn_restore_selection.set_tooltip_text("恢复选定区域内的接缝（修复内容缺失）")
+        self.btn_restore_selection.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
+        self.btn_restore_selection.connect("clicked", self._on_restore_clicked)
+        self.btn_undo_mod = Gtk.Button.new_from_icon_name("edit-undo-symbolic", Gtk.IconSize.BUTTON)
+        self.btn_undo_mod.set_tooltip_text("撤销上一步编辑 (删除/恢复)")
+        self.btn_undo_mod.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
+        self.btn_undo_mod.connect("clicked", self._on_undo_mod_clicked)
+        self.btn_redo_mod = Gtk.Button.new_from_icon_name("edit-redo-symbolic", Gtk.IconSize.BUTTON)
+        self.btn_redo_mod.set_tooltip_text("重做上一步编辑 (删除/恢复)")
+        self.btn_redo_mod.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
+        self.btn_redo_mod.connect("clicked", self._on_redo_mod_clicked)
+        top_button_box.pack_start(self.btn_start_selection, False, False, 0)
+        top_button_box.pack_start(self.btn_cancel_selection, False, False, 0)
+        top_button_box.pack_start(self.btn_delete_selection, False, False, 0)
+        top_button_box.pack_start(self.btn_restore_selection, False, False, 0)
+        top_button_box.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL, margin=4), False, False, 0)
+        top_button_box.pack_start(self.btn_undo_mod, False, False, 0)
+        top_button_box.pack_start(self.btn_redo_mod, False, False, 0)
         # 创建 ScrolledWindow 和 DrawingArea
         self.scrolled_window = Gtk.ScrolledWindow()
         self.scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -4092,6 +4339,7 @@ class PreviewWindow(Gtk.Window):
         self.zoom_label.set_margin_start(5)
         button_hbox.pack_start(self.zoom_label, False, False, 0)
         self.model_update_handler_id = self.model.connect("model-updated", self.on_model_updated)
+        self.model_mod_handler_id = self.model.connect('modification-stack-changed', self._on_modification_stack_changed)
         self.connect("destroy", self._on_preview_window_destroy)
         v_adj = self.scrolled_window.get_vadjustment()
         if v_adj:
@@ -4124,16 +4372,30 @@ class PreviewWindow(Gtk.Window):
                 self.model_update_handler_id = None
             except Exception as e:
                 logging.warning(f"{e}")
+        if self.model and self.model_mod_handler_id:
+            try:
+                self.model.disconnect(self.model_mod_handler_id)
+                self.model_mod_handler_id = None
+            except Exception as e:
+                logging.warning(f"{e}")
+        if self.selection_autoscroll_timer:
+            GLib.source_remove(self.selection_autoscroll_timer)
+            self.selection_autoscroll_timer = None
 
     def _setup_cursors(self):
         """获取并存储拖动所需的光标"""
         display = Gdk.Display.get_default()
-        self.cursor_default = None
-        self.cursor_grab = Gdk.Cursor.new_from_name(display, "grab")
-        self.cursor_grabbing = Gdk.Cursor.new_from_name(display, "grabbing")
+        self.cursors = {
+            'default': None,
+            'grab': Gdk.Cursor.new_from_name(display, "grab"),
+            'grabbing': Gdk.Cursor.new_from_name(display, "grabbing"),
+            'crosshair': Gdk.Cursor.new_from_name(display, "crosshair"),
+            'n-resize': Gdk.Cursor.new_from_name(display, "n-resize"),
+            's-resize': Gdk.Cursor.new_from_name(display, "s-resize"),
+        }
 
     def _on_key_press(self, widget, event):
-        """处理预览窗口的按键事件，用于缩放"""
+        """处理预览窗口的按键事件"""
         keyval = event.keyval
         state = event.state & self.config.GTK_MODIFIER_MASK
         def is_match(hotkey_config):
@@ -4144,7 +4406,7 @@ class PreviewWindow(Gtk.Window):
         elif is_match(self.config.HOTKEY_PREVIEW_ZOOM_OUT):
             self._zoom_out()
             return True
-        return False
+        return self.parent_overlay.controller.handle_key_press(event)
 
     def _zoom_in(self, button=None):
         current_base_zoom = self.zoom_level if self.manual_zoom_active else self.effective_scale_factor
@@ -4188,6 +4450,9 @@ class PreviewWindow(Gtk.Window):
 
     def on_model_updated(self, model_instance):
         logging.info("预览窗口收到模型更新信号，准备更新尺寸并重绘")
+        if self.model.capture_count == 0 and self.is_selection_mode:
+            logging.info("预览窗口：模型已空，自动退出选择模式")
+            self._on_cancel_selection_mode(None)
         v_adj = self.scrolled_window.get_vadjustment()
         old_upper = v_adj.get_upper()
         should_scroll_now = False
@@ -4209,8 +4474,18 @@ class PreviewWindow(Gtk.Window):
         v_adj.set_value(max(v_adj.get_lower(), target_value))
 
     def _update_button_sensitivity(self, adjustment=None):
+        y1_abs, y2_abs = self._get_selection_absolute_bounds()
+        has_valid_selection = y1_abs is not None and y2_abs is not None and abs(y1_abs - y2_abs) > 1e-5
+        has_captures = self.model.capture_count > 0
+        self.btn_start_selection.set_sensitive(has_captures and (not self.is_selection_mode))
+        self.btn_cancel_selection.set_sensitive(has_captures and self.is_selection_mode)
+        self.btn_delete_selection.set_sensitive(has_captures and self.is_selection_mode and has_valid_selection)
+        self.btn_restore_selection.set_sensitive(has_captures and self.is_selection_mode and has_valid_selection)
+
+        self.btn_undo_mod.set_sensitive(has_captures and len(self.model.modifications) > 0)
+        self.btn_redo_mod.set_sensitive(has_captures and len(self.model.redo_stack) > 0)
         v_adj = self.scrolled_window.get_vadjustment()
-        can_scroll = v_adj.get_upper() > v_adj.get_page_size() + 1
+        can_scroll = v_adj and (v_adj.get_upper() > v_adj.get_page_size() + 1)
         self.btn_scroll_top.set_sensitive(can_scroll)
         self.btn_scroll_bottom.set_sensitive(can_scroll)
         self.btn_zoom_in.set_sensitive(self.zoom_level < self.MAX_ZOOM)
@@ -4247,6 +4522,8 @@ class PreviewWindow(Gtk.Window):
             self.drawing_area_height = math.ceil(virtual_height * self.effective_scale_factor)
             self.center_vertically = self.drawing_area_height < viewport_height
             self.display_total_height = self.drawing_area_height
+        self.initial_y_offset = (viewport_height - self.drawing_area_height) / 2 if self.center_vertically else 0
+        self.initial_y_offset = max(0, self.initial_y_offset)
         GLib.idle_add(self._update_zoom_label)
         self.drawing_area.set_size_request(self.drawing_area_width, self.drawing_area_height)
         self.drawing_area.queue_draw()
@@ -4257,6 +4534,8 @@ class PreviewWindow(Gtk.Window):
     def _scroll_to_bottom_if_needed(self):
         """检查并滚动到 Adjustment 的底部"""
         v_adj = self.scrolled_window.get_vadjustment()
+        if not v_adj:
+             return GLib.SOURCE_REMOVE
         new_upper = v_adj.get_upper()
         page_size = v_adj.get_page_size()
         if new_upper > page_size:
@@ -4276,13 +4555,175 @@ class PreviewWindow(Gtk.Window):
         elif not self.was_at_bottom and is_now_at_bottom:
              self.was_at_bottom = True
 
+    def _drawing_y_to_render_y(self, drawing_y):
+        if self.effective_scale_factor == 0: return 0
+        return (drawing_y - self.initial_y_offset) / self.effective_scale_factor
+
+    def _absolute_y_to_render_y(self, absolute_y):
+        if not self.model.render_plan:
+            return absolute_y
+        for piece in self.model.render_plan:
+            if piece['absolute_y_start'] <= absolute_y < piece['absolute_y_end']:
+                offset = absolute_y - piece['absolute_y_start']
+                return piece['render_y_start'] + offset
+        for piece in self.model.render_plan:
+            if piece['absolute_y_start'] > absolute_y:
+                return piece['render_y_start']
+        if self.model.render_plan:
+            last = self.model.render_plan[-1]
+            return last['render_y_start'] + last['height']
+        return 0
+
+    def _render_y_to_absolute_y(self, render_y):
+        if not self.model.render_plan:
+            return render_y
+        piece_render_y_starts = [p['render_y_start'] for p in self.model.render_plan]
+        index = bisect.bisect_right(piece_render_y_starts, render_y) - 1
+        index = max(0, index)
+        if index >= len(self.model.render_plan):
+            if self.model.render_plan:
+                last_piece = self.model.render_plan[-1]
+                offset = render_y - last_piece['render_y_start']
+                return last_piece['absolute_y_start'] + offset
+            else:
+                return render_y
+        piece = self.model.render_plan[index]
+        if render_y >= piece['render_y_start'] + piece['height']:
+            if index + 1 < len(self.model.render_plan):
+                next_piece = self.model.render_plan[index + 1]
+                return next_piece['absolute_y_start']
+            else:
+                return piece['absolute_y_end']
+        offset_in_render_piece = render_y - piece['render_y_start']
+        absolute_y = piece['absolute_y_start'] + offset_in_render_piece
+        return absolute_y
+
+    def _get_selection_absolute_bounds(self):
+        if self.selection_absolute_start_y is None or self.selection_absolute_end_y is None:
+            return None, None
+        y1_model = min(self.selection_absolute_start_y, self.selection_absolute_end_y)
+        y2_model = max(self.selection_absolute_start_y, self.selection_absolute_end_y)
+        return y1_model, y2_model
+
+    def _get_hovered_resize_handle(self, y):
+        render_plan_y_at_mouse = self._drawing_y_to_render_y(y)
+        if self.is_drawing_selection or self.effective_scale_factor == 0:
+            return None
+        y_top_orig, y_bottom_orig = self._get_selection_absolute_bounds()
+        if y_top_orig is None:
+            return None
+        y_top_render = self._absolute_y_to_render_y(y_top_orig)
+        y_bottom_render = self._absolute_y_to_render_y(y_bottom_orig)
+        handle_size_render_space = self.resize_handle_size / self.effective_scale_factor
+        if abs(render_plan_y_at_mouse - y_top_render) < handle_size_render_space:
+            return 'top'
+        if abs(render_plan_y_at_mouse - y_bottom_render) < handle_size_render_space:
+            return 'bottom'
+        return None
+
+    def _on_start_selection_mode(self, button):
+        if self.is_selection_mode:
+            return
+        self.is_selection_mode = True
+        if self.is_dragging:
+            self.is_dragging = False
+            self.drawing_area.get_window().set_cursor(self.cursors['default'])
+        self.drawing_area.get_window().set_cursor(self.cursors['crosshair'])
+        self._update_button_sensitivity()
+        self.drawing_area.queue_draw()
+
+    def _on_cancel_selection_mode(self, button):
+        if not self.is_selection_mode:
+            return
+        self.is_selection_mode = False
+        self.selection_absolute_start_y = None
+        self.selection_absolute_end_y = None
+        self.is_drawing_selection = False
+        self.is_resizing_selection = None
+        if self.selection_autoscroll_timer:
+            GLib.source_remove(self.selection_autoscroll_timer)
+            self.selection_autoscroll_timer = None
+        self.selection_autoscroll_direction = 0
+        self.drawing_area.get_window().set_cursor(self.cursors['default'])
+        self._update_button_sensitivity()
+        self.drawing_area.queue_draw()
+
+    def _on_delete_clicked(self, button):
+        """处理删除按钮点击事件"""
+        y1_abs, y2_abs = self._get_selection_absolute_bounds()
+        if y1_abs is None or y2_abs is None or abs(y1_abs - y2_abs) < 1e-5:
+            logging.warning("_on_delete_clicked: 选区无效，不执行任何操作")
+            return
+        mod = {
+            'type': 'delete',
+            'y_start_abs': min(y1_abs, y2_abs),
+            'y_end_abs': max(y1_abs, y2_abs)
+        }
+        if self.model.modifications and self.model.modifications[-1] == mod:
+            logging.info("StitchModel: 跳过添加重复的 'delete' 修改")
+            return
+        self.model.add_modification(mod)
+        self.drawing_area.queue_draw()
+
+    def _on_restore_clicked(self, button):
+        """处理恢复按钮点击事件"""
+        y1_abs, y2_abs = self._get_selection_absolute_bounds()
+        if y1_abs is None or y2_abs is None or abs(y1_abs - y2_abs) < 1e-5:
+            logging.warning("_on_restore_clicked: 选区无效，不执行任何操作")
+            return
+        selection_start_abs = min(y1_abs, y2_abs)
+        selection_end_abs = max(y1_abs, y2_abs)
+        mods_added = 0
+        restored_seams_indices = {mod['seam_index'] for mod in self.model.modifications if mod['type'] == 'restore'}
+        for i, abs_piece in enumerate(self.model.absolute_plan[:-1]):
+            original_overlap = abs_piece['overlap_with_next']
+            if original_overlap == 0:
+                continue
+            next_piece = self.model.absolute_plan[i+1]
+            seam_start_abs = next_piece['absolute_y_start']
+            seam_end_abs = next_piece['absolute_y_start'] + original_overlap
+            if (seam_start_abs >= selection_start_abs) and (seam_start_abs < selection_end_abs):
+                if i in restored_seams_indices:
+                    logging.info(f"接缝 {i} (a-y {seam_start_abs:.0f}) 已被恢复，跳过重复添加。")
+                    continue
+                seam_deleted = False
+                for mod in self.model.modifications:
+                    if mod['type'] == 'delete':
+                        if mod['y_start_abs'] <= seam_start_abs and mod['y_end_abs'] > seam_start_abs:
+                            seam_deleted = True
+                            break
+                if seam_deleted:
+                    logging.info(f"接缝 {i} (a-y {seam_start_abs:.0f}) 在选区内，但已被删除，跳过恢复。")
+                    continue
+                logging.info(f"选区 ({selection_start_abs:.0f}, {selection_end_abs:.0f}) 触碰了接缝 {i} (a-y {seam_start_abs:.0f})。添加恢复修改。")
+                mod = {
+                    'type': 'restore',
+                    'seam_index': i,
+                    'original_overlap': original_overlap
+                }
+                self.model.add_modification(mod)
+                mods_added += 1
+        if mods_added > 0:
+            logging.info(f"已为 {mods_added} 个接缝添加了恢复操作")
+        else:
+            logging.info("选区内未发现可恢复的接缝")
+
+    def _on_undo_mod_clicked(self, button):
+        self.model.undo()
+
+    def _on_redo_mod_clicked(self, button):
+        self.model.redo()
+
+    def _on_modification_stack_changed(self, model):
+        self._update_button_sensitivity()
+
     def on_draw(self, widget, cr):
          """绘制 DrawingArea 的内容"""
          widget_width = widget.get_allocated_width()
          widget_height = widget.get_allocated_height()
          cr.set_source_rgb(0.1, 0.1, 0.1)
          cr.paint()
-         if not self.model.entries:
+         if not self.model.render_plan:
              cr.set_source_rgb(0.8, 0.8, 0.8)
              layout = PangoCairo.create_layout(cr)
              font_desc = Pango.FontDescription("Sans 24")
@@ -4298,43 +4739,153 @@ class PreviewWindow(Gtk.Window):
          draw_area_w = self.drawing_area_width
          draw_area_h = self.drawing_area_height
          draw_x_offset = (widget_width - draw_area_w) / 2 if widget_width > draw_area_w else 0
-         initial_y_offset = (widget_height - draw_area_h) / 2 if self.center_vertically else 0
-         initial_y_offset = max(0, initial_y_offset)
+         draw_y_offset = (widget_height - draw_area_h) / 2 if self.center_vertically else 0
+         draw_y_offset = max(0, draw_y_offset)
+         cr.translate(draw_x_offset, draw_y_offset)
+         cr.scale(scale_factor, scale_factor)
          clip_x1, visible_y1_widget, clip_x2, visible_y2_widget = cr.clip_extents()
-         visible_y1_draw = visible_y1_widget - initial_y_offset
-         visible_y2_draw = visible_y2_widget - initial_y_offset
-         scaled_y_positions = [y * scale_factor for y in self.model.y_positions]
-         first_index = max(0, bisect.bisect_right(scaled_y_positions, visible_y1_draw) - 1)
+         visible_y1_model, visible_y2_model = cr.clip_extents()[1::2]
+         model_y_positions = [p['render_y_start'] for p in self.model.render_plan]
+         first_index = max(0, bisect.bisect_right(model_y_positions, visible_y1_model) - 1)
          drawn_count = 0
-         for i in range(first_index, len(self.model.entries)):
-             entry = self.model.entries[i]
-             filepath = entry.get('filepath')
-             original_h = entry.get('height', 0)
-             scaled_y_pos = scaled_y_positions[i]
-             scaled_h = original_h * scale_factor
-             if scaled_y_pos >= visible_y2_draw:
+         for i in range(first_index, len(self.model.render_plan)):
+             piece = self.model.render_plan[i]
+             filepath = piece.get('filepath')
+             src_y = piece.get('src_y', 0)
+             src_height = piece.get('height', 0)
+             dest_y = model_y_positions[i]
+             dest_h = src_height
+             if dest_y >= visible_y2_model:
                  break
-             if scaled_y_pos + scaled_h <= visible_y1_draw:
+             if dest_y + dest_h <= visible_y1_model:
                  continue
              pixbuf = self.model._get_cached_pixbuf(filepath)
              if not pixbuf:
                  logging.error(f"无法为 {Path(filepath).name} 获取 Pixbuf")
                  continue
+             original_width = pixbuf.get_width()
              try:
                  cr.save()
-                 cr.translate(draw_x_offset, scaled_y_pos + initial_y_offset)
-                 cr.scale(scale_factor, scale_factor)
-                 Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, 0)
+                 cr.translate(0, dest_y)
+                 Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, -src_y)
+                 cr.rectangle(0, 0, original_width, src_height)
+                 cr.clip()
                  cr.paint()
                  cr.restore()
                  drawn_count += 1
              except Exception as e:
-                 logging.error(f"绘制 Pixbuf {Path(filepath).name} 时出错: {e}")
+                 logging.error(f"绘制 Pixbuf {Path(filepath).name} (src_y={src_y}) 时出错: {e}")
                  try: cr.restore()
                  except cairo.Error: pass
+         # 如果在选择模式下，绘制蒙版和选框
+         if self.is_selection_mode:
+             cr.set_source_rgba(0.1, 0.1, 0.1, 0.6)
+             total_draw_y_start = 0
+             total_draw_height = self.model.total_virtual_height
+             total_draw_x_start = 0
+             total_draw_width = self.model.image_width
+             sel_y1_orig, sel_y2_orig = self._get_selection_absolute_bounds()
+             if sel_y1_orig is None:
+                  cr.rectangle(total_draw_x_start, total_draw_y_start, total_draw_width, total_draw_height)
+                  cr.fill()
+             else:
+                 sel_y1_render = self._absolute_y_to_render_y(sel_y1_orig)
+                 sel_y2_render = self._absolute_y_to_render_y(sel_y2_orig)
+                 sel_h_render = abs(sel_y2_render - sel_y1_render)
+                 height_above = max(0, min(sel_y1_render, sel_y2_render) - total_draw_y_start)
+                 if height_above > 0.1:
+                     cr.rectangle(total_draw_x_start, total_draw_y_start, total_draw_width, height_above)
+                     cr.fill()
+                 height_below = max(0, (total_draw_y_start + total_draw_height) - max(sel_y1_render, sel_y2_render))
+                 if height_below > 0.1:
+                     cr.rectangle(total_draw_x_start, max(sel_y1_render, sel_y2_render), total_draw_width, height_below)
+                     cr.fill()
+                 if sel_h_render > 0.1:
+                     cr.set_line_width(2.0 / self.effective_scale_factor)
+                     if self.is_drawing_selection:
+                         cr.set_source_rgba(1.0, 1.0, 1.0, 0.9)
+                         cr.set_dash([6.0 / self.effective_scale_factor, 4.0 / self.effective_scale_factor])
+                     else:
+                         cr.set_source_rgba(0.9, 0.9, 0.9, 0.8)
+                         cr.set_dash([])
+                     cr.rectangle(total_draw_x_start, min(sel_y1_render, sel_y2_render), total_draw_width, sel_h_render)
+                     cr.stroke()
+                     cr.set_dash([])
+                 elif sel_h_render < 0.1 and not self.is_drawing_selection and not self.is_resizing_selection:
+                     cr.set_line_width(3.0 / self.effective_scale_factor)
+                     cr.set_source_rgba(1.0, 0.1, 0.1, 0.7)
+                     cr.set_dash([8.0 / self.effective_scale_factor, 6.0 / self.effective_scale_factor])
+                     seam_y_render = sel_y1_render
+                     cr.move_to(total_draw_x_start, seam_y_render)
+                     cr.line_to(total_draw_x_start + total_draw_width, seam_y_render)
+                     cr.stroke()
+                     cr.set_dash([])
+                 selection_start_abs = min(sel_y1_orig, sel_y2_orig)
+                 selection_end_abs = max(sel_y1_orig, sel_y2_orig)
+                 delete_regions = [
+                     (mod['y_start_abs'], mod['y_end_abs']) 
+                     for mod in self.model.modifications 
+                     if mod['type'] == 'delete'
+                 ]
+                 restored_seam_indices = {
+                     mod['seam_index'] 
+                     for mod in self.model.modifications 
+                     if mod['type'] == 'restore'
+                 }
+                 cr.set_line_width(3.0 / self.effective_scale_factor)
+                 cr.set_dash([8.0 / self.effective_scale_factor, 6.0 / self.effective_scale_factor])
+                 total_draw_width = self.model.image_width
+                 total_draw_x_start = 0
+                 for i, abs_piece in enumerate(self.model.absolute_plan[:-1]):
+                     seam_start_abs = self.model.absolute_plan[i+1]['absolute_y_start']
+                     if (seam_start_abs >= selection_start_abs) and (seam_start_abs < selection_end_abs):
+                         is_deleted = False
+                         for del_start, del_end in delete_regions:
+                             if del_start <= seam_start_abs < del_end:
+                                 is_deleted = True
+                                 break
+                         if is_deleted:
+                             continue
+                         original_overlap = abs_piece['overlap_with_next']
+                         is_restored = (i in restored_seam_indices)
+                         is_originally_seamless = (original_overlap <= 1e-5)
+                         if is_originally_seamless or is_restored:
+                             cr.set_source_rgba(0.7, 0.3, 0.8, 0.8) 
+                         else:
+                             cr.set_source_rgba(0.2, 0.5, 1.0, 0.8)
+                         seam_y_render = self._absolute_y_to_render_y(seam_start_abs)
+                         cr.move_to(total_draw_x_start, seam_y_render)
+                         cr.line_to(total_draw_x_start + total_draw_width, seam_y_render)
+                         cr.stroke()
+                 cr.set_dash([])
 
     def _on_drawing_area_button_press(self, widget, event):
         if event.button == 1:
+            if self.is_selection_mode:
+                render_plan_y = self._drawing_y_to_render_y(event.y)
+                absolute_model_y = self._render_y_to_absolute_y(render_plan_y)
+                handle = self._get_hovered_resize_handle(event.y)
+                if handle:
+                    self.is_resizing_selection = handle
+                    self.is_drawing_selection = False
+                    y1_abs, y2_abs = self._get_selection_absolute_bounds()
+                    if handle == 'top':
+                        self.selection_absolute_start_y = absolute_model_y
+                        self.selection_absolute_end_y = y2_abs
+                    else:
+                        self.selection_absolute_start_y = y1_abs
+                        self.selection_absolute_end_y = absolute_model_y
+                    cursor_name = 'n-resize' if handle == 'top' else 's-resize'
+                    self.drawing_area.get_window().set_cursor(self.cursors[cursor_name])
+                    logging.info(f"开始调整选区手柄: {handle}")
+                else:
+                    self.is_drawing_selection = True
+                    self.is_resizing_selection = None
+                    self.selection_absolute_start_y = absolute_model_y
+                    self.selection_absolute_end_y = absolute_model_y
+                    self.drawing_area.get_window().set_cursor(self.cursors['grabbing'])
+                    self.drawing_area.queue_draw()
+                return True
             hadj = self.scrolled_window.get_hadjustment()
             vadj = self.scrolled_window.get_vadjustment()
             can_scroll_h = hadj and hadj.get_upper() > hadj.get_page_size()
@@ -4345,11 +4896,79 @@ class PreviewWindow(Gtk.Window):
                 self.drag_start_y = event.y_root
                 self.drag_start_hadj_value = hadj.get_value() if hadj else 0
                 self.drag_start_vadj_value = vadj.get_value() if vadj else 0
-                self.get_window().set_cursor(self.cursor_grab)
+                self.drawing_area.get_window().set_cursor(self.cursors['grab'])
                 return True
         return False
 
+    def _check_and_trigger_autoscroll(self, event):
+        if not (self.is_drawing_selection or self.is_resizing_selection):
+            if self.selection_autoscroll_timer:
+                GLib.source_remove(self.selection_autoscroll_timer)
+                self.selection_autoscroll_timer = None
+            self.selection_autoscroll_direction = 0
+            return
+        vadj = self.scrolled_window.get_vadjustment()
+        if not vadj:
+            return
+        viewport_y = vadj.get_value()
+        viewport_h = vadj.get_page_size()
+        viewport_bottom = viewport_y + viewport_h
+        mouse_y_in_drawing_area = event.y 
+        trigger_border = self.AUTOSCROLL_BORDER_SIZE
+        new_scroll_direction = 0
+        if mouse_y_in_drawing_area < (viewport_y + trigger_border):
+            new_scroll_direction = -1
+        elif mouse_y_in_drawing_area > (viewport_bottom - trigger_border):
+            new_scroll_direction = 1
+        if new_scroll_direction != self.selection_autoscroll_direction:
+            if self.selection_autoscroll_timer:
+                GLib.source_remove(self.selection_autoscroll_timer)
+                self.selection_autoscroll_timer = None
+            self.selection_autoscroll_direction = new_scroll_direction
+            if self.selection_autoscroll_direction != 0:
+                logging.info(f"开始自动滚动，方向: {self.selection_autoscroll_direction}")
+                self.selection_autoscroll_timer = GLib.timeout_add(
+                    self.AUTOSCROLL_INTERVAL, 
+                    self._auto_scroll_selection
+                )
+            else:
+                logging.info("鼠标移回中心，停止自动滚动")
+
     def _on_drawing_area_motion_notify(self, widget, event):
+        def get_clamped_y(raw_y):
+            y_offset = self.initial_y_offset
+            min_y = y_offset
+            max_y = y_offset + self.display_total_height
+            return max(min_y, min(raw_y, max_y))
+        if self.is_resizing_selection:
+            clamped_drawing_y = get_clamped_y(event.y)
+            render_plan_y = self._drawing_y_to_render_y(clamped_drawing_y)
+            absolute_model_y = self._render_y_to_absolute_y(render_plan_y)
+            if self.is_resizing_selection == 'top':
+                self.selection_absolute_start_y = absolute_model_y
+            else:
+                self.selection_absolute_end_y = absolute_model_y
+            self._check_and_trigger_autoscroll(event)
+            GLib.idle_add(self.drawing_area.queue_draw)
+            return True
+        if self.is_drawing_selection:
+            clamped_drawing_y = get_clamped_y(event.y)
+            render_plan_y = self._drawing_y_to_render_y(clamped_drawing_y)
+            absolute_model_y = self._render_y_to_absolute_y(render_plan_y)
+            if self.selection_absolute_end_y != absolute_model_y:
+                self.selection_absolute_end_y = absolute_model_y
+                self._check_and_trigger_autoscroll(event)
+                GLib.idle_add(self.drawing_area.queue_draw)
+            return True
+        if self.is_selection_mode:
+            handle = self._get_hovered_resize_handle(event.y)
+            if handle == 'top':
+                self.drawing_area.get_window().set_cursor(self.cursors['n-resize'])
+            elif handle == 'bottom':
+                self.drawing_area.get_window().set_cursor(self.cursors['s-resize'])
+            else:
+                self.drawing_area.get_window().set_cursor(self.cursors['crosshair'])
+            return True
         if self.is_dragging:
             hadj = self.scrolled_window.get_hadjustment()
             vadj = self.scrolled_window.get_vadjustment()
@@ -4368,16 +4987,84 @@ class PreviewWindow(Gtk.Window):
                 vadj.set_value(new_v_value_clamped)
             actual_h_after = hadj.get_value() if hadj else 0
             actual_v_after = vadj.get_value() if vadj else 0
-            self.get_window().set_cursor(self.cursor_grabbing)
+            self.drawing_area.get_window().set_cursor(self.cursors['grabbing'])
             return True
         return False
 
     def _on_drawing_area_button_release(self, widget, event):
-        if event.button == 1 and self.is_dragging:
-            self.is_dragging = False
-            self.get_window().set_cursor(self.cursor_default)
-            return True
+        if event.button == 1:
+            if self.selection_autoscroll_timer:
+                GLib.source_remove(self.selection_autoscroll_timer)
+                self.selection_autoscroll_timer = None
+                logging.info("鼠标释放，停止自动滚动")
+            self.selection_autoscroll_direction = 0
+            if self.is_drawing_selection:
+                self.is_drawing_selection = False
+                y1_abs, y2_abs = self._get_selection_absolute_bounds()
+                if y1_abs is not None and y2_abs is not None and abs(y1_abs - y2_abs) < 1e-5:
+                        self.selection_absolute_start_y = None
+                        self.selection_absolute_end_y = None
+                self.drawing_area.get_window().set_cursor(self.cursors['crosshair'])
+                self._update_button_sensitivity()
+                GLib.idle_add(self.drawing_area.queue_draw)
+                return True
+            if self.is_resizing_selection:
+                self.is_resizing_selection = None
+                self.drawing_area.get_window().set_cursor(self.cursors['crosshair'])
+                self._update_button_sensitivity()
+                GLib.idle_add(self.drawing_area.queue_draw)
+                return True
+            if self.is_dragging:
+                self.is_dragging = False
+                self.drawing_area.get_window().set_cursor(self.cursors['default'])
+                return True
         return False
+
+    def _auto_scroll_selection(self):
+        """定时器回调，用于在选择时自动滚动视口"""
+        if not (self.is_drawing_selection or self.is_resizing_selection):
+            self.selection_autoscroll_timer = None
+            self.selection_autoscroll_direction = 0
+            logging.warning("_auto_scroll_selection 触发，但已不在选择/调整大小状态")
+            return False
+        if self.selection_autoscroll_direction == 0:
+            self.selection_autoscroll_timer = None
+            logging.warning("_auto_scroll_selection 触发，但滚动方向为 0")
+            return False
+        vadj = self.scrolled_window.get_vadjustment()
+        current_value = vadj.get_value()
+        step = self.AUTOSCROLL_STEP * self.selection_autoscroll_direction
+        new_value = current_value + step
+        lower = vadj.get_lower()
+        upper = vadj.get_upper() - vadj.get_page_size()
+        if new_value < lower:
+            new_value_clamped = lower
+        elif new_value > upper:
+            new_value_clamped = upper
+        else:
+            new_value_clamped = new_value
+        actual_scroll_amount_drawing = new_value_clamped - current_value
+        if abs(actual_scroll_amount_drawing) > 1e-3:
+            vadj.set_value(new_value_clamped)
+            new_drawing_y = 0
+            if self.is_drawing_selection or self.is_resizing_selection == 'bottom':
+                new_drawing_y = vadj.get_value() + vadj.get_page_size() - self.AUTOSCROLL_BORDER_SIZE
+            elif self.is_resizing_selection == 'top':
+                new_drawing_y = vadj.get_value() + self.AUTOSCROLL_BORDER_SIZE
+            new_render_y = self._drawing_y_to_render_y(new_drawing_y)
+            new_absolute_y = self._render_y_to_absolute_y(new_render_y)
+ 
+            if self.is_resizing_selection == 'top' or (self.is_drawing_selection and self.selection_autoscroll_direction == -1):
+                self.selection_absolute_start_y = new_absolute_y
+            if self.is_resizing_selection == 'bottom' or (self.is_drawing_selection and self.selection_autoscroll_direction == 1):
+                self.selection_absolute_end_y = new_absolute_y
+            self.drawing_area.queue_draw()
+        if abs(new_value_clamped - new_value) > 1e-3:
+            logging.info("自动滚动到达边缘，定时器停止")
+            self.selection_autoscroll_timer = None
+            self.selection_autoscroll_direction = 0
+            return False
+        return True
 
 class CaptureOverlay(Gtk.Window):
     def __init__(self, geometry_str, config: Config):
@@ -4385,6 +5072,7 @@ class CaptureOverlay(Gtk.Window):
         self.session = CaptureSession(geometry_str)
         self.controller = ActionController(self.session, self, config)
         self.preview_window = None
+        self.preview_window_last_geometry = None
         self.stitch_model = self.controller.stitch_model
         self.stitch_model.connect('model-updated', self.on_model_updated_ui)
         self.evdev_wheel_scroller = None
@@ -4571,6 +5259,7 @@ class CaptureOverlay(Gtk.Window):
         logging.info("预览窗口已被销毁")
         if self.preview_window == widget:
             self.preview_window = None
+            self.preview_window_last_geometry = None
 
     def show_quit_confirmation_dialog(self):
         """显示退出确认对话框并返回用户的响应"""
@@ -4668,17 +5357,36 @@ class CaptureOverlay(Gtk.Window):
                 logging.warning("toggle_preview_window: 预览窗口实例存在但 XID 为空，可能尚未 'realize'。回退到 show()")
                 self.preview_window.show()
                 return
-
             visibility_ratio = get_window_visibility(win_xid)
             is_visually_on_screen = visibility_ratio > 0.50
-
             if is_visually_on_screen:
                 logging.info(f"预览窗口可视 (可见度: {visibility_ratio*100:.1f}%)，正在隐藏...")
+                try:
+                    x, y = self.preview_window.get_position()
+                    w, h = self.preview_window.get_size()
+                    self.preview_window_last_geometry = (x, y, w, h)
+                    logging.info(f"存储预览窗口最后位置: {self.preview_window_last_geometry}")
+                except Exception as e:
+                    logging.warning(f"无法存储预览窗口位置: {e}")
+                    self.preview_window_last_geometry = None
                 self.preview_window.hide()
             else:
                 logging.info(f"预览窗口不可视 (可见度: {visibility_ratio*100:.1f}%)，正在显示并激活...")
-                self.preview_window.show()
-                GLib.idle_add(activate_window_with_xlib, win_xid)
+                def restore_and_show():
+                    if not self.preview_window or self.preview_window.xid != win_xid:
+                        return False
+                    if self.preview_window_last_geometry:
+                        x, y, w, h = self.preview_window_last_geometry
+                        logging.info(f"恢复预览窗口到最后位置: ({x}, {y}) 尺寸 ({w} x {h})")
+                        self.preview_window.resize(w, h)
+                        self.preview_window.move(x, y)
+                        self.preview_window.show()
+                        GLib.idle_add(activate_window_with_xlib, win_xid)
+                    else:
+                        logging.info("没有存储的预览窗口位置，将重新计算位置。")
+                        self._position_and_show_preview()
+                    return False
+                GLib.idle_add(restore_and_show)
 
     def on_dialog_key_press(self, widget, event):
         """处理确认对话框的按键事件"""
@@ -5281,7 +5989,7 @@ def check_dependencies():
         logging.warning("\n建议安装以获得完整体验")
 
 def main():
-    parser = argparse.ArgumentParser(description="一个辅助滚动截图并拼接的工具")
+    parser = argparse.ArgumentParser(description="一个自动/辅助式长截图工具")
     parser.add_argument(
         '-c', '--config',
         type=Path,
