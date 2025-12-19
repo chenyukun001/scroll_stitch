@@ -444,7 +444,7 @@ X11:
 pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
 ```
 
-X11:
+Wayland:
 
 ```shell
 pip install 'Pillow>=3.0.0' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'

@@ -72,7 +72,6 @@ WINDOW_MANAGER = None
 FRAME_GRABBER = None
 GLOBAL_OVERLAY = None
 hotkey_listener = None
-config_window_instance = None
 are_hotkeys_enabled = True
 log_queue = None
 
@@ -411,7 +410,7 @@ temp_directory_base = /tmp/scroll_stitch_{pid}
 grid_matching_max_overlap = 20
 free_scroll_matching_max_overlap = 200
 auto_scroll_ticks_per_step = 2
-max_scroll_per_tick = 170
+max_scroll_per_tick = 230
 min_scroll_per_tick = 30
 max_viewer_dimension = 32767
 preview_drag_sensitivity = 2.0
@@ -1281,7 +1280,7 @@ class X11WindowManager(WindowManagerBase):
         window.set_decorated(False)
         window.set_keep_above(True)
         window.set_app_paintable(True)
-        window.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        window.set_type_hint(Gdk.WindowTypeHint.NORMAL)
         window.set_skip_taskbar_hint(True)
         window.set_skip_pager_hint(True)
         visual = window.get_screen().get_rgba_visual()
@@ -1427,177 +1426,6 @@ def copy_to_clipboard(image_path: Path) -> bool:
         copy_duration = time.perf_counter() - copy_start_time
         logging.error(f"使用 GTK 复制到剪贴板失败: {e}，耗时: {copy_duration:.3f} 秒")
         return False
-
-def activate_window_with_xlib(xid):
-    if not xid:
-        logging.warning("无法激活窗口：XID 不可用")
-    disp = None
-    try:
-        disp = display.Display()
-        root = disp.screen().root
-        window_obj = disp.create_resource_object('window', xid)
-        if not window_obj:
-            logging.error(f"无法为 XID {xid} 创建资源对象，窗口可能不存在。")
-        active_window_atom = disp.intern_atom('_NET_ACTIVE_WINDOW')
-        event = protocol.event.ClientMessage(
-            window=window_obj,
-            client_type=active_window_atom,
-            data=(32, [2, X.CurrentTime, xid, 0, 0])
-        )
-        mask = (X.SubstructureRedirectMask | X.SubstructureNotifyMask)
-        root.send_event(event, event_mask=mask)
-        disp.sync()
-        logging.info(f"已通过 python-xlib 成功请求激活窗口 XID {xid}")
-    except Exception as e:
-        logging.error(f"使用 python-xlib 激活窗口 {xid} 失败: {e}")
-    finally:
-        if disp:
-            disp.close()
-    return False
-
-def get_window_visibility(target_xid):
-    """检查指定 XID 窗口的可见性，返回一个可见比例 (0.0 = 完全不可见, 1.0 = 基本完全可见)"""
-    # 缓冲区px全局坐标
-    if not target_xid:
-        return 0.0
-    disp = None
-    try:
-        disp = display.Display()
-        root = disp.screen().root
-        target_window = disp.create_resource_object('window', target_xid)
-        if not target_window:
-            logging.warning(f"get_window_visibility: 无法为 XID {target_xid} 创建资源对象。")
-            return 0.0
-        # 1. 检查窗口是否映射状态和未最小化
-        try:
-            attrs = target_window.get_attributes()
-            if attrs.map_state != X.IsViewable:
-                logging.info(f"get_window_visibility: 窗口 {target_xid} 未映射 (map_state != IsViewable)。")
-                return 0.0
-            state_atom = disp.intern_atom('_NET_WM_STATE')
-            hidden_atom = disp.intern_atom('_NET_WM_STATE_HIDDEN')
-            state_prop = target_window.get_full_property(state_atom, X.AnyPropertyType)
-            if state_prop and state_prop.value and hidden_atom in state_prop.value:
-                logging.info(f"get_window_visibility: 窗口 {target_xid} 处于 'hidden' (最小化) 状态。")
-                return 0.0
-        except Exception as e:
-            logging.warning(f"get_window_visibility: 检查窗口状态时出错: {e}")
-            return 0.0
-        # 2. 检查窗口是否在当前桌面上
-        try:
-            current_desktop_atom = disp.intern_atom('_NET_CURRENT_DESKTOP')
-            prop = root.get_full_property(current_desktop_atom, X.AnyPropertyType)
-            current_desktop = prop.value[0] if (prop and prop.value) else 0
-            window_desktop_atom = disp.intern_atom('_NET_WM_DESKTOP')
-            prop = target_window.get_full_property(window_desktop_atom, X.AnyPropertyType)
-            window_desktop = prop.value[0] if (prop and prop.value) else 0
-            if window_desktop != 0xFFFFFFFF and window_desktop != -1 and window_desktop != current_desktop:
-                logging.info(f"get_window_visibility: 窗口 {target_xid} 不在当前桌面 ({current_desktop}) 上。")
-                return 0.0
-        except Exception as e:
-            logging.warning(f"get_window_visibility: 检查桌面时出错: {e}")
-        # 3. 获取目标窗口的完整几何信息 (包括边框)
-        target_wm_class = None
-        try:
-            target_wm_class = target_window.get_wm_class()
-        except Exception:
-            pass
-        try:
-            geom = target_window.get_geometry()
-            translated = root.translate_coords(target_window, 0, 0)
-            client_x = translated.x
-            client_y = translated.y
-            extents_atom = disp.intern_atom('_NET_FRAME_EXTENTS')
-            prop = target_window.get_full_property(extents_atom, X.AnyPropertyType)
-            extents = tuple(prop.value[:4]) if (prop and prop.value and len(prop.value) >= 4) else (0, 0, 0, 0)
-            x1 = client_x - extents[0]
-            y1 = client_y - extents[2]
-            width = geom.width + extents[0] + extents[1]
-            height = geom.height + extents[2] + extents[3]
-            target_rect = (x1, y1, x1 + width, y1 + height)
-            target_area = width * height
-            if target_area <= 0:
-                logging.info(f"get_window_visibility: 窗口 {target_xid} 面积为 0。")
-                return 0.0
-        except Exception as e:
-            logging.error(f"get_window_visibility: 获取窗口几何信息失败: {e}")
-            return 0.0
-        # 4. 获取堆叠顺序中在目标窗口之上的所有窗口
-        try:
-            stacking_atom = disp.intern_atom('_NET_CLIENT_LIST_STACKING')
-            prop = root.get_full_property(stacking_atom, X.AnyPropertyType)
-            if prop and prop.value:
-                stacked_window_ids = prop.value
-            else:
-                stacked_window_ids = [win.id for win in root.query_tree().children]
-            target_index = stacked_window_ids.index(target_xid)
-            windows_above_ids = stacked_window_ids[target_index + 1:]
-        except ValueError:
-            logging.warning(f"get_window_visibility: 窗口 {target_xid} 不在 _NET_CLIENT_LIST_STACKING 中。")
-            return 1.0
-        except Exception as e:
-            logging.error(f"get_window_visibility: 获取窗口堆叠顺序失败: {e}")
-            return 0.0
-        # 5. 计算遮挡
-        covering_rects = []
-        for wid in windows_above_ids:
-            try:
-                window = disp.create_resource_object('window', wid)
-                if not window: continue
-                if target_wm_class:
-                    try:
-                        wm_class = window.get_wm_class()
-                        if wm_class == target_wm_class:
-                            continue
-                    except Exception:
-                        pass
-                attrs = window.get_attributes()
-                if attrs.map_state != X.IsViewable: continue
-                state_prop = window.get_full_property(state_atom, X.AnyPropertyType)
-                if state_prop and state_prop.value and hidden_atom in state_prop.value: continue
-                prop = window.get_full_property(window_desktop_atom, X.AnyPropertyType)
-                win_desktop = prop.value[0] if (prop and prop.value) else 0
-                if win_desktop != 0xFFFFFFFF and win_desktop != -1 and win_desktop != current_desktop: continue
-                geom = window.get_geometry()
-                translated = root.translate_coords(window, 0, 0)
-                client_x = translated.x
-                client_y = translated.y
-                prop = window.get_full_property(extents_atom, X.AnyPropertyType)
-                extents = tuple(prop.value[:4]) if (prop and prop.value and len(prop.value) >= 4) else (0, 0, 0, 0)
-                cx1 = client_x - extents[0]
-                cy1 = client_y - extents[2]
-                cwidth = geom.width + extents[0] + extents[1]
-                cheight = geom.height + extents[2] + extents[3]
-                if cwidth > 0 and cheight > 0:
-                    covering_rects.append((cx1, cy1, cx1 + cwidth, cy1 + cheight))
-            except Exception:
-                continue
-        # 6. 使用容斥原理计算被覆盖面积
-        if not covering_rects:
-            logging.info(f"get_window_visibility: 窗口 {target_xid} 可见且未被遮挡。")
-            return 1.0
-        covered_area = 0
-        n = len(covering_rects)
-        for k in range(1, n + 1):
-            sign = (-1) ** (k - 1)
-            for combo in itertools.combinations(covering_rects, k):
-                all_rects = list(combo) + [target_rect]
-                # 计算交集
-                ix1 = max(r[0] for r in all_rects)
-                iy1 = max(r[1] for r in all_rects)
-                ix2 = min(r[2] for r in all_rects)
-                iy2 = min(r[3] for r in all_rects)
-                intersection_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-                covered_area += sign * intersection_area
-        visibility_ratio = max(0.0, 1.0 - covered_area / target_area)
-        logging.info(f"get_window_visibility: 窗口 {target_xid} 可见度: {visibility_ratio*100:.1f}%")
-        return visibility_ratio
-    except Exception as e:
-        logging.error(f"get_window_visibility 发生严重错误: {e}")
-        return 0.0
-    finally:
-        if disp:
-            disp.close()
 
 def create_feedback_panel(text, show_progress_bar=False):
     # 逻辑px
@@ -2556,6 +2384,25 @@ class ActionController:
         self.session = session
         self.view = view
         self.config = config
+        self.scroll_manager = ScrollManager(self.config, self.session, self.view)
+        self.grid_mode_controller = GridModeController(self.config, self.session, self.view)
+        self._hotkey_actions = [
+            (config.HOTKEY_CAPTURE, self.take_capture),
+            (config.HOTKEY_FINALIZE, self.finalize_and_quit),
+            (config.HOTKEY_UNDO, self.delete_last_capture),
+            (config.HOTKEY_CANCEL, self.quit_and_cleanup),
+            (config.HOTKEY_GRID_BACKWARD, lambda: self.handle_movement_action('up', source='hotkey')),
+            (config.HOTKEY_GRID_FORWARD, lambda: self.handle_movement_action('down', source='hotkey')),
+            (config.HOTKEY_AUTO_SCROLL_START, self.start_auto_scroll),
+            (config.HOTKEY_AUTO_SCROLL_STOP, self.stop_auto_scroll),
+            (config.HOTKEY_CONFIGURE_SCROLL_UNIT, self.grid_mode_controller.start_calibration),
+            (config.HOTKEY_TOGGLE_GRID_MODE, self.grid_mode_controller.toggle),
+            (config.HOTKEY_TOGGLE_PREVIEW, self.view.toggle_preview_panel),
+            (config.HOTKEY_OPEN_CONFIG_EDITOR, self.view.toggle_config_panel),
+            (config.HOTKEY_TOGGLE_INSTRUCTION_PANEL, self.view.toggle_instruction_panel),
+            (config.HOTKEY_PREVIEW_ZOOM_IN, lambda: self.view.preview_panel._zoom_in() if self.view.preview_panel and self.view.preview_panel.get_visible() else None),
+            (config.HOTKEY_PREVIEW_ZOOM_OUT, lambda: self.view.preview_panel._zoom_out() if self.view.preview_panel and self.view.preview_panel.get_visible() else None),
+        ]
         self.current_mode_str = "自由模式"
         self.final_notification = None
         self.is_exiting = False
@@ -2577,8 +2424,6 @@ class ActionController:
         self.drag_start_geometry = {}
         self.drag_start_x_rel = 0
         self.drag_start_y_rel = 0
-        self.scroll_manager = ScrollManager(self.config, self.session, self.view)
-        self.grid_mode_controller = GridModeController(self.config, self.session, self.view)
         self._capture_filename_counter = 0
         self.stitch_model = StitchModel()
         self.task_queue = queue.Queue()
@@ -3109,6 +2954,9 @@ class ActionController:
         if self.view.preview_panel and self.view.preview_panel.get_visible():
              logging.info("检测到预览面板已打开，正在隐藏它...")
              GLib.idle_add(self.view.preview_panel.hide)
+        if self.view.config_panel and self.view.config_panel.get_visible():
+             logging.info("检测到配置面板已打开，正在隐藏它...")
+             GLib.idle_add(self.view.config_panel.hide)
         render_plan_snapshot = list(self.stitch_model.render_plan)
         image_width_snapshot = self.stitch_model.image_width
         if render_plan_snapshot:
@@ -3276,11 +3124,6 @@ class ActionController:
         if self.scroll_manager.evdev_abs_mouse:
             self.scroll_manager.evdev_abs_mouse.close()
             logging.info("EvdevAbsoluteMouse 已关闭")
-        global config_window_instance
-        if config_window_instance:
-            logging.info("检测到配置窗口仍然打开，正在销毁它...")
-            config_window_instance.destroy()
-            config_window_instance = None
         if FRAME_GRABBER:
             FRAME_GRABBER.cleanup()
             logging.info("FrameGrabber 已清理")
@@ -3302,44 +3145,10 @@ class ActionController:
         state = event.state & config.GTK_MODIFIER_MASK
         def is_match(hotkey_config):
             return keyval in hotkey_config['gtk_keys'] and state == hotkey_config['gtk_mask']
-        if is_match(config.HOTKEY_CAPTURE):
-            self.take_capture()
-            return True
-        elif is_match(config.HOTKEY_FINALIZE):
-            self.finalize_and_quit()
-            return True
-        elif is_match(config.HOTKEY_CANCEL):
-            self.quit_and_cleanup()
-            return True
-        elif is_match(config.HOTKEY_UNDO):
-            self.delete_last_capture()
-            return True
-        elif is_match(config.HOTKEY_GRID_BACKWARD):
-            self.handle_movement_action('up')
-            return True
-        elif is_match(config.HOTKEY_GRID_FORWARD):
-            self.handle_movement_action('down')
-            return True
-        elif is_match(config.HOTKEY_AUTO_SCROLL_START):
-            self.start_auto_scroll()
-            return True
-        elif is_match(config.HOTKEY_AUTO_SCROLL_STOP):
-            self.stop_auto_scroll()
-        elif is_match(config.HOTKEY_CONFIGURE_SCROLL_UNIT):
-            self.grid_mode_controller.start_calibration()
-            return True
-        elif is_match(config.HOTKEY_TOGGLE_GRID_MODE):
-            self.grid_mode_controller.toggle()
-            return True
-        elif is_match(config.HOTKEY_TOGGLE_PREVIEW):
-            self.view.toggle_preview_panel()
-            return True
-        elif is_match(config.HOTKEY_OPEN_CONFIG_EDITOR):
-            toggle_config_window()
-            return True
-        elif is_match(config.HOTKEY_TOGGLE_INSTRUCTION_PANEL):
-            self.view.toggle_instruction_panel()
-            return True
+        for hotkey_config, action in self._hotkey_actions:
+            if is_match(hotkey_config):
+                action()
+                return True
         return False
 
     def handle_button_press(self, event):
@@ -3480,34 +3289,23 @@ class ButtonPanel(Gtk.Box):
     }
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=config.BUTTON_SPACING)
-        # 整格模式按钮
-        self.btn_grid_forward = Gtk.Button(label="前进")
-        self.btn_grid_backward = Gtk.Button(label="后退")
-        self.btn_grid_forward.connect("clicked", lambda w: self.emit('grid-forward-clicked'))
-        self.btn_grid_backward.connect("clicked", lambda w: self.emit('grid-backward-clicked'))
-        # 自动滚动按钮
-        self.btn_auto_start = Gtk.Button(label="开始")
-        self.btn_auto_stop = Gtk.Button(label="停止")
-        self.btn_auto_start.connect("clicked", lambda w: self.emit('auto-scroll-start-clicked'))
-        self.btn_auto_stop.connect("clicked", lambda w: self.emit('auto-scroll-stop-clicked'))
-        # 主操作按钮
-        self.btn_capture = Gtk.Button(label="截图")
-        self.btn_capture.connect("clicked", lambda w: self.emit('capture-clicked'))
-        self.btn_undo = Gtk.Button(label="撤销")
-        self.btn_undo.connect("clicked", lambda w: self.emit('undo-clicked'))
-        self.btn_finalize = Gtk.Button(label="完成")
-        self.btn_finalize.connect("clicked", lambda w: self.emit('finalize-clicked'))
-        self.btn_cancel = Gtk.Button(label="取消")
-        self.btn_cancel.connect("clicked", lambda w: self.emit('cancel-clicked'))
-        all_buttons = [
-            self.btn_grid_backward, self.btn_grid_forward,
-            self.btn_auto_start, self.btn_auto_stop,
-            self.btn_capture, self.btn_undo, self.btn_finalize, self.btn_cancel
+        buttons_data = [
+            ('btn_grid_forward', '前进', 'grid-forward-clicked'),
+            ('btn_grid_backward', '后退', 'grid-backward-clicked'),
+            ('btn_auto_start', '开始', 'auto-scroll-start-clicked'),
+            ('btn_auto_stop', '停止', 'auto-scroll-stop-clicked'),
+            ('btn_capture', '截图', 'capture-clicked'),
+            ('btn_undo', '撤销', 'undo-clicked'),
+            ('btn_finalize', '完成', 'finalize-clicked'),
+            ('btn_cancel', '取消', 'cancel-clicked')
         ]
-        for btn in all_buttons:
+        for attr_name, label, signal_name in buttons_data:
+            btn = Gtk.Button(label=label)
+            btn.connect("clicked", lambda w, s=signal_name: self.emit(s))
             btn.set_can_focus(False)
             btn.show()
             btn.get_style_context().add_class("force-active-style")
+            setattr(self, attr_name, btn)
         if config.ENABLE_GRID_ACTION_BUTTONS:
             self.btn_grid_backward.set_visible(False)
             self.btn_grid_forward.set_visible(False)
@@ -3640,7 +3438,7 @@ class FunctionPanel(Gtk.Box):
        self.btn_toggle_grid.connect("clicked", lambda w: self.emit('toggle-grid-mode-clicked'))
        self.btn_toggle_preview = Gtk.Button(label=f"预览面板")
        self.btn_toggle_preview.connect("clicked", lambda w: self.emit('toggle-preview-clicked'))
-       self.btn_open_config = Gtk.Button(label=f"配置窗口")
+       self.btn_open_config = Gtk.Button(label=f"配置面板")
        self.btn_open_config.connect("clicked", lambda w: self.emit('open-config-clicked'))
        self.btn_toggle_hotkeys = Gtk.Button(label=f"热键开关")
        self.btn_toggle_hotkeys.connect("clicked", lambda w: self.emit('toggle-hotkeys-clicked'))
@@ -3721,7 +3519,7 @@ class InstructionPanel(Gtk.Box):
             (config.str_grid_backward.upper(), "整格后退"),
             (config.str_configure_scroll_unit.upper(), "配置滚动单位"),
             (config.str_toggle_preview.upper(), "显隐预览面板"),
-            (config.str_open_config_editor.upper(), "显隐配置窗口"),
+            (config.str_open_config_editor.upper(), "显隐配置面板"),
             (config.str_toggle_hotkeys_enabled.upper(), "开关热键"),
             (config.str_preview_zoom_out.upper(), "放大预览面板"),
             (config.str_preview_zoom_in.upper(), "缩小预览面板"),
@@ -3758,11 +3556,378 @@ class StreamToLoggerRedirector:
     def flush(self):
         pass
 
-class ConfigWindow(Gtk.Window):
-    """完整的配置窗口，提供所有设置项的图形化编辑界面"""
+class SimulatedWindow(Gtk.EventBox):
+    """模拟窗口行为的基础组件，提供标题栏拖动、边缘调整大小、最大化和关闭功能"""
     # 逻辑px
-    def __init__(self, config_obj):
-        super().__init__(title="拼长图配置")
+    def __init__(self, parent_overlay, title="Window", css_class="simulated-window", resizable=True):
+        super().__init__()
+        self.parent_overlay = parent_overlay
+        self.is_maximized = False
+        self.resizable = resizable
+        # 窗口坐标
+        self.restore_geometry = None
+        self.RESIZE_BORDER = 6
+        self._dragging_panel = False
+        self._resizing_panel = False
+        self._resize_edge = None
+        self._drag_anchor_mouse = None
+        self._drag_anchor_panel_pos = None
+        self._resize_start_rect = None
+        self._resize_limit_w = 100
+        self._resize_limit_h = 50
+        self.user_has_moved = False
+        self.get_style_context().add_class(css_class)
+        self.main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.main_vbox.set_margin_top(self.RESIZE_BORDER)
+        self.main_vbox.set_margin_bottom(self.RESIZE_BORDER)
+        self.main_vbox.set_margin_start(self.RESIZE_BORDER)
+        self.main_vbox.set_margin_end(self.RESIZE_BORDER)
+        self.add(self.main_vbox)
+        self.header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.header_box.get_style_context().add_class("window-header")
+        self.main_vbox.pack_start(self.header_box, False, False, 0)
+        self.title_label = Gtk.Label(label=title)
+        self.title_label.get_style_context().add_class("window-title")
+        self.title_label.set_margin_bottom(0)
+        self.header_box.pack_start(self.title_label, True, True, 0)
+        self.maximize_btn = Gtk.Button.new_from_icon_name("window-maximize-symbolic", Gtk.IconSize.MENU)
+        self.maximize_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.maximize_btn.set_tooltip_text("最大化")
+        self.maximize_btn.set_can_focus(False)
+        self.maximize_btn.connect("clicked", self._toggle_maximize)
+        if self.resizable:
+            self.header_box.pack_start(self.maximize_btn, False, False, 0)
+        else:
+            self.maximize_btn.set_no_show_all(True)
+            self.maximize_btn.hide()
+        self.close_btn = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        self.close_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.close_btn.set_can_focus(False)
+        self.close_btn.connect("clicked", self.on_close_clicked)
+        self.header_box.pack_end(self.close_btn, False, False, 0)
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
+        self.connect("button-press-event", self._on_panel_press)
+        self.connect("button-release-event", self._on_panel_release)
+        self.connect("motion-notify-event", self._on_panel_motion)
+
+    def add_content(self, widget, expand=True, fill=True, padding=0):
+        self.main_vbox.pack_start(widget, expand, fill, padding)
+
+    def on_close_clicked(self, btn):
+        if self.is_maximized:
+            self._restore_panel()
+        self.user_has_moved = False
+        self.hide()
+
+    def _toggle_maximize(self, btn=None):
+        if self.is_maximized:
+            self._restore_panel()
+        else:
+            self._maximize_panel()
+
+    def _maximize_panel(self):
+        curr_x = self.parent_overlay.fixed_container.child_get_property(self, "x")
+        curr_y = self.parent_overlay.fixed_container.child_get_property(self, "y")
+        alloc = self.get_allocation()
+        self.restore_geometry = (curr_x, curr_y, alloc.width, alloc.height)
+        rect = self.parent_overlay.screen_rect
+        screen_w = rect.width if rect else self.parent_overlay.get_allocated_width()
+        screen_h = rect.height if rect else self.parent_overlay.get_allocated_height()
+        # 显示器坐标 -> 窗口坐标
+        valid_screen_w = screen_w - self.parent_overlay.monitor_offset_x
+        valid_screen_h = screen_h - self.parent_overlay.monitor_offset_y
+        self.set_size_request(valid_screen_w, valid_screen_h)
+        self.parent_overlay.fixed_container.move(self, 0, 0)
+        self.is_maximized = True
+        image = Gtk.Image.new_from_icon_name("window-restore-symbolic", Gtk.IconSize.MENU)
+        self.maximize_btn.set_image(image)
+        self.maximize_btn.set_tooltip_text("还原")
+        self.parent_overlay._update_input_shape()
+
+    def _restore_panel(self):
+        if not self.restore_geometry:
+            return
+        x, y, w, h = self.restore_geometry
+        self.set_size_request(w, h)
+        self.parent_overlay.fixed_container.move(self, x, y)
+        self.is_maximized = False
+        image = Gtk.Image.new_from_icon_name("window-maximize-symbolic", Gtk.IconSize.MENU)
+        self.maximize_btn.set_image(image)
+        self.maximize_btn.set_tooltip_text("最大化")
+        self.parent_overlay._update_input_shape()
+
+    def _get_panel_edge(self, x, y):
+        if not self.resizable:
+            return None
+        w = self.get_allocated_width()
+        h = self.get_allocated_height()
+        border = self.RESIZE_BORDER
+        on_top = y < border
+        on_bottom = y > h - border
+        on_left = x < border
+        on_right = x > w - border
+        edge = ''
+        if on_top: edge = 'top'
+        elif on_bottom: edge = 'bottom'
+        if on_left: edge += '-left' if edge else 'left'
+        elif on_right: edge += '-right' if edge else 'right'
+        return edge if edge else None
+
+    def _is_on_header(self, x, y):
+        if not self.header_box.get_visible(): return False
+        inner_x = x - self.RESIZE_BORDER
+        inner_y = y - self.RESIZE_BORDER
+        alloc = self.header_box.get_allocation()
+        if 0 <= inner_x <= alloc.width and 0 <= inner_y <= alloc.height:
+            return True
+        return False
+
+    def _is_over_header_buttons(self, x, y):
+        for btn in [self.maximize_btn, self.close_btn]:
+            if not btn.get_visible(): continue
+            coords = btn.translate_coordinates(self, 0, 0)
+            if coords is None: continue
+            wx, wy = coords
+            alloc = btn.get_allocation()
+            if wx <= x < wx + alloc.width and wy <= y < wy + alloc.height:
+                return True
+        return False
+
+    def _on_panel_press(self, widget, event):
+        if event.button == 1:
+            edge = self._get_panel_edge(event.x, event.y)
+            win_x, win_y = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
+            self._drag_anchor_mouse = (win_x, win_y)
+            curr_x = self.parent_overlay.fixed_container.child_get_property(self, "x")
+            curr_y = self.parent_overlay.fixed_container.child_get_property(self, "y")
+            if edge:
+                self._resizing_panel = True
+                self._resize_edge = edge
+                alloc = self.get_allocation()
+                self._resize_start_rect = (curr_x, curr_y, alloc.width, alloc.height)
+                min_req, _ = self.main_vbox.get_preferred_size()
+                self._resize_limit_w = min_req.width + 2 * self.RESIZE_BORDER
+                self._resize_limit_h = min_req.height + 2 * self.RESIZE_BORDER
+                self.user_has_moved = True
+                return True
+            elif self._is_on_header(event.x, event.y):
+                self._dragging_panel = True
+                self._drag_anchor_panel_pos = (curr_x, curr_y)
+                self.get_window().set_cursor(self.parent_overlay.cursors.get('grabbing'))
+                self.user_has_moved = True
+                return True
+        return False
+
+    def _on_panel_release(self, widget, event):
+        if event.button == 1:
+            if self._dragging_panel or self._resizing_panel:
+                self._dragging_panel = False
+                self._resizing_panel = False
+                self._resize_edge = None
+                self.get_window().set_cursor(None)
+                self.parent_overlay._update_input_shape()
+                self._on_panel_motion(widget, event)
+                return True
+        return False
+
+    def _on_panel_motion(self, widget, event):
+        if self._dragging_panel:
+            curr_win_x, curr_win_y = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
+            if self.is_maximized:
+                max_width = self.get_allocated_width()
+                mouse_ratio_x = event.x / max_width if max_width > 0 else 0.5
+                if self.restore_geometry:
+                    _, _, target_restored_w, _ = self.restore_geometry
+                self._restore_panel()
+                new_panel_x = int(curr_win_x - (target_restored_w * mouse_ratio_x))
+                new_panel_y = max(0, int(curr_win_y - 15))
+                self._drag_anchor_panel_pos = (new_panel_x, new_panel_y)
+                self._drag_anchor_mouse = (curr_win_x, curr_win_y)
+                self.parent_overlay.fixed_container.move(self, new_panel_x, new_panel_y)
+                return True
+            total_dx = curr_win_x - self._drag_anchor_mouse[0]
+            total_dy = curr_win_y - self._drag_anchor_mouse[1]
+            new_x = self._drag_anchor_panel_pos[0] + total_dx
+            new_y = max(0, self._drag_anchor_panel_pos[1] + total_dy)
+            self.parent_overlay.fixed_container.move(self, new_x, new_y)
+            return True
+        if self._resizing_panel:
+            if self.is_maximized:
+                self.is_maximized = False
+                image = Gtk.Image.new_from_icon_name("window-maximize-symbolic", Gtk.IconSize.MENU)
+                self.maximize_btn.set_image(image)
+                self.maximize_btn.set_tooltip_text("最大化")
+            curr_win_x, curr_win_y = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
+            dx = curr_win_x - self._drag_anchor_mouse[0]
+            dy = curr_win_y - self._drag_anchor_mouse[1]
+            start_x, start_y, start_w, start_h = self._resize_start_rect
+            current_new_x, current_new_y = start_x, start_y
+            current_new_w, current_new_h = start_w, start_h
+            edge = self._resize_edge
+            min_w, min_h = self._resize_limit_w, self._resize_limit_h
+            if 'right' in edge:
+                current_new_w = max(start_w + dx, min_w)
+            elif 'left' in edge:
+                fixed_right = start_x + start_w
+                proposed_width = start_w - dx
+                current_new_w = max(proposed_width, min_w)
+                current_new_x = fixed_right - current_new_w
+            if 'bottom' in edge:
+                current_new_h = max(start_h + dy, min_h)
+            elif 'top' in edge:
+                fixed_bottom = start_y + start_h
+                proposed_height = start_h - dy
+                current_new_h = max(proposed_height, min_h)
+                current_new_y = fixed_bottom - current_new_h
+            self.set_size_request(int(current_new_w), int(current_new_h))
+            if current_new_x != start_x or current_new_y != start_y:
+                self.parent_overlay.fixed_container.move(self, int(current_new_x), int(current_new_y))
+            return True
+        edge = self._get_panel_edge(event.x, event.y)
+        if edge:
+            cursor_name = {
+                'top': 'n-resize', 'bottom': 's-resize',
+                'left': 'w-resize', 'right': 'e-resize',
+                'top-left': 'nw-resize', 'top-right': 'ne-resize',
+                'bottom-left': 'sw-resize', 'bottom-right': 'se-resize'
+            }.get(edge, 'default')
+            self.get_window().set_cursor(self.parent_overlay.cursors.get(cursor_name))
+        elif self._is_on_header(event.x, event.y):
+            if self._is_over_header_buttons(event.x, event.y):
+                self.get_window().set_cursor(None)
+            else:
+                self.get_window().set_cursor(self.parent_overlay.cursors.get('grab'))
+        else:
+            self.get_window().set_cursor(None)
+
+class CustomColorButton(Gtk.Button):
+    def __init__(self, color_str="0,0,0,1"):
+        super().__init__()
+        self.rgba = Gdk.RGBA(0, 0, 0, 1)
+        self.set_halign(Gtk.Align.FILL)
+        self.set_valign(Gtk.Align.FILL)
+        self.get_style_context().add_class("no-padding")
+        self.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
+        self.drawing_area = Gtk.DrawingArea()
+        self.drawing_area.set_halign(Gtk.Align.FILL)
+        self.drawing_area.set_valign(Gtk.Align.FILL)
+        self.drawing_area.connect("draw", self._on_draw)
+        self.add(self.drawing_area)
+        self.parse_and_set(color_str)
+
+    def parse_and_set(self, color_str):
+        try:
+            parts = [float(c.strip()) for c in color_str.split(',')]
+            if len(parts) == 4:
+                r, g, b, a = parts
+                self.rgba = Gdk.RGBA(r, g, b, a)
+            self.drawing_area.queue_draw()
+        except:
+            pass
+
+    def set_rgba(self, rgba):
+        self.rgba = rgba
+        self.drawing_area.queue_draw()
+
+    def get_rgba(self):
+        return self.rgba
+
+    def _on_draw(self, widget, cr):
+        cr.set_source_rgba(self.rgba.red, self.rgba.green, self.rgba.blue, self.rgba.alpha)
+        cr.paint()
+        cr.set_source_rgb(0.6, 0.6, 0.6)
+        cr.set_line_width(1)
+        cr.rectangle(0.5, 0.5, widget.get_allocated_width()-1, widget.get_allocated_height()-1)
+        cr.stroke()
+        return False
+
+class EmbeddedFileChooser(SimulatedWindow):
+    def __init__(self, parent_overlay):
+        super().__init__(parent_overlay, title="选择目录", css_class="simulated-window", resizable=True)
+        self.target_entry = None
+        self.chooser = Gtk.FileChooserWidget(action=Gtk.FileChooserAction.SELECT_FOLDER)
+        self.add_content(self.chooser, expand=True, fill=True)
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        btn_box.set_halign(Gtk.Align.END)
+        btn_box.set_margin_top(5)
+        btn_box.set_margin_bottom(5)
+        btn_box.set_margin_end(5)
+        btn_cancel = Gtk.Button(label="取消")
+        btn_cancel.connect("clicked", lambda w: self.hide())
+        btn_ok = Gtk.Button(label="选择")
+        btn_ok.get_style_context().add_class("suggested-action")
+        btn_ok.connect("clicked", self._on_select_clicked)
+        btn_box.pack_start(btn_cancel, False, False, 0)
+        btn_box.pack_start(btn_ok, False, False, 0)
+        self.add_content(btn_box, expand=False, fill=False)
+        self.show_all()
+        _, nat_size = self.get_preferred_size()
+        self.set_size_request(nat_size.width, 800)
+        self.hide()
+
+    def open_for(self, entry_widget):
+        self.target_entry = entry_widget
+        current_path = entry_widget.get_text()
+        if current_path and os.path.isdir(current_path):
+            self.chooser.set_current_folder(current_path)
+        self.show_all()
+        self.get_window().raise_()
+
+    def _on_select_clicked(self, widget):
+        filename = self.chooser.get_filename()
+        if filename and self.target_entry:
+            self.target_entry.set_text(filename)
+        self.hide()
+
+class EmbeddedColorChooser(SimulatedWindow):
+    def __init__(self, parent_overlay):
+        super().__init__(parent_overlay, title="选择颜色", css_class="simulated-window", resizable=False)
+        self.target_button = None
+        self.chooser_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add_content(self.chooser_container, expand=True, fill=True)
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        btn_box.set_halign(Gtk.Align.END)
+        btn_box.set_margin_top(5)
+        btn_box.set_margin_bottom(5)
+        btn_box.set_margin_end(5)
+        btn_cancel = Gtk.Button(label="取消")
+        btn_cancel.connect("clicked", lambda w: self.hide())
+        btn_ok = Gtk.Button(label="确定")
+        btn_ok.get_style_context().add_class("suggested-action")
+        btn_ok.connect("clicked", self._on_select_clicked)
+        btn_box.pack_start(btn_cancel, False, False, 0)
+        btn_box.pack_start(btn_ok, False, False, 0)
+        self.add_content(btn_box, expand=False, fill=False)
+        self.show_all()
+        _, nat_size = self.get_preferred_size()
+        self.set_size_request(nat_size.width, nat_size.height)
+        self.hide()
+
+    def open_for(self, custom_color_btn):
+        self.target_button = custom_color_btn
+        for child in self.chooser_container.get_children():
+            child.destroy()
+        self.chooser = Gtk.ColorChooserWidget()
+        self.chooser.set_use_alpha(True)
+        self.chooser.set_rgba(custom_color_btn.get_rgba())
+        self.chooser_container.pack_start(self.chooser, True, True, 0)
+        self.chooser.show()
+        self.show_all()
+        self.get_window().raise_()
+
+    def _on_select_clicked(self, widget):
+        rgba = self.chooser.get_rgba()
+        if self.target_button:
+            self.target_button.set_rgba(rgba)
+        _, req = self.get_preferred_size()
+        panel_w, panel_h = req.width, req.height
+        self.hide()
+
+class ConfigPanel(SimulatedWindow):
+    """配置面板，提供所有设置项的图形化编辑界面"""
+    # 逻辑px
+    def __init__(self, config_obj, parent_overlay):
+        super().__init__(parent_overlay, title="拼长图配置", css_class="simulated-window", resizable=True)
         self.config = config_obj
         self.show_advanced = False
         self.input_has_focus = False
@@ -3800,19 +3965,8 @@ class ConfigWindow(Gtk.Window):
             ('System', 'log_file'), ('System', 'temp_directory_base'),
         ]
         self.sound_data = self._discover_sound_themes()
-        self.set_default_size(800, 600)
-        self.set_position(Gtk.WindowPosition.CENTER)
-        self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
-        self.set_keep_above(True)
-        self.set_icon_name("preferences-system")
-        self.xid = None
         self.capturing_hotkey_button = None
-        self.connect("key-press-event", self._on_config_window_key_press)
-        self.connect("key-release-event", self._on_config_window_key_release)
         self.connect("destroy", self._on_destroy)
-        self.connect("realize", self._on_realize)
-        self.connect("delete-event", self._on_delete_event)
-        self.connect("map-event", self._on_map_event)
         self.is_destroyed = False
         self.log_queue = log_queue
         self.log_text_buffer = None
@@ -3821,47 +3975,77 @@ class ConfigWindow(Gtk.Window):
         self.log_tags = {}
         self.filter_checkboxes = {}
         self.log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        self._sub_panels_state = {}
         self._setup_ui()
         self._create_log_tags()
         self._load_config_values()
+        self.file_chooser_panel = EmbeddedFileChooser(parent_overlay)
+        self.color_chooser_panel = EmbeddedColorChooser(parent_overlay)
         self.show_all()
+        _, nat_size = self.get_preferred_size()
+        self.set_size_request(nat_size.width, 800)
+        self.hide()
         self._setup_default_parser()
         self._update_advanced_visibility()
         self.log_timer_id = GLib.timeout_add(150, self._check_log_queue)
 
-    def _on_realize(self, widget):
-        if not IS_WAYLAND:
-            try:
-                self.xid = self.get_window().get_xid()
-            except Exception as e:
-                logging.error(f"ConfigWindow: 获取 XID 失败: {e}")
+    def show(self):
+        super().show()
+        print(self._sub_panels_state)
+        if self._sub_panels_state.get('file_chooser', False):
+            if hasattr(self, 'file_chooser_panel') and self.file_chooser_panel:
+                self.file_chooser_panel.show()
+        if self._sub_panels_state.get('color_chooser', False):
+            if hasattr(self, 'color_chooser_panel') and self.color_chooser_panel:
+                self.color_chooser_panel.show()
 
-    def _on_map_event(self, widget, event):
-        logging.info("ConfigWindow map-event 触发，正在请求激活")
-        if not IS_WAYLAND:
-            if self.xid:
-                GLib.idle_add(activate_window_with_xlib, self.xid)
-            else:
-                logging.warning("_on_map_event: self.xid 尚未设置，无法激活")
-        return False
+    def hide(self):
+        if hasattr(self, 'file_chooser_panel') and self.file_chooser_panel:
+            self._sub_panels_state['file_chooser'] = self.file_chooser_panel.get_visible()
+            self.file_chooser_panel.hide()
+        if hasattr(self, 'color_chooser_panel') and self.color_chooser_panel:
+            self._sub_panels_state['color_chooser'] = self.color_chooser_panel.get_visible()
+            self.color_chooser_panel.hide()
+        super().hide()
 
-    def _on_delete_event(self, widget, event):
+    def on_close_clicked(self, btn):
         """窗口关闭时保存所有配置"""
+        if self.capturing_hotkey_button:
+            key = self.capturing_hotkey_button.get_name()
+            prev_text = self.config.parser.get('Hotkeys', key, fallback="")
+            self.capturing_hotkey_button.set_label(prev_text)
+            self.capturing_hotkey_button = None
         self._save_all_configs()
         global hotkey_listener
         if hotkey_listener and are_hotkeys_enabled:
             hotkey_listener.set_normal_keys_grabbed(True)
-            logging.info("配置窗口关闭，全局热键已恢复")
-        return False
+            logging.info("配置面板隐藏，全局热键已恢复")
+        if self.is_maximized:
+            self._restore_panel()
+        self.user_has_moved = False
+        self.hide()
+        self._sub_panels_state = {}
 
     def _on_destroy(self, widget):
-        """窗口销毁时的清理操作"""
+        """面板销毁时的清理操作"""
+        if self.is_destroyed:
+            return
         self.is_destroyed = True
         if self.log_timer_id:
             GLib.source_remove(self.log_timer_id)
             self.log_timer_id = None
-            logging.info("配置窗口的日志更新定时器已成功移除")
+            logging.info("配置面板的日志更新定时器已成功移除")
         self._save_all_configs()
+
+    def ensure_z_order(self):
+        if self.get_window():
+            self.get_window().raise_()
+        if self.file_chooser_panel and self.file_chooser_panel.get_visible():
+            if self.file_chooser_panel.get_window():
+                self.file_chooser_panel.get_window().raise_()
+        if self.color_chooser_panel and self.color_chooser_panel.get_visible():
+            if self.color_chooser_panel.get_window():
+                self.color_chooser_panel.get_window().raise_()
 
     def _on_input_focus_in(self, widget, event):
         self.input_has_focus = True
@@ -4049,12 +4233,12 @@ class ConfigWindow(Gtk.Window):
             hotkey_listener.set_normal_keys_grabbed(False)
             logging.info("开始捕获快捷键，全局热键暂停")
 
-    def _on_config_window_key_press(self, widget, event):
+    def handle_key_press(self, widget, event):
         if self.capturing_hotkey_button:
             return True 
         return False
 
-    def _on_config_window_key_release(self, widget, event):
+    def handle_key_release(self, widget, event):
         if not self.capturing_hotkey_button:
             return False
         hotkey_str = self._key_event_to_string(event)
@@ -4084,18 +4268,13 @@ class ConfigWindow(Gtk.Window):
                 conflicting_key_desc = next(c[1] for c in self.hotkey_configs if c[0] == key)
                 break
         if conflict_found:
-            dialog = Gtk.MessageDialog(
-                transient_for=self,
-                modal=True,
-                message_type=Gtk.MessageType.ERROR,
-                buttons=Gtk.ButtonsType.OK,
-                text="快捷键冲突"
+            message = f"快捷键 '{hotkey_str}' 已被分配给 '{conflicting_key_desc}'\n请设置一个不同的快捷键"
+            send_desktop_notification(
+                title="快捷键冲突",
+                message=message,
+                sound_name="dialog-error",
+                level="warning"
             )
-            dialog.format_secondary_text(
-                f"快捷键 '{hotkey_str}' 已被分配给 '{conflicting_key_desc}'\n请设置一个不同的快捷键"
-            )
-            dialog.run()
-            dialog.destroy()
             self.capturing_hotkey_button.set_label(original_label)
         else:
             self.capturing_hotkey_button.set_label(hotkey_str)
@@ -4108,7 +4287,7 @@ class ConfigWindow(Gtk.Window):
     def _setup_ui(self):
         """设置主界面布局"""
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.add(main_vbox)
+        self.add_content(main_vbox)
         # 创建水平分割的主内容区
         main_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         main_vbox.pack_start(main_hbox, True, True, 0)
@@ -4217,23 +4396,46 @@ class ConfigWindow(Gtk.Window):
         bottom_hbox.pack_end(help_label, False, False, 0)
 
     def _on_browse_button_clicked(self, widget):
-        dialog = Gtk.FileChooserDialog(
-            title="请选择保存目录",
-            parent=self,
-            action=Gtk.FileChooserAction.SELECT_FOLDER
-        )
-        dialog.add_buttons(
-            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-            Gtk.STOCK_OK, Gtk.ResponseType.OK
-        )
-        current_folder = self.save_dir_entry.get_text()
-        if current_folder and Path(current_folder).is_dir():
-            dialog.set_current_folder(current_folder)
-        response = dialog.run()
-        if response == Gtk.ResponseType.OK:
-            folder_path = dialog.get_filename()
-            self.save_dir_entry.set_text(folder_path)
-        dialog.destroy()
+        if self.parent_overlay.screen_rect:
+            screen_w, screen_h = self.parent_overlay.screen_rect.width, self.parent_overlay.screen_rect.height
+        else:
+            screen_w, screen_h = self.parent_overlay.get_allocated_width(), self.parent_overlay.get_allocated_height()
+        valid_w = screen_w - self.parent_overlay.monitor_offset_x
+        valid_h = screen_h - self.parent_overlay.monitor_offset_y
+        req_w, req_h = self.file_chooser_panel.get_size_request()
+        x = (valid_w - req_w) // 2
+        y = (valid_h - req_h) // 2
+        self.parent_overlay.fixed_container.move(self.file_chooser_panel, max(0, x), max(0, y))
+        self.file_chooser_panel.open_for(self.save_dir_entry)
+
+    def _show_embedded_color_chooser(self, target_button):
+        global_mouse_pos = self.parent_overlay.controller.scroll_manager._get_pointer_position()
+        offset_x, offset_y = self.parent_overlay.monitor_offset_x, self.parent_overlay.monitor_offset_y
+        if self.parent_overlay.screen_rect:
+            screen_w, screen_h = self.parent_overlay.screen_rect.width, self.parent_overlay.screen_rect.height
+            offset_x += self.parent_overlay.screen_rect.x
+            offset_y += self.parent_overlay.screen_rect.y
+        else:
+            screen_w, screen_h = self.parent_overlay.get_allocated_width(), self.parent_overlay.get_allocated_height()
+        # 显示器坐标 -> 窗口坐标
+        valid_w = screen_w - self.parent_overlay.monitor_offset_x
+        valid_h = screen_h - self.parent_overlay.monitor_offset_y
+        # 全局坐标 -> 窗口坐标
+        mouse_win_x = global_mouse_pos[0] - offset_x
+        mouse_win_y = global_mouse_pos[1] - offset_y
+        self.color_chooser_panel.open_for(target_button)
+        self.color_chooser_panel.show_all()
+        _, nat_size = self.color_chooser_panel.get_preferred_size()
+        panel_w, panel_h = nat_size.width, nat_size.height
+        target_x = mouse_win_x + 10
+        target_y = mouse_win_y + 10
+        if target_x + panel_w > valid_w:
+            target_x = mouse_win_x - panel_w - 10
+        if target_y + panel_h > valid_h:
+            target_y = mouse_win_y - panel_h - 10
+        target_x = max(0, target_x)
+        target_y = max(0, target_y)
+        self.parent_overlay.fixed_container.move(self.color_chooser_panel, int(target_x), int(target_y))
 
     def _update_filename_preview(self, widget=None):
         template = self.filename_entry.get_text()
@@ -4401,7 +4603,7 @@ class ConfigWindow(Gtk.Window):
             ("grid_backward", "整格后退"), ("grid_forward", "整格前进"),
             ("auto_scroll_start", "开始自动滚动"), ("auto_scroll_stop", "停止自动滚动"),
             ("configure_scroll_unit", "配置滚动单位"), ("toggle_grid_mode", "切换整格模式"),
-            ("toggle_preview", "激活/隐藏预览面板"), ("open_config_editor", "激活/隐藏配置窗口"),
+            ("toggle_preview", "激活/隐藏预览面板"), ("open_config_editor", "激活/隐藏配置面板"),
             ("toggle_instruction_panel", "显示/隐藏提示面板"), ("toggle_hotkeys_enabled", "启用/禁用快捷键"), 
             ("preview_zoom_in", "预览面板放大"), ("preview_zoom_out", "预览面板缩小"),
             ("dialog_confirm", "退出对话框确认"), ("dialog_cancel", "退出对话框取消")
@@ -4608,13 +4810,15 @@ class ConfigWindow(Gtk.Window):
         frame1.add(grid1)
         # 边框颜色
         label = Gtk.Label(label="边框颜色:", xalign=0)
-        self.border_color_button = Gtk.ColorButton()
+        self.border_color_button = CustomColorButton()
+        self.border_color_button.connect("clicked", self._show_embedded_color_chooser)
         grid1.attach(label, 0, 0, 1, 1)
         grid1.attach(self.border_color_button, 1, 0, 1, 1)
         # 指示器颜色
         label_ind = Gtk.Label(label="匹配指示器颜色:", xalign=0)
         label_ind.set_tooltip_markup("误差修正功能启用时，在边框上标记区域的颜色")
-        self.indicator_color_button = Gtk.ColorButton()
+        self.indicator_color_button = CustomColorButton()
+        self.indicator_color_button.connect("clicked", self._show_embedded_color_chooser)
         self.indicator_color_button.set_tooltip_markup(label_ind.get_tooltip_markup())
         grid1.attach(label_ind, 0, 1, 1, 1)
         grid1.attach(self.indicator_color_button, 1, 1, 1, 1)
@@ -5142,7 +5346,7 @@ class ConfigWindow(Gtk.Window):
     def _get_widget_value(self, widget, key):
         if isinstance(widget, Gtk.CheckButton) or isinstance(widget, Gtk.Switch):
             return str(widget.get_active()).lower()
-        elif isinstance(widget, Gtk.ColorButton):
+        elif isinstance(widget, CustomColorButton):
             rgba = widget.get_rgba()
             return f"{rgba.red:.2f}, {rgba.green:.2f}, {rgba.blue:.2f}, {rgba.alpha:.2f}"
         elif isinstance(widget, Gtk.Button):
@@ -5169,7 +5373,7 @@ class ConfigWindow(Gtk.Window):
     def _update_widget_value(self, widget, key, value):
         if isinstance(widget, Gtk.Switch) or isinstance(widget, Gtk.CheckButton):
             widget.set_active(value.lower() == 'true')
-        elif isinstance(widget, Gtk.ColorButton):
+        elif isinstance(widget, CustomColorButton):
             if value and value.count(',') == 3:
                 try:
                     r, g, b, a = [float(c.strip()) for c in value.split(',')]
@@ -5254,247 +5458,13 @@ class ConfigWindow(Gtk.Window):
         except Exception as e:
             logging.error(f"写入配置文件失败: {e}")
 
-class SimulatedWindow(Gtk.EventBox):
-    """模拟窗口行为的基础组件，提供标题栏拖动、边缘调整大小、最大化和关闭功能"""
-    # 逻辑px
-    def __init__(self, parent_overlay, title="Window", css_class="simulated-window"):
-        super().__init__()
-        self.parent_overlay = parent_overlay
-        self.is_maximized = False
-        # 窗口坐标
-        self.restore_geometry = None
-        self.RESIZE_BORDER = 6
-        self._dragging_panel = False
-        self._resizing_panel = False
-        self._resize_edge = None
-        self._drag_anchor_mouse = None
-        self._drag_anchor_panel_pos = None
-        self._resize_start_rect = None
-        self._resize_limit_w = 100
-        self._resize_limit_h = 50
-        self.user_has_moved = False
-        self.get_style_context().add_class(css_class)
-        self.main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.main_vbox.set_margin_top(self.RESIZE_BORDER)
-        self.main_vbox.set_margin_bottom(self.RESIZE_BORDER)
-        self.main_vbox.set_margin_start(self.RESIZE_BORDER)
-        self.main_vbox.set_margin_end(self.RESIZE_BORDER)
-        self.add(self.main_vbox)
-        self.header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.header_box.get_style_context().add_class("window-header") 
-        self.main_vbox.pack_start(self.header_box, False, False, 0)
-        self.title_label = Gtk.Label(label=title)
-        self.title_label.get_style_context().add_class("window-title")
-        self.title_label.set_margin_bottom(0)
-        self.header_box.pack_start(self.title_label, True, True, 0)
-        self.maximize_btn = Gtk.Button.new_from_icon_name("window-maximize-symbolic", Gtk.IconSize.MENU)
-        self.maximize_btn.set_relief(Gtk.ReliefStyle.NONE)
-        self.maximize_btn.set_tooltip_text("最大化")
-        self.maximize_btn.set_can_focus(False)
-        self.maximize_btn.connect("clicked", self._toggle_maximize)
-        self.header_box.pack_start(self.maximize_btn, False, False, 0)
-        self.close_btn = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
-        self.close_btn.set_relief(Gtk.ReliefStyle.NONE)
-        self.close_btn.set_can_focus(False)
-        self.close_btn.connect("clicked", self.on_close_clicked)
-        self.header_box.pack_end(self.close_btn, False, False, 0)
-        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
-        self.connect("button-press-event", self._on_panel_press)
-        self.connect("button-release-event", self._on_panel_release)
-        self.connect("motion-notify-event", self._on_panel_motion)
-
-    def add_content(self, widget, expand=True, fill=True, padding=0):
-        self.main_vbox.pack_start(widget, expand, fill, padding)
-
-    def on_close_clicked(self, btn):
-        if self.is_maximized:
-            self._restore_panel()
-        self.user_has_moved = False
-        self.hide()
-
-    def _toggle_maximize(self, btn=None):
-        if self.is_maximized:
-            self._restore_panel()
-        else:
-            self._maximize_panel()
-
-    def _maximize_panel(self):
-        curr_x = self.parent_overlay.fixed_container.child_get_property(self, "x")
-        curr_y = self.parent_overlay.fixed_container.child_get_property(self, "y")
-        alloc = self.get_allocation()
-        self.restore_geometry = (curr_x, curr_y, alloc.width, alloc.height)
-        rect = self.parent_overlay.screen_rect
-        screen_w = rect.width if rect else self.parent_overlay.get_allocated_width()
-        screen_h = rect.height if rect else self.parent_overlay.get_allocated_height()
-        # 屏幕坐标 -> 窗口坐标
-        valid_screen_w = screen_w - self.parent_overlay.monitor_offset_x
-        valid_screen_h = screen_h - self.parent_overlay.monitor_offset_y
-        self.set_size_request(valid_screen_w, valid_screen_h)
-        self.parent_overlay.fixed_container.move(self, 0, 0)
-        self.is_maximized = True
-        image = Gtk.Image.new_from_icon_name("window-restore-symbolic", Gtk.IconSize.MENU)
-        self.maximize_btn.set_image(image)
-        self.maximize_btn.set_tooltip_text("还原")
-        self.parent_overlay._update_input_shape()
-
-    def _restore_panel(self):
-        if not self.restore_geometry:
-            return
-        x, y, w, h = self.restore_geometry
-        self.set_size_request(w, h)
-        self.parent_overlay.fixed_container.move(self, x, y)
-        self.is_maximized = False
-        image = Gtk.Image.new_from_icon_name("window-maximize-symbolic", Gtk.IconSize.MENU)
-        self.maximize_btn.set_image(image)
-        self.maximize_btn.set_tooltip_text("最大化")
-        self.parent_overlay._update_input_shape()
-
-    def _get_panel_edge(self, x, y):
-        w = self.get_allocated_width()
-        h = self.get_allocated_height()
-        border = self.RESIZE_BORDER
-        on_top = y < border
-        on_bottom = y > h - border
-        on_left = x < border
-        on_right = x > w - border
-        edge = ''
-        if on_top: edge = 'top'
-        elif on_bottom: edge = 'bottom'
-        if on_left: edge += '-left' if edge else 'left'
-        elif on_right: edge += '-right' if edge else 'right'
-        return edge if edge else None
-
-    def _is_on_header(self, x, y):
-        if not self.header_box.get_visible(): return False
-        inner_x = x - self.RESIZE_BORDER
-        inner_y = y - self.RESIZE_BORDER
-        alloc = self.header_box.get_allocation()
-        if 0 <= inner_x <= alloc.width and 0 <= inner_y <= alloc.height:
-            return True
-        return False
-    
-    def _is_over_header_buttons(self, x, y):
-        for btn in [self.maximize_btn, self.close_btn]:
-            wx, wy = btn.translate_coordinates(self, 0, 0)
-            alloc = btn.get_allocation()
-            if wx <= x < wx + alloc.width and wy <= y < wy + alloc.height:
-                return True
-        return False
-
-    def _on_panel_press(self, widget, event):
-        if event.button == 1:
-            edge = self._get_panel_edge(event.x, event.y)
-            win_x, win_y = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
-            self._drag_anchor_mouse = (win_x, win_y)
-            curr_x = self.parent_overlay.fixed_container.child_get_property(self, "x")
-            curr_y = self.parent_overlay.fixed_container.child_get_property(self, "y")
-            if edge:
-                self._resizing_panel = True
-                self._resize_edge = edge
-                alloc = self.get_allocation()
-                self._resize_start_rect = (curr_x, curr_y, alloc.width, alloc.height)
-                min_req, _ = self.main_vbox.get_preferred_size()
-                self._resize_limit_w = min_req.width + 2 * self.RESIZE_BORDER
-                self._resize_limit_h = min_req.height + 2 * self.RESIZE_BORDER
-                self.user_has_moved = True
-                return True
-            elif self._is_on_header(event.x, event.y):
-                self._dragging_panel = True
-                self._drag_anchor_panel_pos = (curr_x, curr_y)
-                self.get_window().set_cursor(self.parent_overlay.cursors.get('grabbing'))
-                self.user_has_moved = True
-                return True
-        return False
-
-    def _on_panel_release(self, widget, event):
-        if event.button == 1:
-            if self._dragging_panel or self._resizing_panel:
-                self._dragging_panel = False
-                self._resizing_panel = False
-                self._resize_edge = None
-                self.get_window().set_cursor(None)
-                self.parent_overlay._update_input_shape()
-                self._on_panel_motion(widget, event)
-                return True
-        return False
-
-    def _on_panel_motion(self, widget, event):
-        if self._dragging_panel:
-            curr_win_x, curr_win_y = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
-            if self.is_maximized:
-                max_width = self.get_allocated_width()
-                mouse_ratio_x = event.x / max_width if max_width > 0 else 0.5
-                if self.restore_geometry:
-                    _, _, target_restored_w, _ = self.restore_geometry
-                self._restore_panel()
-                new_panel_x = int(curr_win_x - (target_restored_w * mouse_ratio_x))
-                new_panel_y = int(curr_win_y - 15)
-                self._drag_anchor_panel_pos = (new_panel_x, new_panel_y)
-                self._drag_anchor_mouse = (curr_win_x, curr_win_y)
-                self.parent_overlay.fixed_container.move(self, new_panel_x, new_panel_y)
-                return True
-            total_dx = curr_win_x - self._drag_anchor_mouse[0]
-            total_dy = curr_win_y - self._drag_anchor_mouse[1]
-            new_x = self._drag_anchor_panel_pos[0] + total_dx
-            new_y = self._drag_anchor_panel_pos[1] + total_dy
-            self.parent_overlay.fixed_container.move(self, new_x, new_y)
-            return True
-        if self._resizing_panel:
-            if self.is_maximized:
-                self.is_maximized = False
-                image = Gtk.Image.new_from_icon_name("window-maximize-symbolic", Gtk.IconSize.MENU)
-                self.maximize_btn.set_image(image)
-                self.maximize_btn.set_tooltip_text("最大化")
-            curr_win_x, curr_win_y = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
-            dx = curr_win_x - self._drag_anchor_mouse[0]
-            dy = curr_win_y - self._drag_anchor_mouse[1]
-            start_x, start_y, start_w, start_h = self._resize_start_rect
-            current_new_x, current_new_y = start_x, start_y
-            current_new_w, current_new_h = start_w, start_h
-            edge = self._resize_edge
-            min_w, min_h = self._resize_limit_w, self._resize_limit_h
-            if 'right' in edge:
-                current_new_w = max(start_w + dx, min_w)
-            elif 'left' in edge:
-                fixed_right = start_x + start_w
-                proposed_width = start_w - dx
-                current_new_w = max(proposed_width, min_w)
-                current_new_x = fixed_right - current_new_w
-            if 'bottom' in edge:
-                current_new_h = max(start_h + dy, min_h)
-            elif 'top' in edge:
-                fixed_bottom = start_y + start_h
-                proposed_height = start_h - dy
-                current_new_h = max(proposed_height, min_h)
-                current_new_y = fixed_bottom - current_new_h
-            self.set_size_request(int(current_new_w), int(current_new_h))
-            if current_new_x != start_x or current_new_y != start_y:
-                self.parent_overlay.fixed_container.move(self, int(current_new_x), int(current_new_y))
-            return True
-        edge = self._get_panel_edge(event.x, event.y)
-        if edge:
-            cursor_name = {
-                'top': 'n-resize', 'bottom': 's-resize',
-                'left': 'w-resize', 'right': 'e-resize',
-                'top-left': 'nw-resize', 'top-right': 'ne-resize',
-                'bottom-left': 'sw-resize', 'bottom-right': 'se-resize'
-            }.get(edge, 'default')
-            self.get_window().set_cursor(self.parent_overlay.cursors.get(cursor_name))
-        elif self._is_on_header(event.x, event.y):
-            if self._is_over_header_buttons(event.x, event.y):
-                self.get_window().set_cursor(None)
-            else:
-                self.get_window().set_cursor(self.parent_overlay.cursors.get('grab'))
-        else:
-            self.get_window().set_cursor(None)
-
 class PreviewPanel(SimulatedWindow):
     """显示截图预览的滚动窗口"""
     ZOOM_FACTOR = 1.26  # 缩放系数
     MIN_ZOOM = 0.25     # 最小缩放比例
     MAX_ZOOM = 4.0      # 最大缩放比例
     def __init__(self, model: StitchModel, config: Config, parent_overlay: 'CaptureOverlay'):
-        super().__init__(parent_overlay, title="长图预览", css_class="simulated-window")
+        super().__init__(parent_overlay, title="长图预览", css_class="simulated-window", resizable=True)
         self.model = model
         self.config = config
         self.zoom_level = 1.0
@@ -5526,7 +5496,7 @@ class PreviewPanel(SimulatedWindow):
         self.AUTOSCROLL_SENSITIVITY = 1.0
         self.AUTOSCROLL_INTERVAL = 50
         self.initial_y_offset = 0
-        top_button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        top_button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         top_button_box.set_margin_top(0)
         top_button_box.set_margin_bottom(0)
         top_button_box.set_margin_start(4)
@@ -5535,30 +5505,29 @@ class PreviewPanel(SimulatedWindow):
         top_button_box.set_halign(Gtk.Align.CENTER)
         self.btn_start_selection = Gtk.Button(label="选择")
         self.btn_start_selection.set_tooltip_text("选择区域")
-        self.btn_start_selection.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
         self.btn_start_selection.connect("clicked", self._on_start_selection_mode)
         self.btn_cancel_selection = Gtk.Button(label="取消")
         self.btn_cancel_selection.set_tooltip_text("退出选择")
-        self.btn_cancel_selection.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
         self.btn_cancel_selection.connect("clicked", self._on_cancel_selection_mode)
         self.btn_cancel_selection.set_sensitive(False)
         self.btn_delete_selection = Gtk.Button(label="删除")
         self.btn_delete_selection.set_tooltip_text("删除选定区域（修复内容重复）")
-        self.btn_delete_selection.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
         self.btn_delete_selection.connect("clicked", self._on_delete_clicked)
         self.btn_delete_selection.set_sensitive(False)
         self.btn_restore_selection = Gtk.Button(label="恢复")
         self.btn_restore_selection.set_tooltip_text("恢复选定区域内的接缝（修复内容缺失）")
-        self.btn_restore_selection.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
         self.btn_restore_selection.connect("clicked", self._on_restore_clicked)
         self.btn_undo_mod = Gtk.Button.new_from_icon_name("edit-undo-symbolic", Gtk.IconSize.BUTTON)
         self.btn_undo_mod.set_tooltip_text("撤销上一步编辑 (删除/恢复)")
-        self.btn_undo_mod.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
         self.btn_undo_mod.connect("clicked", self._on_undo_mod_clicked)
         self.btn_redo_mod = Gtk.Button.new_from_icon_name("edit-redo-symbolic", Gtk.IconSize.BUTTON)
         self.btn_redo_mod.set_tooltip_text("重做上一步编辑 (删除/恢复)")
-        self.btn_redo_mod.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
         self.btn_redo_mod.connect("clicked", self._on_redo_mod_clicked)
+        for btn in [self.btn_start_selection, self.btn_cancel_selection,
+                    self.btn_delete_selection, self.btn_restore_selection,
+                    self.btn_undo_mod, self.btn_redo_mod]:
+            btn.get_style_context().add_class("no-padding")
+            btn.get_style_context().add_class(Gtk.STYLE_CLASS_FLAT)
         top_button_box.pack_start(self.btn_start_selection, False, False, 0)
         top_button_box.pack_start(self.btn_cancel_selection, False, False, 0)
         top_button_box.pack_start(self.btn_delete_selection, False, False, 0)
@@ -5626,7 +5595,9 @@ class PreviewPanel(SimulatedWindow):
         min_req_size, _ = self.get_preferred_size()
         self.min_width_calculated = min_req_size.width
         self._resize_limit_w = self.min_width_calculated
-        self.set_size_request(self.min_width_calculated, 800)
+        initial_w = self.min_width_calculated + 60
+        initial_h = 750
+        self.set_size_request(initial_w, initial_h)
 
     def cleanup(self):
         if self.model and self.model_update_handler_id:
@@ -6436,13 +6407,13 @@ class CaptureOverlay(Gtk.Window):
         self.current_y_rel = 0
         self.is_dragging_selection = False
         self.preview_panel = None
+        self.config_panel = None
         self.stitch_model = self.controller.stitch_model
         self.stitch_model.connect('model-updated', self.on_model_updated_ui)
         self.evdev_wheel_scroller = None
         self.invisible_scroller = None
         self.screen_rect = None # 全局坐标
         self.scale = self.get_scale_factor()
-        self.window_xid = None
         self.is_dialog_open = False
         self.show_side_panel = True
         self.show_button_panel = True
@@ -6535,7 +6506,7 @@ class CaptureOverlay(Gtk.Window):
         current_alloc = self.get_allocation()
         if not self.screen_rect and current_alloc.width <= 1:
             logging.info(f"窗口尚未布局 (width={current_alloc.width})，推迟显示通知: {title}")
-            GLib.timeout_add(200, self.show_embedded_notification, title, message, level, action_path, controller, width, height)
+            GLib.timeout_add(300, self.show_embedded_notification, title, message, level, action_path, controller, width, height)
             return
         if self.current_notification_widget:
             self.dismiss_notification(self.current_notification_widget, trigger_cleanup=False)
@@ -6568,6 +6539,7 @@ class CaptureOverlay(Gtk.Window):
         if hasattr(self, 'overlay_mask'):
             self.overlay_mask.hide()
         if self.preview_panel: self.preview_panel.hide()
+        if self.config_panel: self.config_panel.hide()
         self.queue_draw()
         self._update_input_shape()
 
@@ -6591,7 +6563,6 @@ class CaptureOverlay(Gtk.Window):
 
     def _connect_events(self):
         """连接所有Gtk信号和事件"""
-        self.connect("realize", self.on_realize)
         self.connect("map-event", self.on_map_event)
         self.connect("draw", self.on_draw)
         self.connect("size-allocate", self.on_size_allocate)
@@ -6602,6 +6573,7 @@ class CaptureOverlay(Gtk.Window):
         self.connect("button-release-event", self.on_button_release)
         self.connect("motion-notify-event", self.on_motion_notify)
         self.connect("key-press-event", self.on_key_press_event)
+        self.connect("key-release-event", self.on_key_release_event)
 
     def apply_global_styles(self):
         """应用所有全局 CSS 样式"""
@@ -6649,6 +6621,10 @@ class CaptureOverlay(Gtk.Window):
         }
         """
         load_css(button_active_css, "Button Active Style")
+        no_padding_css = """
+        .no-padding { padding: 0px; }
+        """
+        load_css(no_padding_css, "No Padding Style")
         logging.info("已应用所有全局 CSS 样式")
 
     def on_key_press_event(self, widget, event):
@@ -6657,6 +6633,9 @@ class CaptureOverlay(Gtk.Window):
             return True
         if self.preview_panel and self.preview_panel.get_visible():
             if self.preview_panel._on_key_press(widget, event):
+                return True
+        if self.config_panel and self.config_panel.get_visible():
+            if self.config_panel.capturing_hotkey_button:
                 return True
         if not self.is_selection_done:
             keyval = event.keyval
@@ -6674,12 +6653,22 @@ class CaptureOverlay(Gtk.Window):
         else:
             return self.controller.handle_key_press(event)
 
+    def on_key_release_event(self, widget, event):
+        if self.config_panel and self.config_panel.get_visible():
+            if self.config_panel.handle_key_release(widget, event):
+                return True
+        return False
+
     def _grab_for_selection(self):
         display = Gdk.Display.get_default()
         seat = display.get_default_seat()
         capabilities = (Gdk.SeatCapabilities.POINTER |
                         Gdk.SeatCapabilities.KEYBOARD)
-        self.get_window().set_cursor(self.cursors["crosshair"])
+        def _set_cursor_delayed():
+            if self.get_window():
+                self.get_window().set_cursor(self.cursors["crosshair"])
+            return False
+        GLib.timeout_add(250, _set_cursor_delayed)
         grab_status = seat.grab(
             self.get_window(), capabilities,
             True, None, None, None, None
@@ -6785,7 +6774,7 @@ class CaptureOverlay(Gtk.Window):
         threading.Thread(target=self._run_calibration_thread, args=(cal_widget, target_log_x, target_log_y), daemon=True).start()
 
     def _run_calibration_thread(self, widget, log_x, log_y):
-        # 屏幕坐标
+        # 显示器坐标
         time.sleep(0.6)
         full_img = None
         if IS_WAYLAND:
@@ -6870,13 +6859,6 @@ class CaptureOverlay(Gtk.Window):
         GLib.idle_add(self.update_layout)
         return False
 
-    def on_realize(self, widget):
-        if not IS_WAYLAND:
-            try:
-                self.window_xid = widget.get_window().get_xid()
-            except Exception as e:
-                logging.error(f"获取 xid 失败: {e}")
-
     def on_model_updated_ui(self, model_instance):
         """模型更新时刷新界面元素 (连接到 StitchModel 的信号)"""
         if self.is_selection_done:
@@ -6912,21 +6894,13 @@ class CaptureOverlay(Gtk.Window):
         if right_panel_w > 0:
             cluster_right_x += (right_panel_w + border)
         space_left = cluster_left_x - spacing
-        # 屏幕坐标 -> 窗口坐标
+        # 显示器坐标 -> 窗口坐标
         valid_screen_w = screen_w - self.monitor_offset_x
         valid_screen_h = screen_h - self.monitor_offset_y
         space_right = valid_screen_w - cluster_right_x - spacing
         can_place_right = space_right >= preview_w
         can_place_left = space_left >= preview_w
-        place_left = False
-        if can_place_right and can_place_left:
-            place_left = space_left > space_right
-        elif can_place_left:
-            place_left = True
-        elif can_place_right:
-            place_left = False
-        else:
-            place_left = space_left > space_right
+        place_left = space_left > space_right
         if place_left:
             target_x = cluster_left_x - spacing - preview_w
         else:
@@ -6948,10 +6922,7 @@ class CaptureOverlay(Gtk.Window):
         if self.is_dialog_open:
             logging.warning("退出对话框已打开，忽略重复请求")
             return Gtk.ResponseType.NONE
-        if not IS_WAYLAND:
-            GLib.idle_add(activate_window_with_xlib, self.window_xid)
-        else:
-            GLib.idle_add(self.present)
+        GLib.idle_add(self.present)
         self.is_dialog_open = True
         global hotkey_listener
         if hotkey_listener:
@@ -7031,7 +7002,7 @@ class CaptureOverlay(Gtk.Window):
         self.fixed_container.put(self.side_panel, 0, 0)
         self.side_panel.connect("toggle-grid-mode-clicked", lambda w: self.controller.grid_mode_controller.toggle())
         self.side_panel.connect("toggle-preview-clicked", lambda w: self.toggle_preview_panel())
-        self.side_panel.connect("open-config-clicked", lambda w: toggle_config_window())
+        self.side_panel.connect("open-config-clicked", lambda w: self.toggle_config_panel())
         self.side_panel.connect("toggle-hotkeys-clicked", lambda w: toggle_all_hotkeys())
         self.button_panel = ButtonPanel()
         self.button_panel.connect("grid-backward-clicked", lambda w: self.controller.handle_movement_action('up', source='button'))
@@ -7047,12 +7018,42 @@ class CaptureOverlay(Gtk.Window):
         self.fixed_container.put(self.instruction_panel, 0, 0)
         _, nat_size = self.instruction_panel.get_preferred_size()
         self._instr_panel_natural_w, self._instr_panel_natural_h = nat_size.width, nat_size.height
-        logging.info(f"缓存的 InstructionPanel 自然高度: {self._instr_panel_natural_h}")
+        logging.info(f"缓存的 InstructionPanel 自然高度: {self._instr_panel_natural_h} 逻辑px")
         self.instruction_panel.connect("size-allocate", lambda w, a: self._update_input_shape())
         self.instruction_panel.hide()
         self.preview_panel = PreviewPanel(self.controller.stitch_model, config, self)
         self.fixed_container.put(self.preview_panel, 0, 0)
         self.preview_panel.hide()
+        self.config_panel = ConfigPanel(config, self)
+        self.fixed_container.put(self.config_panel, 0, 0)
+        self.fixed_container.put(self.config_panel.file_chooser_panel, 0, 0)
+        self.fixed_container.put(self.config_panel.color_chooser_panel, 0, 0)
+        self.config_panel.hide()
+
+    def toggle_config_panel(self):
+        """切换配置面板的可见性"""
+        if not self.config_panel: return
+        if self.config_panel.get_visible():
+            logging.info("隐藏配置面板")
+            self.config_panel.hide()
+            self._update_input_shape()
+        else:
+            logging.info("显示配置面板")
+            if not self.config_panel.user_has_moved:
+                if self.screen_rect:
+                    screen_w, screen_h = self.screen_rect.width, self.screen_rect.height
+                else:
+                    screen_w, screen_h = self.get_allocated_width(), self.get_allocated_height()
+                # 显示器坐标 -> 窗口坐标
+                valid_w = screen_w - self.monitor_offset_x
+                valid_h = screen_h - self.monitor_offset_y
+                req_w, req_h = self.config_panel.get_size_request()
+                x = (valid_w - req_w) // 2
+                y = (valid_h - req_h) // 2
+                self.fixed_container.move(self.config_panel, max(0, x), max(0, y))
+            self.config_panel.show()
+            self.config_panel.ensure_z_order()
+            self._update_input_shape()
 
     def toggle_preview_panel(self):
         """创建或切换预览面板的可见性"""
@@ -7070,6 +7071,8 @@ class CaptureOverlay(Gtk.Window):
             else:
                 self.preview_panel.show()
                 self._update_input_shape()
+            if self.config_panel and self.config_panel.get_visible():
+                self.config_panel.ensure_z_order()
 
     def on_dialog_key_press(self, widget, event):
         """处理确认对话框的按键事件"""
@@ -7257,51 +7260,32 @@ class CaptureOverlay(Gtk.Window):
         )
         border_full_region.subtract(inner_transparent_region)
         final_input_region.union(border_full_region)
-        if self.show_side_panel and self.side_panel_on_left:
-            panel_x = self.fixed_container.child_get_property(self.side_panel, "x")
-            panel_y = self.fixed_container.child_get_property(self.side_panel, "y")
-            panel_rect = self.side_panel.get_allocation()
-            side_panel_region = cairo.Region(cairo.RectangleInt(panel_x, panel_y, panel_rect.width, panel_rect.height))
-            final_input_region.union(side_panel_region)
-        if self.show_button_panel:
-            panel_x = self.fixed_container.child_get_property(self.button_panel, "x")
-            panel_y = self.fixed_container.child_get_property(self.button_panel, "y")
-            panel_rect = self.button_panel.get_allocation()
-            button_panel_region = cairo.Region(cairo.RectangleInt(panel_x, panel_y, panel_rect.width, panel_rect.height))
-            final_input_region.union(button_panel_region)
-        elif self.show_side_panel and not self.side_panel_on_left:
-            panel_x = self.fixed_container.child_get_property(self.side_panel, "x")
-            panel_y = self.fixed_container.child_get_property(self.side_panel, "y")
-            panel_rect = self.side_panel.get_allocation()
-            side_panel_region = cairo.Region(cairo.RectangleInt(panel_x, panel_y, panel_rect.width, panel_rect.height))
-            final_input_region.union(side_panel_region)
-        if self.instruction_panel.get_visible():
-             panel_x = self.fixed_container.child_get_property(self.instruction_panel, "x")
-             panel_y = self.fixed_container.child_get_property(self.instruction_panel, "y")
-             panel_rect = self.instruction_panel.get_allocation()
-             instr_region = cairo.Region(cairo.RectangleInt(panel_x, panel_y, panel_rect.width, panel_rect.height))
-             final_input_region.union(instr_region)
-        if self.preview_panel and self.preview_panel.get_visible():
-            panel_x = self.fixed_container.child_get_property(self.preview_panel, "x")
-            panel_y = self.fixed_container.child_get_property(self.preview_panel, "y")
-            panel_rect = self.preview_panel.get_allocation()
-            preview_region = cairo.Region(cairo.RectangleInt(panel_x, panel_y, panel_rect.width, panel_rect.height))
-            final_input_region.union(preview_region)
-        if self.controller.grid_mode_controller.calibration_state and \
-           "panel" in self.controller.grid_mode_controller.calibration_state:
-            cal_panel = self.controller.grid_mode_controller.calibration_state["panel"]
-            if cal_panel and cal_panel.get_visible():
-                 p_alloc = cal_panel.get_allocation()
-                 px = self.fixed_container.child_get_property(cal_panel, "x")
-                 py = self.fixed_container.child_get_property(cal_panel, "y")
-                 cal_region = cairo.Region(cairo.RectangleInt(px, py, p_alloc.width, p_alloc.height))
-                 final_input_region.union(cal_region)
-        if self.current_notification_widget and self.current_notification_widget.get_visible():
-            panel_x = self.fixed_container.child_get_property(self.current_notification_widget, "x")
-            panel_y = self.fixed_container.child_get_property(self.current_notification_widget, "y")
-            panel_rect = self.current_notification_widget.get_allocation()
-            notif_region = cairo.Region(cairo.RectangleInt(panel_x, panel_y, panel_rect.width, panel_rect.height))
-            final_input_region.union(notif_region)
+        def _union_widget_region(widget):
+            if widget and widget.get_visible():
+                try:
+                    alloc = widget.get_allocation()
+                    if alloc.width > 0 and alloc.height > 0:
+                        x = self.fixed_container.child_get_property(widget, "x")
+                        y = self.fixed_container.child_get_property(widget, "y")
+                        reg = cairo.Region(cairo.RectangleInt(x, y, alloc.width, alloc.height))
+                        final_input_region.union(reg)
+                except TypeError:
+                    pass
+        widgets_to_process = [
+            self.side_panel if self.show_side_panel else None,
+            self.button_panel if self.show_button_panel else None,
+            self.instruction_panel,
+            self.preview_panel,
+            self.config_panel,
+            self.current_notification_widget
+        ]
+        if self.config_panel:
+            widgets_to_process.append(self.config_panel.file_chooser_panel)
+            widgets_to_process.append(self.config_panel.color_chooser_panel)
+        if self.controller.grid_mode_controller.calibration_state:
+            widgets_to_process.append(self.controller.grid_mode_controller.calibration_state.get("panel"))
+        for w in widgets_to_process:
+            _union_widget_region(w)
         if hasattr(self, 'overlay_mask') and self.overlay_mask.get_visible():
              mask_region = cairo.Region(cairo.RectangleInt(0, 0, win_w, win_h))
              final_input_region.union(mask_region)
@@ -7506,7 +7490,7 @@ class CaptureOverlay(Gtk.Window):
         margin = 20
         panel_w = self._instr_panel_natural_w
         panel_h = self._instr_panel_natural_h
-        # 屏幕坐标 -> 窗口坐标
+        # 显示器坐标 -> 窗口坐标
         valid_screen_w = screen_w - self.monitor_offset_x
         valid_screen_h = screen_h - self.monitor_offset_y
         if valid_screen_h < panel_h + margin * 2 or valid_screen_w < panel_w + margin * 2:
@@ -7982,47 +7966,6 @@ class EvdevHotkeyListener(threading.Thread):
     def stop(self):
         self.running = False
 
-def toggle_config_window():
-    """创建或显示配置窗口，确保只有一个实例存在"""
-    global config_window_instance
-    def on_window_destroy(widget):
-        global config_window_instance
-        config_window_instance = None
-        logging.info("配置窗口已销毁，实例已清除")
-
-    def task():
-        global config_window_instance
-        if config_window_instance is None:
-            logging.info("配置窗口不存在，正在创建...")
-            config_window_instance = ConfigWindow(config)
-            config_window_instance.connect("destroy", on_window_destroy)
-            logging.info("配置窗口已创建并显示")
-        else:
-            is_visually_on_screen = False
-            if IS_WAYLAND:
-                is_visually_on_screen = config_window_instance.is_visible()
-                logging.info(f"Wayland 下 Gtk.is_visible() = {is_visually_on_screen}")
-            else:
-                win_xid = config_window_instance.xid
-                if not win_xid:
-                    logging.warning("toggle_config_window: 窗口实例存在但 XID 为空，可能尚未 'realize'")
-                    return
-                visibility_ratio = get_window_visibility(win_xid)
-                is_visually_on_screen = visibility_ratio > 0.50
-                logging.info(f"X11 下可见度 = {visibility_ratio*100:.1f}%")
-            if is_visually_on_screen:
-                logging.info(f"配置窗口可视，正在隐藏...")
-                config_window_instance.hide()
-                global hotkey_listener
-                if hotkey_listener and are_hotkeys_enabled:
-                    hotkey_listener.set_normal_keys_grabbed(True)
-                    logging.info("配置窗口隐藏，全局热键已恢复")
-            else:
-                logging.info(f"配置窗口不可视，正在显示并激活...")
-                config_window_instance.show()
-                GLib.idle_add(config_window_instance.present)
-    GLib.idle_add(task)
-
 def toggle_all_hotkeys():
     """切换快捷键（包括全局和窗口焦点）的启用状态"""
     global are_hotkeys_enabled
@@ -8062,7 +8005,7 @@ def setup_hotkey_listener(overlay):
         ('toggle_grid_mode', overlay.controller.grid_mode_controller.toggle),
         ('configure_scroll_unit', overlay.controller.grid_mode_controller.start_calibration),
         ('toggle_preview', overlay.toggle_preview_panel),
-        ('open_config_editor', toggle_config_window),
+        ('open_config_editor', overlay.toggle_config_panel),
         ('toggle_instruction_panel', overlay.toggle_instruction_panel),
         ('toggle_hotkeys_enabled', toggle_all_hotkeys),
         ('preview_zoom_in', lambda: overlay.preview_panel._zoom_in() if overlay.preview_panel and overlay.preview_panel.get_visible() else None),
