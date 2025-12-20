@@ -156,7 +156,7 @@ class Config:
                 if gtk_key_val:
                     gtk_keys_tuple = (gtk_key_val,)
             elif not gtk_mask:
-                 logging.error(f"快捷键 '{original_str}' 无效")
+                 logging.warning(f"快捷键 '{original_str}' 无效")
         return {
             'gtk_keys': gtk_keys_tuple,
             'gtk_mask': gtk_mask,
@@ -245,7 +245,8 @@ class Config:
         self.STR_CAPTURE_COUNT_FORMAT = self.parser.get('Interface.Strings', 'capture_count_format', fallback='截图: {count}')
         self.STR_PROCESSING_TEXT = self.parser.get('Interface.Strings', 'processing_dialog_text', fallback='正在处理…')
         # Output
-        self.SAVE_DIRECTORY = Path(self.parser.get('Output', 'save_directory', fallback='~/Pictures/截图')).expanduser()
+        save_dir_str = self.parser.get('Output', 'save_directory', fallback='')
+        self.SAVE_DIRECTORY = Path(save_dir_str).expanduser() if save_dir_str.strip() else None
         self.SAVE_FORMAT = self.parser.get('Output', 'save_format', fallback='PNG').upper()
         self.JPEG_QUALITY = self.parser.getint('Output', 'jpeg_quality', fallback=95)
         self.FILENAME_TEMPLATE = self.parser.get('Output', 'filename_template', fallback='长截图 {timestamp}')
@@ -389,7 +390,7 @@ processing_dialog_text = 正在处理…
 capture_count_format = 截图: {count}
 
 [Output]
-save_directory = ~/Pictures/截图
+save_directory =
 save_format = PNG
 jpeg_quality = 95
 filename_template = 长截图 {timestamp}
@@ -458,20 +459,9 @@ dialog_cancel = esc
         return 0, False
 
     def save_scroll_unit(self, app_class: str, unit_value: int, matching_enabled: bool):
-        """将计算出的滚动单位和匹配设置保存到配置文件中"""
         # unit_value: 缓冲区px
-        try:
-            if not self.parser.has_section('ApplicationScrollUnits'):
-                self.parser.add_section('ApplicationScrollUnits')
-            value_to_save = f"{unit_value},{str(matching_enabled).lower()}"
-            self.parser.set('ApplicationScrollUnits', app_class, value_to_save)
-            with open(self.config_path, 'w', encoding='utf-8') as configfile:
-                self.parser.write(configfile)
-            logging.info(f"成功将配置 '{app_class} = {value_to_save}' 写入 {self.config_path}")
-            return True
-        except Exception as e:
-            logging.error(f"写入配置文件失败: {e}")
-            return False
+        value_to_save = f"{unit_value},{str(matching_enabled).lower()}"
+        return self.save_setting('ApplicationScrollUnits', app_class, value_to_save)
 
     def save_setting(self, section: str, key: str, value: str):
         try:
@@ -480,7 +470,7 @@ dialog_cancel = esc
             self.parser.set(section, key, str(value))
             with open(self.config_path, 'w', encoding='utf-8') as configfile:
                 self.parser.write(configfile)
-            logging.info(f"成功将配置 '{key} = {value}' 写入 [{section}]")
+            logging.debug(f"成功将配置 '{key} = {value}' 写入 [{section}]")
             return True
         except Exception as e:
             logging.error(f"写入配置文件失败: {e}")
@@ -517,7 +507,7 @@ class InvisibleCursorScroller:
             pattern = fr'{re.escape(master_name)} pointer\s+id=(\d+)'
             matches = re.findall(pattern, output)
             ids = [int(match) for match in matches]
-            logging.info(f"找到 {len(ids)} 个名为 '{master_name}' 的主指针设备: {ids}")
+            logging.debug(f"找到 {len(ids)} 个名为 '{master_name}' 的主指针设备: {ids}")
         except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
             logging.error(f"查找主设备 ID 时出错: {e}")
         return ids
@@ -529,7 +519,7 @@ class InvisibleCursorScroller:
             try:
                 output = subprocess.check_output(['xinput', 'list']).decode()
                 if device_name in output:
-                    logging.info(f"设备 '{device_name}' 已被 X Server 识别")
+                    logging.debug(f"设备 '{device_name}' 已被 X Server 识别")
                     return True
             except subprocess.CalledProcessError:
                 pass
@@ -545,7 +535,7 @@ class InvisibleCursorScroller:
             master_id_to_use = None
             if not self.config.REUSE_INVISIBLE_CURSOR:
                 if existing_master_ids:
-                    logging.info("配置为不复用，正在尝试清理所有检测到的旧主设备...")
+                    logging.info("隐形光标设备配置为不复用，正在尝试清理所有检测到的旧主设备...")
                     for old_id in existing_master_ids:
                         try:
                             result = subprocess.run(
@@ -553,22 +543,22 @@ class InvisibleCursorScroller:
                                 check=False, capture_output=True, text=True, timeout=1
                             )
                             if result.returncode == 0:
-                                logging.info(f"成功移除旧主设备 ID: {old_id}")
+                                logging.debug(f"成功移除旧主设备 ID: {old_id}")
                             else:
                                 logging.warning(f"尝试移除旧主设备 ID {old_id} 未成功 (可能已被移除或权限问题). stderr: {result.stderr.strip()}")
                         except subprocess.TimeoutExpired:
-                            logging.warning(f"移除旧主设备 ID {old_id} 超时.")
+                            logging.warning(f"移除旧主设备 ID {old_id} 超时")
                         except Exception as e_remove:
                             logging.warning(f"尝试移除旧主设备 ID {old_id} 时发生异常: {e_remove}")
                     existing_master_ids = []
                 else:
-                    logging.info("配置为不复用，且未检测到旧主设备。")
+                    logging.info("隐形光标设备配置为不复用，且未检测到旧主设备")
             else:
                 if len(existing_master_ids) == 0:
-                    logging.info("配置为复用，但未找到现有设备，将创建新设备。")
+                    logging.info("配置为复用，但未找到现有设备，将创建新设备")
                 elif len(existing_master_ids) == 1:
                     master_id_to_use = existing_master_ids[0]
-                    logging.info(f"配置为复用，找到唯一现有设备 ID: {master_id_to_use}，将复用。")
+                    logging.info(f"配置为复用，找到唯一现有设备 ID: {master_id_to_use}，将复用")
                 else:
                     logging.warning(f"配置为复用，但检测到多个 ({len(existing_master_ids)}) 同名主设备: {existing_master_ids}。将尝试复用第一个 ID: {existing_master_ids[0]}")
                     master_id_to_use = existing_master_ids[0]
@@ -584,7 +574,7 @@ class InvisibleCursorScroller:
                     diff_ids = list(set(ids_after) - set(ids_before))
                     if len(diff_ids) == 1:
                         new_master_id = diff_ids[0]
-                        logging.info(f"成功识别新创建的主设备 ID: {new_master_id}")
+                        logging.debug(f"成功识别新创建的主设备 ID: {new_master_id}")
                         break
                     elif len(diff_ids) > 1:
                          logging.warning(f"检测到多个新设备 ID: {diff_ids}，将使用第一个: {diff_ids[0]}")
@@ -605,30 +595,42 @@ class InvisibleCursorScroller:
                         subprocess.run(['xinput', 'remove-master', str(self.master_id)], check=False)
                     except Exception as e_cleanup:
                         logging.warning(f"清理失败的主设备 {self.master_id} 时出错: {e_cleanup}")
-                logging.info(f"将新虚拟设备附加到主设备 ID {self.master_id}")
+                logging.debug(f"将新虚拟设备附加到主设备 ID {self.master_id}")
                 subprocess.check_call(['xinput', 'reattach', mouse_dev_name, str(self.master_id)])
             else:
                 self.master_id = master_id_to_use
                 try:
                     self._create_virtual_devices()
-                    logging.info(f"尝试重新打开 UInput 句柄以复用设备 (Master ID: {self.master_id})。")
+                    logging.debug(f"尝试重新打开 UInput 句柄以复用设备 (Master ID: {self.master_id})")
                     subprocess.check_call(['xinput', 'reattach', mouse_dev_name, str(self.master_id)])
-                    logging.info(f"已重新附加虚拟设备到 Master ID: {self.master_id}")
+                    logging.debug(f"已重新附加虚拟设备到 Master ID: {self.master_id}")
                 except Exception as e_reopen:
-                    logging.warning(f"复用设备 (Master ID: {self.master_id}) 时重新打开 UInput 或重新附加失败: {e_reopen}。滚动功能可能无效。")
+                    logging.warning(f"复用设备 (Master ID: {self.master_id}) 时重新打开 UInput 或重新附加失败: {e_reopen}。滚动功能可能无效")
+                    GLib.idle_add(
+                        send_desktop_notification,
+                        "隐形光标复用失败",
+                        "无法重新连接虚拟设备，滚动功能可能无效",
+                        "dialog-warning", "warning"
+                    )
             self.park()
-            logging.info(f"隐形光标设置完成 (Master ID: {self.master_id})")
+            logging.debug(f"隐形光标设置完成 (Master ID: {self.master_id})")
             self.is_ready = True
             return self
         except Exception as e:
             logging.error(f"创建/设置隐形光标失败: {e}")
             self.cleanup()
             self.is_ready = False
+            GLib.idle_add(
+                send_desktop_notification,
+                "隐形光标初始化失败",
+                f"无法创建虚拟设备: {e}",
+                "dialog-error", "warning"
+            )
             return self
 
     def park(self):
         self.move(self.park_x, self.park_y)
-        logging.info(f"隐形光标已停放至全局坐标 ({self.park_x}, {self.park_y})处")
+        logging.debug(f"隐形光标已停放至全局坐标 ({self.park_x}, {self.park_y})处")
 
     def _create_virtual_devices(self):
         # 虚拟鼠标 (用于移动光标)
@@ -668,7 +670,7 @@ class InvisibleCursorScroller:
                 try:
                      command = ['xinput', 'remove-master', str(self.master_id)]
                      subprocess.check_call(command)
-                     logging.info(f"已移除隐形光标 (Master ID: {self.master_id})")
+                     logging.debug(f"已移除隐形光标 (Master ID: {self.master_id})")
                 except Exception as e:
                      logging.warning(f"清理隐形光标主设备时出错: {e}")
             self.master_id = None
@@ -687,7 +689,7 @@ class EvdevWheelScroller:
         }
         # UInput 的初始化
         self.ui_device = UInput(capabilities, name='scroll_stitch-wheel-mouse', version=0x1)
-        logging.info("EvdevWheelScroller 初始化成功，虚拟滚轮鼠标已创建")
+        logging.debug("EvdevWheelScroller 初始化成功，虚拟滚轮鼠标已创建")
 
     def scroll_discrete(self, num_clicks):
         """模拟鼠标滚轮进行离散滚动"""
@@ -704,7 +706,7 @@ class EvdevWheelScroller:
     def close(self):
         if self.ui_device:
             self.ui_device.close()
-            logging.info("虚拟滚轮鼠标已关闭")
+            logging.debug("虚拟滚轮鼠标已关闭")
 
 class EvdevAbsoluteMouse:
     """在 Wayland 下使用绝对定位设备来移动鼠标"""
@@ -722,7 +724,7 @@ class EvdevAbsoluteMouse:
             ]
         }
         self.device = UInput(caps, name='scroll-stitch-mover', version=0x1)
-        logging.info(f"EvdevAbsoluteMouse 已创建: 全局坐标范围 ({min_x},{min_y}) -> ({max_x},{max_y})")
+        logging.debug(f"EvdevAbsoluteMouse 已创建: 全局坐标范围 ({min_x},{min_y}) -> ({max_x},{max_y})")
 
     def move(self, x, y):
         # x,y: 缓冲区px全局坐标
@@ -756,7 +758,7 @@ def play_sound(sound_name: str, theme_name: str = None):
         return
     try:
         subprocess.Popen(["paplay", sound_file_path])
-        logging.info(f"正在播放声音: {sound_file_path}")
+        logging.debug(f"正在播放声音: {sound_file_path}")
     except FileNotFoundError:
         logging.warning(f"播放命令 'paplay' 未找到，请确保已安装")
 
@@ -868,23 +870,23 @@ class EmbeddedNotificationPanel(Gtk.EventBox):
     def close(self):
         self.overlay.dismiss_notification(self)
 
-def send_desktop_notification(title, message, sound_name=None, level="normal", action_path=None, controller=None, width=0, height=0):
+def send_desktop_notification(title, message, sound_name=None, level="normal", timeout=None, action_config=None):
     try:
         if sound_name:
             play_sound(sound_name)
         overlay = None
-        if controller and hasattr(controller, 'view'):
-            overlay = controller.view
+        if action_config and action_config.get('controller') and hasattr(action_config['controller'], 'view'):
+            overlay = action_config['controller'].view
         elif GLOBAL_OVERLAY:
             overlay = GLOBAL_OVERLAY
         if overlay:
-            overlay.show_embedded_notification(title, message, level, action_path, controller, width, height)
+            overlay.show_embedded_notification(title, message, level, timeout, action_config)
         else:
             logging.warning("无法找到主窗口覆盖层，通知仅记录日志: " + message)
     except Exception as e:
         logging.error(f"发送内嵌通知失败: {e}")
-        if controller:
-            GLib.idle_add(controller._perform_cleanup)
+        if action_config and action_config.get('controller'):
+            GLib.idle_add(action_config['controller']._perform_cleanup)
 
 class XFixesCursorImage(Structure):
     # 缓冲区px {
@@ -998,7 +1000,7 @@ class X11FrameGrabber(FrameGrabberBase):
             libx11.XFree.argtypes = [c_void_p]
             libx11.XFree(cursor_image_ptr)
             XCloseDisplay(dpy)
-            logging.info(f'成功获取光标图像: {width}x{height} at ({x},{y}), hotspot=({xhot},{yhot})')
+            logging.debug(f'成功获取光标图像: {width}x{height} at ({x},{y}), hotspot=({xhot},{yhot})')
             return {
                 'image': bgra,
                 'x': x,
@@ -1081,7 +1083,7 @@ class X11FrameGrabber(FrameGrabberBase):
                 img.save(str(filepath), 'PNG')
             else:
                 pixbuf.savev(str(filepath), 'png', [], [])
-                logging.info(f"成功使用 GDK 截图到: {filepath}")
+                logging.debug(f"成功使用 GDK 截图到: {filepath}")
             return True
         except Exception as e:
             logging.error(f"使用 GDK 截图失败: {e}")
@@ -1100,6 +1102,8 @@ class WaylandFrameGrabber(FrameGrabberBase):
         self.connection = None
         self.portal = None
         self.init_loop = None
+        self.last_error = None
+        self.user_cancelled = False
         self._setup_dbus()
 
     def _setup_dbus(self):
@@ -1119,17 +1123,24 @@ class WaylandFrameGrabber(FrameGrabberBase):
         logging.info("Wayland Grabber: 正在请求屏幕录制权限...")
         self.init_loop = GLib.MainLoop()
         self._start_portal_request()
+        if self.state == "ERROR":
+            logging.warning("Wayland Grabber: 初始化请求失败，跳过事件循环")
+            self.init_loop = None
+            return True
         try:
             self.init_loop.run()
         except KeyboardInterrupt:
+            self.user_cancelled = True
             return False
         self.init_loop = None
+        if self.user_cancelled:
+            logging.info("Wayland Grabber: 用户取消了授权")
+            return False
         if self.state == "STREAMING":
             logging.info("Wayland Grabber: 授权成功，后台流已启动")
-            return True
         else:
-            logging.error(f"Wayland Grabber: 授权失败或被取消 (State: {self.state})")
-            return False
+            logging.warning(f"Wayland Grabber: 未进入流状态 (State: {self.state})")
+        return True
 
     def _start_portal_request(self):
         self.state = "REQUESTING"
@@ -1147,14 +1158,23 @@ class WaylandFrameGrabber(FrameGrabberBase):
             self.portal.call_sync('CreateSession', GLib.Variant('(a{sv})', (options,)),
                                   Gio.DBusCallFlags.NONE, -1, None)
         except Exception as e:
-            logging.error(f"CreateSession 失败: {e}")
+            err_msg = f"CreateSession 失败:\n{e}"
+            logging.error(err_msg)
             self.state = "ERROR"
+            self.last_error = err_msg
             if self.init_loop: self.init_loop.quit()
 
     def _on_portal_response(self, connection, sender, path, iface, signal, params, user_data):
         response_code, results = params.unpack()
-        if response_code != 0:
-            logging.error(f"Portal 请求被拒绝 (code={response_code})")
+        if response_code == 1:
+            logging.info("Portal 请求被用户取消 (code=1)")
+            self.user_cancelled = True
+            self.state = "CANCELLED"
+            if self.init_loop: self.init_loop.quit()
+            return
+        elif response_code != 0:
+            logging.error(f"Portal 请求失败 (code={response_code})")
+            self.last_error = f"屏幕录制请求失败 (错误码: {response_code})"
             self.state = "ERROR"
             if self.init_loop: self.init_loop.quit()
             return
@@ -1196,9 +1216,20 @@ class WaylandFrameGrabber(FrameGrabberBase):
             self.pipeline = Gst.parse_launch(pipeline_str)
             self.appsink = self.pipeline.get_by_name('mysink')
             self.appsink.connect('new-sample', self._on_new_sample)
+            bus = self.pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message", self._on_bus_message)
             self.pipeline.set_state(Gst.State.PLAYING)
         except Exception as e:
-            logging.error(f"Pipeline 启动失败: {e}")
+            err_str = f"Pipeline 启动失败:\n{e}"
+            logging.error(err_str)
+            self.last_error = err_str
+
+    def _on_bus_message(self, bus, message):
+        if message.type == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            self.last_error = f"GStreamer 错误: {err.message}\n(Debug: {debug})"
+            logging.error(self.last_error)
 
     def _on_new_sample(self, appsink):
         # 缓冲区px
@@ -1295,14 +1326,14 @@ class WaylandWindowManager(WindowManagerBase):
         if visual and window.get_screen().is_composited():
             window.set_visual(visual)
         else:
-            logging.warning("无法设置 RGBA visual，透明度可能无法工作。")
+            logging.warning("无法设置 RGBA visual，透明度可能无法工作")
         if not GTK_LAYER_SHELL_AVAILABLE or not GtkLayerShell.is_supported():
             window.set_decorated(False)
             empty_titlebar = Gtk.Fixed()
             window.set_titlebar(empty_titlebar)
             send_desktop_notification("窗口未置顶", "需手动置顶", level="warning")
         else:
-            logging.info("WaylandWindowManager: 正在应用 GtkLayerShell 属性...")
+            logging.debug("WaylandWindowManager: 正在应用 GtkLayerShell 属性...")
             GtkLayerShell.init_for_window(window)
             GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
             GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.TOP, True)
@@ -1311,7 +1342,7 @@ class WaylandWindowManager(WindowManagerBase):
             GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.RIGHT, True)
             GtkLayerShell.set_namespace(window, "scroll_stitch_overlay")
             protocol_version = GtkLayerShell.get_protocol_version()
-            logging.info(f"GtkLayerShell 协议版本: {protocol_version}")
+            logging.debug(f"GtkLayerShell 协议版本: {protocol_version}")
             if protocol_version >= 4:
                 GtkLayerShell.set_keyboard_mode(window, GtkLayerShell.KeyboardMode.ON_DEMAND)
             else:
@@ -1362,11 +1393,11 @@ def _find_overlap_pyramid(img_top, img_bottom, max_overlap_search):
         return overlap_1, score_1
     if scale_factor_1 >= 0.3:
         return overlap_1, score_1
-    logging.info(f"快速匹配分数低 ({score_1:.3f})，尝试更高精度重试...")
+    logging.debug(f"快速匹配分数低 ({score_1:.3f})，尝试更高精度重试...")
     scale_factor_2 = 1.5 * scale_factor_1
     overlap_2, score_2 = _run_pyramid_step(img_top, img_bottom, max_overlap_search, scale_factor_2)
     if score_2 > score_1:
-        logging.info(f"高精度重试成功: score {score_1:.3f} -> {score_2:.3f}")
+        logging.debug(f"高精度重试成功: score {score_1:.3f} -> {score_2:.3f}")
         return overlap_2, score_2
     return overlap_1, score_1
 
@@ -1376,7 +1407,7 @@ def stitch_images_in_memory_from_model(render_plan: list, image_width: int, tota
     num_pieces = len(render_plan)
     final_width_int = int(round(image_width))
     final_height_int = int(round(total_height))
-    logging.info(f"开始从 {num_pieces} 个渲染片段拼接图像，最终尺寸: {final_width_int}x{final_height_int} (原始浮点高度: {total_height})")
+    logging.debug(f"开始从 {num_pieces} 个渲染片段拼接图像，最终尺寸: {final_width_int}x{final_height_int} (原始浮点高度: {total_height})")
     pil_cache = {}
     try:
         stitched_image = Image.new('RGBA', (final_width_int, final_height_int))
@@ -1404,12 +1435,14 @@ def stitch_images_in_memory_from_model(render_plan: list, image_width: int, tota
         logging.info("图像拼接完成")
         return stitched_image
     except Exception as e:
-        logging.exception(f"拼接图像时发生严重错误: {e}")
+        msg = f"拼接图像时发生错误: {e}"
+        logging.error(msg)
+        GLib.idle_add(send_desktop_notification, "拼接失败", msg, "dialog-error", "critical")
         return None
     finally:
         for img in pil_cache.values():
             img.close()
-        logging.info(f"PIL 缓存中的 {len(pil_cache)} 张图片已关闭")
+        logging.debug(f"PIL 缓存中的 {len(pil_cache)} 张图片已关闭")
 # 缓冲区px }
 
 def copy_to_clipboard(image_path: Path) -> bool:
@@ -1425,6 +1458,7 @@ def copy_to_clipboard(image_path: Path) -> bool:
     except GLib.Error as e:
         copy_duration = time.perf_counter() - copy_start_time
         logging.error(f"使用 GTK 复制到剪贴板失败: {e}，耗时: {copy_duration:.3f} 秒")
+        GLib.idle_add(lambda: send_desktop_notification("复制失败", f"无法写入剪贴板: {e}", level="warning"))
         return False
 
 def create_feedback_panel(text, show_progress_bar=False):
@@ -1665,7 +1699,7 @@ class StitchModel(GObject.Object):
     def undo(self):
         """撤销上一个修改"""
         if not self.modifications:
-            logging.info("StitchModel: 撤销栈为空，无操作")
+            logging.debug("StitchModel: 撤销栈为空，无操作")
             return
         mod = self.modifications.pop()
         self.redo_stack.append(mod)
@@ -1676,7 +1710,7 @@ class StitchModel(GObject.Object):
     def redo(self):
         """重做上一个撤销的修改"""
         if not self.redo_stack:
-            logging.info("StitchModel: 重做栈为空，无操作")
+            logging.debug("StitchModel: 重做栈为空，无操作")
             return
         mod = self.redo_stack.pop()
         self.modifications.append(mod)
@@ -1685,16 +1719,16 @@ class StitchModel(GObject.Object):
         GLib.idle_add(self.emit, 'modification-stack-changed')
 
     def add_modification(self, mod: dict):
-        logging.info(f"StitchModel: 添加新修改: {mod}")
+        logging.debug(f"StitchModel: 添加新修改: {mod}")
         self.modifications.append(mod)
         if self.redo_stack:
-            logging.info("StitchModel: 新修改导致重做栈被清空")
+            logging.debug("StitchModel: 新修改导致重做栈被清空")
             self.redo_stack.clear()
         GLib.idle_add(self.emit, 'modification-stack-changed')
         GLib.idle_add(self._regenerate_plans)
 
     def add_entry(self, filepath: str, width: int, height: int, overlap_with_previous: int):
-        logging.info(f"主线程: 收到添加请求: {filepath}, h={height}, overlap={overlap_with_previous}")
+        logging.debug(f"主线程: 收到添加请求: {filepath}, h={height}, overlap={overlap_with_previous}")
         if not self.entries:
             self.image_width = width
             self.entries.append({'filepath': filepath, 'height': height, 'overlap': 0})
@@ -1707,7 +1741,7 @@ class StitchModel(GObject.Object):
     def pop_entry(self):
         if not self.entries:
             return
-        logging.info("主线程: 收到移除最后一个条目的请求")
+        logging.debug("主线程: 收到移除最后一个条目的请求")
         last_entry_index = len(self.entries) - 1
         last_abs_piece = None
         if self.absolute_plan and len(self.absolute_plan) > last_entry_index:
@@ -1718,7 +1752,7 @@ class StitchModel(GObject.Object):
             entry_abs_start = last_abs_piece['absolute_y_start']
             entry_abs_end = last_abs_piece['absolute_y_start'] + last_abs_piece['height']
             seam_index_to_remove = last_entry_index - 1
-            logging.info(f"正在清理与截图 {last_entry_index} (AbsY: [{entry_abs_start}, {entry_abs_end}], SeamIdx: {seam_index_to_remove}) 相关的修改")
+            logging.debug(f"正在清理与截图 {last_entry_index} (AbsY: [{entry_abs_start}, {entry_abs_end}], SeamIdx: {seam_index_to_remove}) 相关的修改")
             new_modifications = []
             removed_count = 0
             for mod in self.modifications:
@@ -1728,31 +1762,31 @@ class StitchModel(GObject.Object):
                     mod_end = mod['y_end_abs']
                     if max(entry_abs_start, mod_start) < min(entry_abs_end, mod_end):
                         mod_applies = True
-                        logging.info(f"删除操作 {mod} 与被删除截图重叠，将被移除")
+                        logging.debug(f"删除操作 {mod} 与被删除截图重叠，将被移除")
                 elif mod['type'] == 'restore':
                     if mod['seam_index'] == seam_index_to_remove:
                          mod_applies = True
-                         logging.info(f"恢复操作 {mod} 与被删除截图相关，将被移除")
+                         logging.debug(f"恢复操作 {mod} 与被删除截图相关，将被移除")
                 if mod_applies:
                     removed_count += 1
                 else:
                     new_modifications.append(mod)
             if removed_count > 0:
                 self.modifications = new_modifications
-                logging.info(f"已移除 {removed_count} 个与被删除截图相关的修改")
+                logging.debug(f"已移除 {removed_count} 个与被删除截图相关的修改")
                 if self.redo_stack:
                     self.redo_stack.clear()
-                    logging.info("由于删除了截图，重做栈已清空")
+                    logging.debug("由于删除了截图，重做栈已清空")
                 GLib.idle_add(self.emit, 'modification-stack-changed')
         popped_entry = self.entries.pop()
         if popped_entry['filepath'] in self.pixbuf_cache:
             del self.pixbuf_cache[popped_entry['filepath']]
-            logging.info(f"从缓存中移除 {popped_entry['filepath']}")
+            logging.debug(f"从缓存中移除 {popped_entry['filepath']}")
         try:
             filepath_to_remove = Path(popped_entry['filepath'])
             if filepath_to_remove.exists():
                 os.remove(filepath_to_remove)
-                logging.info(f"已删除文件: {filepath_to_remove}")
+                logging.debug(f"已删除文件: {filepath_to_remove}")
         except OSError as e:
             logging.error(f"删除文件失败 {popped_entry['filepath']}: {e}")
         if self.entries:
@@ -1863,14 +1897,14 @@ class GridModeController:
                 self.x_display = None
                 logging.error(f"无法连接到 X Display，整格模式功能将不可用: {e}")
         else:
-            logging.info("检测到 Wayland，Xlib 窗口检测将不可用。")
+            logging.info("检测到 Wayland，Xlib 窗口检测将不可用")
             self.x_display = None
 
     def _get_window_at_coords(self, d, x: int, y: int):
         """X11在不移动鼠标的情况下，获取指定全局坐标下的窗口ID和WM_CLASS"""
         # x, y: 逻辑px全局坐标
         if IS_WAYLAND:
-            logging.warning("_get_window_at_coords 在 Wayland 上不可用。")
+            logging.debug("_get_window_at_coords 在 Wayland 上不可用。")
             return None, None
         if not d:
             return None, None
@@ -1926,7 +1960,7 @@ class GridModeController:
                     wm_class = win_obj.get_wm_class()
                     if wm_class and 'Scroll_stitch.py' not in wm_class[1]:
                         app_class = wm_class[1].lower()
-                        logging.info(
+                        logging.debug(
                             f"定位成功! ID={win_obj.id}, Class={app_class}, Scale={scale}, "
                             f"AbsGeom=({abs_x},{abs_y},{win_w},{win_h}), PhysPoint=({buf_x},{buf_y})"
                         )
@@ -1940,7 +1974,7 @@ class GridModeController:
     def _get_app_class_at_center(self):
         # 逻辑px窗口坐标
         if IS_WAYLAND:
-            logging.info("Wayland 环境下无法通过 Xlib 检测应用类别。")
+            logging.debug("Wayland 环境下无法通过 Xlib 检测应用类别")
             return None
         shot_x = self.session.geometry['x']
         shot_y = self.session.geometry['y']
@@ -1986,12 +2020,12 @@ class GridModeController:
         """切换整格模式的开关"""
         # 缓冲区px
         if self._is_toggling:
-            logging.warning("GridModeController: toggle 正在进行中，忽略重复请求")
+            logging.debug("GridModeController: toggle 正在进行中，忽略重复请求")
             return
         self._is_toggling = True
         try:
             if self.view.controller.is_auto_scrolling:
-                logging.warning("自动滚动模式下忽略切换整格模式请求")
+                logging.debug("自动滚动模式下忽略切换整格模式请求")
                 return
             if self.is_active:
                 self.is_active = False
@@ -2048,12 +2082,12 @@ class GridModeController:
             self.session.update_geometry(geo)
             self.view.update_layout()
             self.view.queue_draw()
-            logging.info(f"高度对齐: {target_h_phys} 缓冲区px, {snapped_h} 逻辑px (Scale={scale})")
+            logging.debug(f"高度对齐: {target_h_phys} 缓冲区px, {snapped_h} 逻辑px (Scale={scale})")
 
     def start_calibration(self):
         """启动自动滚动单位校准流程"""
         if self.view.controller.is_auto_scrolling:
-            logging.warning("自动滚动模式下忽略配置滚动单位请求")
+            logging.debug("自动滚动模式下忽略配置滚动单位请求")
             return
         if self.is_active:
             send_desktop_notification("操作无效", "请先按 Shift 键退出整格模式再进行配置", level="normal")
@@ -2083,7 +2117,7 @@ class GridModeController:
                         r1['y'] + r1['h'] <= r2['y'])
         if _rects_overlap(panel_rect, self.session.geometry):
             should_hide = True
-            logging.info("校准面板遮挡了截图选区，将自动隐藏")
+            logging.debug("校准面板遮挡了截图选区，将自动隐藏")
         if not should_hide and self.view.show_side_panel and self.view.side_panel.get_visible():
             alloc = self.view.side_panel.get_allocation()
             side_rect = {'x': self.view.side_panel.translate_coordinates(self.view, 0, 0)[0], 
@@ -2139,7 +2173,7 @@ class GridModeController:
                 GLib.idle_add(task)
                 event.wait()
                 return result[0]
-            logging.info(f"校准参数: 截图区高度={h} 逻辑px, 约 {buf_h} 缓冲区px, 每次滚动格数={ticks_to_scroll}, 采样次数={num_samples}")
+            logging.debug(f"校准参数: 截图区高度={h} 逻辑px, 约 {buf_h} 缓冲区px, 每次滚动格数={ticks_to_scroll}, 采样次数={num_samples}")
             state["filepath_before"] = config.TMP_DIR / "cal_before.png"
             if not safe_capture(state["filepath_before"]):
                  logging.error("校准初始截图失败")
@@ -2169,7 +2203,7 @@ class GridModeController:
                             GLib.idle_add(self._finalize_calibration, True)
                             return
                         state["measured_units"].append(unit)
-                        logging.info(f"采样 {step}: 成功，滚动单位 ≈ {unit:.2f} 缓冲区px/格，相似度 {score:.3f}")
+                        logging.debug(f"采样 {step}: 成功，滚动单位 ≈ {unit:.2f} 缓冲区px/格，相似度 {score:.3f}")
                     else:
                         logging.warning(f"采样 {step}: 匹配失败（相似度 {score:.3f}）")
                         bottom_check_height = ticks_to_scroll * min_scroll_buf
@@ -2189,7 +2223,7 @@ class GridModeController:
                     time.sleep(0.4)
             GLib.idle_add(self._finalize_calibration, True)
         except Exception as e:
-            logging.exception(f"校准线程发生严重错误: {e}")
+            logging.error(f"校准线程发生错误: {e}")
             GLib.idle_add(self._finalize_calibration, False)
     
     def _finalize_calibration(self, success):
@@ -2203,10 +2237,10 @@ class GridModeController:
         if not success or not state["measured_units"] or len(state["measured_units"]) < MIN_VALID_SAMPLES:
             msg = f"为 '{state['app_class']}' 校准失败\n有效采样数据不足，请在内容更丰富的区域操作或确保界面有足够的滚动空间"
             send_desktop_notification("配置失败", msg, level="warning")
-            logging.error(msg.replace('\n', ' '))
+            logging.warning(msg.replace('\n', ' '))
             return
         units = sorted(state["measured_units"])
-        logging.info(f"开始聚类分析，原始数据: {units}")
+        logging.debug(f"开始聚类分析，原始数据: {units}")
         if not units:
             self._finalize_calibration(success=False)
             return
@@ -2225,11 +2259,11 @@ class GridModeController:
             self._finalize_calibration(success=False)
             return
         largest_cluster = max(clusters, key=len)
-        logging.info(f"聚类结果: {clusters}。选择的最大集群: {largest_cluster}")
+        logging.debug(f"聚类结果: {clusters}。选择的最大集群: {largest_cluster}")
         if len(largest_cluster) < MIN_VALID_SAMPLES:
             msg = f"为 '{state['app_class']}' 校准失败。\n采样数据一致性过差，无法找到共识值"
             send_desktop_notification("配置失败", msg, level="warning")
-            logging.error(msg.replace('\n', ' '))
+            logging.warning(msg.replace('\n', ' '))
             return
         final_avg_unit = round(np.mean(largest_cluster))
         final_std_dev = np.std(largest_cluster)
@@ -2238,7 +2272,7 @@ class GridModeController:
         if config.save_scroll_unit(state["app_class"], final_avg_unit, matching_enabled):
             status_str = "启用" if matching_enabled else "禁用"
             msg = f"已为 '{state['app_class']}' 保存滚动单位: {final_avg_unit}px (缓冲区px)\n误差修正已{status_str}"
-            send_desktop_notification("配置成功", msg, level="success")
+            send_desktop_notification("配置成功", msg, level="success", timeout=4)
         else:
             send_desktop_notification("配置失败", "写入配置文件时发生错误", level="warning")
 
@@ -2324,7 +2358,7 @@ class ScrollManager:
         center_y = int(shot_y + self.session.geometry['h'] / 2)
         g_center_x, g_center_y = self.view.window_to_global(center_x, center_y) # 窗口坐标 -> 全局坐标
         if self.config.SCROLL_METHOD == 'invisible_cursor' and self.view.invisible_scroller:
-            logging.info(f"使用隐形光标执行离散滚动: {ticks} 格")
+            logging.debug(f"使用隐形光标执行离散滚动: {ticks} 格")
             scroller = self.view.invisible_scroller
             try:
                 scroller.move(g_center_x, g_center_y)
@@ -2334,7 +2368,7 @@ class ScrollManager:
                 time.sleep(0.05)
                 scroller.park()
         else:
-            logging.info(f"使用用户光标执行离散滚动: {ticks} 格")
+            logging.debug(f"使用用户光标执行离散滚动: {ticks} 格")
             original_pos = self._get_pointer_position() # 逻辑px全局坐标
             self._set_pointer_position(g_center_x + 1, g_center_y + 1) 
             self._set_pointer_position(g_center_x, g_center_y)
@@ -2343,7 +2377,7 @@ class ScrollManager:
                 scrolled_via_xtest = False
                 if not IS_WAYLAND:
                     try:
-                        logging.info(f"使用 XTest 执行离散滚动: {ticks} 格")
+                        logging.debug(f"使用 XTest 执行离散滚动: {ticks} 格")
                         disp = display.Display()
                         button_code = 4 if ticks > 0 else 5
                         num_clicks = abs(ticks)
@@ -2363,13 +2397,19 @@ class ScrollManager:
                         except: pass
                 if not scrolled_via_xtest:
                     if self.view.evdev_wheel_scroller:
-                        logging.info(f"使用 Evdev 执行离散滚动: {ticks} 格")
+                        logging.debug(f"使用 Evdev 执行离散滚动: {ticks} 格")
                         try:
                             self.view.evdev_wheel_scroller.scroll_discrete(ticks)
                         except Exception as e:
                             logging.error(f"使用 Evdev 模拟滚动失败: {e}")
                     else:
                         logging.warning("滚动失败 Evdev 未配置")
+                        GLib.idle_add(
+                            send_desktop_notification,
+                            "自动滚动不可用",
+                            "滚动失败：XTest 无效且未检测到 Evdev 虚拟设备",
+                            "dialog-error", "warning"
+                        )
             except Exception as e:
                 logging.error(f"模拟滚动失败: {e}")
             if return_cursor:
@@ -2477,26 +2517,26 @@ class ActionController:
                 payload = result[1]
                 if result_type == 'ADD_RESULT':
                     filepath, width, height, overlap = payload
-                    logging.info(f"主线程: 处理结果 {Path(filepath).name}, overlap={overlap}")
+                    logging.debug(f"主线程: 处理结果 {Path(filepath).name}, overlap={overlap}")
                     self.stitch_model.add_entry(filepath, width, height, overlap)
                 elif result_type == 'LEARNED_SCROLL':
                     s_new = payload
                     if s_new not in self.session.known_scroll_distances:
                         self.session.known_scroll_distances.append(s_new)
-                        logging.info(f"主线程: 学习到新滚动距离: {s_new} 缓冲区px")
+                        logging.debug(f"主线程: 学习到新滚动距离: {s_new} 缓冲区px")
                 elif result_type == 'POP_REQUEST_RECEIVED':
-                    logging.info("主线程: 收到 Worker 的 POP 确认，执行模型删除")
+                    logging.debug("主线程: 收到 Worker 的 POP 确认，执行模型删除")
                     self.stitch_model.pop_entry()
                 elif result_type == 'BOTTOM_REACHED':
-                    logging.info("主线程: 收到 Worker 的 BOTTOM_REACHED 信号，停止自动滚动")
+                    logging.debug("主线程: 收到 Worker 的 BOTTOM_REACHED 信号，停止自动滚动")
                     if self.is_auto_scrolling:
                         GLib.idle_add(self.stop_auto_scroll, "检测到页面已到达底部")
                     else:
-                        logging.warning("收到 BOTTOM_REACHED 但当前并非自动滚动状态")
+                        logging.debug("收到 BOTTOM_REACHED 但当前并非自动滚动状态")
             except queue.Empty:
                 break
             except Exception as e:
-                logging.exception(f"处理 Worker 结果时出错: {e}")
+                logging.error(f"处理 Worker 结果时出错: {e}")
         return True
 
     @staticmethod
@@ -2516,14 +2556,14 @@ class ActionController:
     @staticmethod
     def _stitch_worker_loop(task_queue: queue.Queue, result_queue: queue.Queue, known_scroll_distances: list):
         """后台工作线程的主循环"""
-        logging.info("StitchWorker 线程开始运行...")
+        logging.debug("StitchWorker 线程开始运行...")
         while True:
             try:
                 task = task_queue.get(timeout=1)
             except queue.Empty:
                 continue
             if task is None or task.get('type') == 'EXIT':
-                logging.info("StitchWorker 收到退出信号")
+                logging.debug("StitchWorker 收到退出信号")
                 break
             if task.get('type') == 'ADD':
                 filepath_str = task.get('filepath')
@@ -2533,7 +2573,7 @@ class ActionController:
                 is_grid_mode = task.get('is_grid_mode', False)
                 grid_matching_enabled = task.get('grid_matching_enabled', False)
                 filepath = Path(filepath_str)
-                logging.info(f"StitchWorker: 处理 ADD 任务: {filepath.name}")
+                logging.debug(f"StitchWorker: 处理 ADD 任务: {filepath.name}")
                 if not filepath.is_file():
                     logging.error(f"StitchWorker: 文件不存在 {filepath}")
                     task_queue.task_done()
@@ -2557,7 +2597,7 @@ class ActionController:
                             max_overlap_to_use = config.FREE_SCROLL_MATCHING_MAX_OVERLAP
                     overlap = 0
                     if prev_filepath_str:
-                        logging.info(f"StitchWorker: 计算 {filepath.name} 与 {Path(prev_filepath_str).name} 的重叠")
+                        logging.debug(f"StitchWorker: 计算 {filepath.name} 与 {Path(prev_filepath_str).name} 的重叠")
                         img_top_np = cv2.imread(prev_filepath_str)
                         score = 0.0
                         if img_top_np is None: raise ValueError(f"无法加载上一张图片 {prev_filepath_str}")
@@ -2576,55 +2616,61 @@ class ActionController:
                                 valid_candidates.sort(key=lambda x: x[0], reverse=True)
                                 best_candidate = valid_candidates[0]
                                 predicted_overlap = best_candidate[0]
-                                logging.info(f"StitchWorker: 预测选中最佳 overlap={predicted_overlap} (score={best_candidate[1]:.3f})，候选数: {len(valid_candidates)}")
+                                logging.debug(f"StitchWorker: 预测选中最佳 overlap={predicted_overlap} (score={best_candidate[1]:.3f})，候选数: {len(valid_candidates)}")
                         if predicted_overlap != -1:
                             overlap = predicted_overlap
                         else:
                             if should_perform_matching:
                                 search_range = min(max_overlap_to_use, h_top - 1, h_new - 1)
                                 if search_range > 0:
-                                    logging.info(f"StitchWorker: 预测失败，执行全范围搜索 (max={search_range}px)...")
+                                    logging.debug(f"StitchWorker: 预测失败，执行全范围搜索 (max={search_range}px)...")
                                     found_overlap, score = _find_overlap_pyramid(img_top_np, img_new_np, search_range)
                                     s_new = h_new - found_overlap
                                     QUALITY_THRESHOLD = 0.95
                                     bottom_check_height = config.MIN_SCROLL_PER_TICK
                                     if score >= QUALITY_THRESHOLD and s_new >= ticks_scrolled*config.MIN_SCROLL_PER_TICK:
                                         overlap = found_overlap
-                                        logging.info(f"StitchWorker: 计算重叠成功: 滚动距离{s_new}px, score={score:.3f}")
+                                        logging.debug(f"StitchWorker: 计算重叠成功: 滚动距离{s_new}px, score={score:.3f}")
                                         is_stuck = False
                                         KNOWN_SCROLL_DEVIATION_LOW = 0.5
                                         KNOWN_SCROLL_DEVIATION_HIGH = 1.5
                                         if auto_mode_context is not None and known_scroll_distances:
                                             stable_distance = np.median(known_scroll_distances[-5:])
                                             if stable_distance > 0 and (s_new < (stable_distance * KNOWN_SCROLL_DEVIATION_LOW) or s_new > (stable_distance * KNOWN_SCROLL_DEVIATION_HIGH)):
-                                                logging.warning(f"StitchWorker: 检测到滚动距离异常。当前: {s_new}px, 稳定值: {stable_distance:.1f}px。")
+                                                logging.warning(f"StitchWorker: 检测到滚动距离异常。当前: {s_new}px, 稳定值: {stable_distance:.1f}px")
                                                 is_stuck = True
                                         if is_stuck:
                                             if ActionController._check_if_bottom_reached(img_top_np, img_new_np, bottom_check_height):
-                                                logging.info("StitchWorker: 滚动距离异常且检测到底部，发送 BOTTOM_REACHED 信号")
+                                                logging.debug("StitchWorker: 滚动距离异常且检测到底部，发送 BOTTOM_REACHED 信号")
                                                 result_queue.put(('BOTTOM_REACHED', None))
                                                 continue
                                             else:
-                                                logging.warning("StitchWorker: 滚动距离异常，但底部检测未通过。将接受此帧。")
+                                                logging.warning("StitchWorker: 滚动距离异常，但底部检测未通过。将接受此帧")
                                         if s_new > 0 and s_new not in known_scroll_distances:
                                             result_queue.put(('LEARNED_SCROLL', s_new))
                                     else:
                                         logging.warning(f"StitchWorker: 计算重叠失败 (score={score:.3f}, s_new={s_new}px). 阈值未满足 (score>={QUALITY_THRESHOLD} and s_new>={ticks_scrolled*config.MIN_SCROLL_PER_TICK})")
                                         if auto_mode_context is not None:
                                             if ActionController._check_if_bottom_reached(img_top_np, img_new_np, bottom_check_height):
-                                                logging.info("StitchWorker: 检测到底部，发送 BOTTOM_REACHED 信号")
+                                                logging.debug("StitchWorker: 检测到底部，发送 BOTTOM_REACHED 信号")
                                                 result_queue.put(('BOTTOM_REACHED', None))
                                                 continue
                                             else:
-                                                logging.info("StitchWorker: 重叠匹配失败，底部检测也未通过")
+                                                logging.debug("StitchWorker: 重叠匹配失败，底部检测也未通过")
                                 else:
                                     logging.warning("StitchWorker: 有效搜索范围为0，跳过重叠计算")
                             else:
-                                logging.info("StitchWorker: 无需进行匹配，设置 overlap=0")
+                                logging.debug("StitchWorker: 无需进行匹配，设置 overlap=0")
                                 overlap = 0
                     result_queue.put(('ADD_RESULT', (filepath_str, w_new, h_new, overlap)))
                 except Exception as e:
-                    logging.exception(f"StitchWorker: 处理 ADD 任务时出错 ({filepath.name}): {e}")
+                    logging.error(f"StitchWorker: 处理 ADD 任务时出错 ({filepath.name}): {e}")
+                    GLib.idle_add(
+                        send_desktop_notification,
+                        "图片处理错误",
+                        f"无法处理截图 {Path(filepath_str).name}: {e}\n该帧已被跳过，长图可能不完整",
+                        "dialog-warning", "warning"
+                    )
                     try:
                         if 'w_new' not in locals() or 'h_new' not in locals():
                             with Image.open(filepath) as img: w_new, h_new = img.size
@@ -2634,13 +2680,13 @@ class ActionController:
                 finally:
                     task_queue.task_done()
             elif task.get('type') == 'POP':
-                logging.info("StitchWorker: 收到 POP 任务，发送确认回主线程")
+                logging.debug("StitchWorker: 收到 POP 任务，发送确认回主线程")
                 result_queue.put(('POP_REQUEST_RECEIVED', None))
                 task_queue.task_done()
             else:
                 logging.warning(f"StitchWorker: 收到未知任务类型: {task.get('type')}")
                 task_queue.task_done()
-        logging.info("StitchWorker 线程已结束。")
+        logging.debug("StitchWorker 线程已结束。")
     # 缓冲区px }
 
     def handle_movement_action(self, direction: str, source: str = 'hotkey'):
@@ -2648,7 +2694,7 @@ class ActionController:
         if self.is_exiting:
             return
         if self.is_processing_movement:
-            logging.warning("正在处理上一个移动动作，忽略新的请求")
+            logging.debug("正在处理上一个移动动作，忽略新的请求")
             return
         if not self.grid_mode_controller.is_active:
             logging.warning("非整格模式下，前进/后退动作无效")
@@ -2673,12 +2719,12 @@ class ActionController:
             GLib.timeout_add(self.SCROLL_TIME_MS, callback)
             return False
         def do_capture_action(callback):
-            logging.info("执行截图...")
+            logging.debug("执行截图...")
             self.take_capture()
             GLib.timeout_add(self.CAPTURE_DELAY_MS, callback)
             return False
         def do_delete_action(callback):
-            logging.info("执行删除...")
+            logging.debug("执行删除...")
             self.delete_last_capture()
             GLib.timeout_add(self.CAPTURE_DELAY_MS, callback)
             return False
@@ -2708,13 +2754,13 @@ class ActionController:
     def take_capture(self, widget=None, auto_mode=False):
         """执行截图的核心逻辑"""
         if self.is_exiting:
-            return
+            return False
         grabbed_seat = None
         filepath = None
         self.auto_mode_context = None
         if not auto_mode and self.is_auto_scrolling:
-            logging.warning("自动滚动模式下忽略手动截图请求")
-            return
+            logging.debug("自动滚动模式下忽略手动截图请求")
+            return False
         try:
             # 逻辑px窗口坐标
             shot_x = self.session.geometry['x']
@@ -2726,7 +2772,7 @@ class ActionController:
             should_include_cursor = self.config.CAPTURE_WITH_CURSOR and not is_grid and not is_auto
             if auto_mode:
                 if self.is_first_auto_capture:
-                    logging.info("自动模式：截取首次完整高度")
+                    logging.debug("自动模式：截取首次完整高度")
                     cap_x, cap_y, cap_w, cap_h = shot_x, shot_y, shot_w, shot_h
                     self.auto_mode_context = {'initial_full': True}
                     self.is_first_auto_capture = False
@@ -2749,8 +2795,7 @@ class ActionController:
                 time.sleep(0.1)
             if cap_w <= 0.5 or cap_h <= 0.5:
                 logging.warning(f"捕获区域过小，跳过截图。尺寸: {cap_w}x{cap_h}")
-                send_desktop_notification("截图跳过", "选区太小，无法截图", "dialog-warning", level="warning")
-                return
+                return False
             filepath = config.TMP_DIR / f"{self._capture_filename_counter:04d}_capture.png"
             self._capture_filename_counter += 1
             if FRAME_GRABBER.capture(mon_x, mon_y, cap_w, cap_h, filepath, self.view.scale, include_cursor=should_include_cursor):
@@ -2768,13 +2813,17 @@ class ActionController:
                     'ticks_scrolled': self.config.AUTO_SCROLL_TICKS_PER_STEP if auto_mode and not self.auto_mode_context.get('initial_full', False) else 2
                 }
                 self.task_queue.put(task)
+                return True
             else:
                  logging.error(f"截图失败: {filepath}")
                  filepath = None
+                 send_desktop_notification("截图失败", "无法从屏幕获取图像，请检查日志", "dialog-error", level="warning")
+                 return False
         except Exception as e:
             logging.error(f"执行截图失败: {e}")
             send_desktop_notification("截图失败", f"无法执行截图命令: {e}", "dialog-warning", level="warning")
             filepath = None
+            return False
 
     def _move_cursor_out_if_needed(self, mon_x, mon_y, w, h, should_include_cursor):
         """Wayland 在自动模式和整格模式下如果配置为截取鼠标指针，则将其移动到截图区域之外"""
@@ -2800,7 +2849,7 @@ class ActionController:
         if abs_mouse:
             target_x_buf = min(target_x_buf, abs_mouse.max_x)
             target_y_buf = min(target_y_buf, abs_mouse.max_y)
-            logging.info(f"移动鼠标至区域外 ({target_x_buf}, {target_y_buf}) 以避开截图")
+            logging.debug(f"移动鼠标至区域外 ({target_x_buf}, {target_y_buf}) 以避开截图")
             abs_mouse.move(target_x_buf, target_y_buf)
 
     def delete_last_capture(self, widget=None):
@@ -2828,12 +2877,14 @@ class ActionController:
         self.auto_scroll_return_cursor = (source == 'button')
         if self.auto_scroll_return_cursor and self.config.SCROLL_METHOD == 'move_user_cursor':
             self.auto_scroll_original_cursor_pos = self.scroll_manager._get_pointer_position()
-            logging.info(f"自动模式：记录原始光标位置 {self.auto_scroll_original_cursor_pos}")
+            logging.debug(f"自动模式：记录原始光标位置 {self.auto_scroll_original_cursor_pos}")
         self.auto_scroll_needs_capture = False
         if self.stitch_model.capture_count == 0:
             logging.info("自动模式：首次启动，先进行一次完整截图")
             self.is_first_auto_capture = True
-            self.take_capture(auto_mode=True)
+            if not self.take_capture(auto_mode=True):
+                self.stop_auto_scroll("启动失败：无法捕获初始截图", level="warning")
+                return
             self.auto_scroll_timer_id = GLib.timeout_add(self.AUTO_CAPTURE_DELAY_MS, self._auto_scroll_step)
         else:
             logging.info("自动模式：继续添加截图，直接开始滚动")
@@ -2845,7 +2896,7 @@ class ActionController:
         btn_panel.btn_undo.set_sensitive(False)
         btn_panel.btn_auto_start.set_sensitive(False)
 
-    def stop_auto_scroll(self, reason_message=None):
+    def stop_auto_scroll(self, reason_message=None, level="normal"):
         if not self.is_auto_scrolling:
             return
         logging.info("正在停止自动滚动...")
@@ -2857,20 +2908,20 @@ class ActionController:
         if self.auto_scroll_timer_id:
             GLib.source_remove(self.auto_scroll_timer_id)
             self.auto_scroll_timer_id = None
-            logging.info("自动滚动定时器已移除")
+            logging.debug("自动滚动定时器已移除")
             if self.auto_scroll_needs_capture:
                 delay_ms = 300
                 GLib.timeout_add(delay_ms, self._perform_delayed_final_capture, should_restore)
                 should_restore = False
         self._release_movement_lock()
         if should_restore:
-            logging.info(f"自动模式结束：恢复原始光标位置到 {self.auto_scroll_original_cursor_pos}")
+            logging.debug(f"自动模式结束：恢复原始光标位置到 {self.auto_scroll_original_cursor_pos}")
             self.scroll_manager._set_pointer_position(*self.auto_scroll_original_cursor_pos)
             self.auto_scroll_original_cursor_pos = None
         if reason_message:
             send_desktop_notification("自动滚动已停止", reason_message, level="normal")
         else:
-            send_desktop_notification("自动模式已停止", "用户按快捷键停止", level="normal")
+            send_desktop_notification("自动模式已停止", "用户按快捷键停止", level=level)
         if self.grid_mode_controller.is_active:
             self.set_current_mode("整格模式")
         else:
@@ -2885,11 +2936,11 @@ class ActionController:
     def _perform_delayed_final_capture(self, should_restore_cursor=False):
         if self.is_exiting:
             return False
-        logging.info("自动模式：执行延迟后的最终截图")
+        logging.debug("自动模式：执行延迟后的最终截图")
         self.take_capture(auto_mode=True)
         self.auto_scroll_needs_capture = False
         if should_restore_cursor and self.auto_scroll_original_cursor_pos:
-            logging.info(f"延迟恢复原始光标位置到 {self.auto_scroll_original_cursor_pos}")
+            logging.debug(f"延迟恢复原始光标位置到 {self.auto_scroll_original_cursor_pos}")
             self.scroll_manager._set_pointer_position(*self.auto_scroll_original_cursor_pos)
             self.auto_scroll_original_cursor_pos = None
         return False
@@ -2899,14 +2950,14 @@ class ActionController:
             self._release_movement_lock()
             return False
         if self.is_processing_movement:
-            logging.warning("自动滚动：正在处理上一动作，等待100ms")
+            logging.debug("自动滚动：正在处理上一动作，等待100ms")
             self.auto_scroll_timer_id = GLib.timeout_add(100, self._auto_scroll_step)
             return False
         ticks_to_scroll = self.config.AUTO_SCROLL_TICKS_PER_STEP
         base_interval_ms = self.AUTO_SCROLL_INTERVAL_MS
         dynamic_interval_ms = int(base_interval_ms * (1 + 0.6 * (ticks_to_scroll - 1)))
         dynamic_interval_ms = min(dynamic_interval_ms, 2000)
-        logging.info(f"自动滚动: 滚动 {ticks_to_scroll} 格, 等待 {dynamic_interval_ms}ms 后截图")
+        logging.debug(f"自动滚动: 滚动 {ticks_to_scroll} 格, 等待 {dynamic_interval_ms}ms 后截图")
         self.scroll_manager.scroll_discrete(-ticks_to_scroll, return_cursor=False)
         self.auto_scroll_needs_capture = True
         self.is_processing_movement = True
@@ -2920,7 +2971,9 @@ class ActionController:
         if not self.is_auto_scrolling:
             self._release_movement_lock()
             return False
-        self.take_capture(auto_mode=True)
+        if not self.take_capture(auto_mode=True):
+            self.stop_auto_scroll("截图失败", level="warning")
+            return False
         self.is_processing_movement = False
         self.auto_scroll_needs_capture = False
         self.auto_scroll_timer_id = GLib.timeout_add(
@@ -2932,30 +2985,44 @@ class ActionController:
     def finalize_and_quit(self, widget=None):
         """执行完成拼接并退出的逻辑"""
         # 缓冲区px
+        if not self.config.SAVE_DIRECTORY:
+            logging.warning("保存目录未配置，中止完成流程")
+            send_desktop_notification(
+                title="配置缺失",
+                message="请先设置图片保存目录，设置完成后配置即生效",
+                sound_name="dialog-warning",
+                level="warning"
+            )
+            if not self.view.config_panel.get_visible():
+                self.view.toggle_config_panel()
+            self.view.config_panel.switch_to_page("output")
+            self.view.config_panel.set_advanced_mode(True)
+            self.view.config_panel.save_dir_entry.grab_focus()
+            return
         if self.is_exiting:
-            logging.warning("正在退出中，忽略完成请求")
+            logging.debug("正在退出中，忽略完成请求")
             return
         if self.is_auto_scrolling:
             self.stop_auto_scroll()
         if self.stitch_model.capture_count == 0:
-            logging.warning("未进行任何截图。正在退出")
+            logging.info("未进行任何截图。正在退出")
             self.quit_and_cleanup()
             return
         if hotkey_listener and hotkey_listener.is_alive():
             hotkey_listener.stop()
         self.is_exiting = True
-        logging.info("请求停止 StitchWorker 并等待...")
+        logging.debug("请求停止 StitchWorker 并等待...")
         self.task_queue.put({'type': 'EXIT'})
         self.stitch_worker.join(timeout=2.0)
         self.stitch_worker_running = False
         self._check_result_queue()
-        logging.info("StitchWorker 已停止且结果队列已清空.")
+        logging.debug("StitchWorker 已停止且结果队列已清空")
         processing_panel, progress_bar = self.view._show_processing_panel()
         if self.view.preview_panel and self.view.preview_panel.get_visible():
-             logging.info("检测到预览面板已打开，正在隐藏它...")
+             logging.debug("检测到预览面板已打开，正在隐藏它...")
              GLib.idle_add(self.view.preview_panel.hide)
         if self.view.config_panel and self.view.config_panel.get_visible():
-             logging.info("检测到配置面板已打开，正在隐藏它...")
+             logging.debug("检测到配置面板已打开，正在隐藏它...")
              GLib.idle_add(self.view.config_panel.hide)
         render_plan_snapshot = list(self.stitch_model.render_plan)
         image_width_snapshot = self.stitch_model.image_width
@@ -2973,7 +3040,7 @@ class ActionController:
 
     def _release_heavy_resources(self):
         """在保持窗口显示通知的同时，释放线程等重资源"""
-        logging.info("正在释放重资源...")
+        logging.debug("正在释放重资源...")
         if FRAME_GRABBER:
             FRAME_GRABBER.cleanup()
         if self.view.invisible_scroller:
@@ -3034,19 +3101,19 @@ class ActionController:
                 GLib.idle_add(progress_bar.set_fraction, 1.0)
                 save_start_time = time.perf_counter()
                 if config.SAVE_FORMAT == 'JPEG':
-                    logging.info(f"以 JPEG 格式保存，质量为 {config.JPEG_QUALITY}")
+                    logging.debug(f"以 JPEG 格式保存，质量为 {config.JPEG_QUALITY}")
                     if stitched_image.mode == 'RGBA':
                         stitched_image = stitched_image.convert('RGB')
                     stitched_image.save(str(output_file), 'JPEG', quality=config.JPEG_QUALITY)
                 else:
-                    logging.info("以 PNG 格式保存")
+                    logging.debug("以 PNG 格式保存")
                     stitched_image.save(str(output_file), 'PNG')
                 save_duration = time.perf_counter() - save_start_time
                 logging.info(f"图片成功使用 Pillow 拼接并保存到: {output_file}，保存耗时: {save_duration:.3f} 秒")
                 message = f"已保存到: {output_file}"
                 if config.COPY_TO_CLIPBOARD:
                     update_label_text("复制到剪贴板...")
-                    logging.info("开始复制到剪贴板")
+                    logging.debug("开始复制到剪贴板")
                     GLib.idle_add(_schedule_clipboard_task, output_file)
                     message += "\n并已复制到剪贴板"
                 total_finalize_duration = time.perf_counter() - finalize_start_time
@@ -3057,10 +3124,13 @@ class ActionController:
                         message=message,
                         sound_name=config.FINALIZE_SOUND,
                         level="success",
-                        action_path=output_file,
-                        controller=self,
-                        width=image_width,
-                        height=total_height,
+                        timeout=8,
+                        action_config={
+                            'path': output_file,
+                            'controller': self,
+                            'width': image_width,
+                            'height': total_height
+                        }
                     )
                 )
                 self._release_heavy_resources()
@@ -3082,7 +3152,7 @@ class ActionController:
     def quit_and_cleanup(self, widget=None):
         """处理带确认的退出逻辑"""
         if self.is_exiting:
-            logging.warning("正在退出中，忽略重复退出请求")
+            logging.debug("正在退出中，忽略重复退出请求")
             return
         if self.is_auto_scrolling:
             self.stop_auto_scroll()
@@ -3108,25 +3178,25 @@ class ActionController:
         if self.result_check_timer_id:
              GLib.source_remove(self.result_check_timer_id)
              self.result_check_timer_id = None
-             logging.info("结果检查定时器已移除")
+             logging.debug("结果检查定时器已移除")
         if self.stitch_worker_running:
-             logging.info("检测到 StitchWorker 仍在运行，尝试最后停止...")
+             logging.debug("检测到 StitchWorker 仍在运行，尝试最后停止...")
              self.task_queue.put({'type': 'EXIT'})
              self.stitch_worker.join(timeout=0.5)
              self.stitch_worker_running = False
         if self.view.invisible_scroller:
             cleanup_thread = threading.Thread(target=self.view.invisible_scroller.cleanup)
             cleanup_thread.start()
-            logging.info("InvisibleCursorScroller.cleanup() 正在后台线程中执行")
+            logging.debug("InvisibleCursorScroller.cleanup() 正在后台线程中执行")
         if self.view.evdev_wheel_scroller:
             self.view.evdev_wheel_scroller.close()
-            logging.info("EvdevWheelScroller 已关闭")
+            logging.debug("EvdevWheelScroller 已关闭")
         if self.scroll_manager.evdev_abs_mouse:
             self.scroll_manager.evdev_abs_mouse.close()
-            logging.info("EvdevAbsoluteMouse 已关闭")
+            logging.debug("EvdevAbsoluteMouse 已关闭")
         if FRAME_GRABBER:
             FRAME_GRABBER.cleanup()
-            logging.info("FrameGrabber 已清理")
+            logging.debug("FrameGrabber 已清理")
         self.session.cleanup()
         Gtk.main_quit()
 
@@ -3137,7 +3207,7 @@ class ActionController:
         if hotkey_listener and hotkey_listener.running and are_hotkeys_enabled:
             return False
         if not are_hotkeys_enabled and not self.view.is_dialog_open:
-            logging.info("CaptureOverlay 热键被禁用，忽略按键。")
+            logging.debug("CaptureOverlay 热键被禁用，忽略按键。")
             return True
         if self.view.is_dialog_open:
             return True
@@ -3344,7 +3414,7 @@ class ButtonPanel(Gtk.Box):
         self.btn_auto_stop.set_visible(config.ENABLE_AUTO_SCROLL_BUTTONS)
         self.separator_auto_main.set_visible(config.ENABLE_AUTO_SCROLL_BUTTONS)
         _, self._button_natural_h_normal = self.get_preferred_height()
-        logging.info(f"缓存的 ButtonPanel 普通模式自然高度: {self._button_natural_h_normal} 逻辑px")
+        logging.debug(f"缓存的 ButtonPanel 普通模式自然高度: {self._button_natural_h_normal} 逻辑px")
         self.btn_grid_backward.set_visible(config.ENABLE_GRID_ACTION_BUTTONS)
         self.btn_grid_forward.set_visible(config.ENABLE_GRID_ACTION_BUTTONS)
         self.separator_grid_auto.set_visible(config.ENABLE_GRID_ACTION_BUTTONS)
@@ -3352,7 +3422,7 @@ class ButtonPanel(Gtk.Box):
         self.btn_auto_stop.set_visible(False)
         self.separator_auto_main.set_visible(False)
         _, self._button_natural_h_grid = self.get_preferred_height()
-        logging.info(f"缓存的 ButtonPanel 整格模式自然高度: {self._button_natural_h_grid} 逻辑px")
+        logging.debug(f"缓存的 ButtonPanel 整格模式自然高度: {self._button_natural_h_grid} 逻辑px")
         self.set_grid_action_buttons_visible(False)
 
     def set_grid_action_buttons_visible(self, visible: bool):
@@ -3473,9 +3543,9 @@ class SidePanel(Gtk.Box):
         self.info_panel.show()
         self.function_panel.show()
         _, self._info_natural_h = self.info_panel.get_preferred_height()
-        logging.info(f"缓存的 InfoPanel 自然高度: {self._info_natural_h} 逻辑px")
+        logging.debug(f"缓存的 InfoPanel 自然高度: {self._info_natural_h} 逻辑px")
         _, self._func_natural_h = self.function_panel.get_preferred_height()
-        logging.info(f"缓存的 FunctionPanel 自然高度: {self._func_natural_h} 逻辑px")
+        logging.debug(f"缓存的 FunctionPanel 自然高度: {self._func_natural_h} 逻辑px")
 
     def update_visibility_by_height(self, available_height: int, is_grid_mode: bool):
         should_show_info_base = config.ENABLE_SIDE_PANEL and (config.SHOW_CAPTURE_COUNT or config.SHOW_TOTAL_DIMENSIONS or config.SHOW_CURRENT_MODE)
@@ -3695,6 +3765,19 @@ class SimulatedWindow(Gtk.EventBox):
 
     def _on_panel_press(self, widget, event):
         if event.button == 1:
+            target_widget = Gtk.get_event_widget(event)
+            is_clicking_input = False
+            current_check = target_widget
+            while current_check and current_check != widget:
+                if isinstance(current_check, (Gtk.Entry, Gtk.TextView, Gtk.SpinButton, Gtk.SearchEntry)):
+                    is_clicking_input = True
+                    break
+                current_check = current_check.get_parent()
+            if not is_clicking_input:
+                toplevel = self.get_toplevel()
+                if toplevel and isinstance(toplevel, Gtk.Window):
+                    if toplevel.get_focus():
+                        toplevel.set_focus(None)
             edge = self._get_panel_edge(event.x, event.y)
             win_x, win_y = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
             self._drag_anchor_mouse = (win_x, win_y)
@@ -3845,6 +3928,7 @@ class EmbeddedFileChooser(SimulatedWindow):
     def __init__(self, parent_overlay):
         super().__init__(parent_overlay, title="选择目录", css_class="simulated-window", resizable=True)
         self.target_entry = None
+        self.on_selected_callback = None
         self.chooser = Gtk.FileChooserWidget(action=Gtk.FileChooserAction.SELECT_FOLDER)
         self.add_content(self.chooser, expand=True, fill=True)
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -3865,8 +3949,9 @@ class EmbeddedFileChooser(SimulatedWindow):
         self.set_size_request(nat_size.width, 800)
         self.hide()
 
-    def open_for(self, entry_widget):
+    def open_for(self, entry_widget, callback=None):
         self.target_entry = entry_widget
+        self.on_selected_callback = callback
         current_path = entry_widget.get_text()
         if current_path and os.path.isdir(current_path):
             self.chooser.set_current_folder(current_path)
@@ -3876,7 +3961,12 @@ class EmbeddedFileChooser(SimulatedWindow):
     def _on_select_clicked(self, widget):
         filename = self.chooser.get_filename()
         if filename and self.target_entry:
+            context = self.target_entry.get_style_context()
+            if context.has_class("dir-not-set"):
+                context.remove_class("dir-not-set")
             self.target_entry.set_text(filename)
+            if self.on_selected_callback:
+                self.on_selected_callback(filename)
         self.hide()
 
 class EmbeddedColorChooser(SimulatedWindow):
@@ -3931,6 +4021,7 @@ class ConfigPanel(SimulatedWindow):
         self.config = config_obj
         self.show_advanced = False
         self.input_has_focus = False
+        self.DIR_PLACEHOLDER = "目录未设置 (请点击浏览按钮选择)"
         self.managed_settings = [
             ('Output', 'save_directory'), ('Output', 'save_format'),
             ('Output', 'jpeg_quality'), ('Output', 'filename_template'),
@@ -4019,7 +4110,7 @@ class ConfigPanel(SimulatedWindow):
         global hotkey_listener
         if hotkey_listener and are_hotkeys_enabled:
             hotkey_listener.set_normal_keys_grabbed(True)
-            logging.info("配置面板隐藏，全局热键已恢复")
+            logging.debug("配置面板隐藏，全局热键已恢复")
         if self.is_maximized:
             self._restore_panel()
         self.user_has_moved = False
@@ -4034,7 +4125,7 @@ class ConfigPanel(SimulatedWindow):
         if self.log_timer_id:
             GLib.source_remove(self.log_timer_id)
             self.log_timer_id = None
-            logging.info("配置面板的日志更新定时器已成功移除")
+            logging.debug("配置面板的日志更新定时器已成功移除")
         self._save_all_configs()
 
     def ensure_z_order(self):
@@ -4046,26 +4137,6 @@ class ConfigPanel(SimulatedWindow):
         if self.color_chooser_panel and self.color_chooser_panel.get_visible():
             if self.color_chooser_panel.get_window():
                 self.color_chooser_panel.get_window().raise_()
-
-    def _on_input_focus_in(self, widget, event):
-        self.input_has_focus = True
-        logging.info(f"输入控件 {type(widget).__name__} 获得焦点，全局热键暂停")
-        global hotkey_listener
-        if hotkey_listener:
-            hotkey_listener.set_normal_keys_grabbed(False)
-        return False
-
-    def _on_input_focus_out(self, widget, event):
-        self.input_has_focus = False
-        logging.info(f"输入控件 {type(widget).__name__} 失去焦点，全局热键恢复")
-        global hotkey_listener
-        if hotkey_listener and not self.capturing_hotkey_button and are_hotkeys_enabled:
-            hotkey_listener.set_normal_keys_grabbed(True)
-        return False
-
-    def _connect_focus_handlers(self, widget):
-        widget.connect("focus-in-event", self._on_input_focus_in)
-        widget.connect("focus-out-event", self._on_input_focus_out)
 
     def _check_log_queue(self):
         """定时器回调，检查队列中是否有新日志"""
@@ -4084,6 +4155,15 @@ class ConfigPanel(SimulatedWindow):
 
     def _insert_record_into_buffer(self, record):
         if not self.log_text_buffer: return
+        should_scroll = False
+        if self.log_autoscroll_checkbutton.get_active():
+            has_focus = self.log_textview.is_focus()
+            adj = self.log_scrolled_window.get_vadjustment()
+            current_pos = adj.get_value()
+            max_pos = adj.get_upper() - adj.get_page_size()
+            is_at_bottom = (max_pos - current_pos) < 20
+            if not has_focus and is_at_bottom:
+                should_scroll = True
         message = self.log_formatter.format(record)
         tag = self.log_tags.get(record.levelname)
         end_iter = self.log_text_buffer.get_end_iter()
@@ -4091,7 +4171,7 @@ class ConfigPanel(SimulatedWindow):
             self.log_text_buffer.insert_with_tags(end_iter, message + '\n', tag)
         else:
             self.log_text_buffer.insert(end_iter, message + '\n')
-        if self.log_autoscroll_checkbutton.get_active():
+        if should_scroll:
             GLib.idle_add(self._scroll_to_end_of_log)
 
     def _on_filter_changed(self, widget):
@@ -4108,24 +4188,21 @@ class ConfigPanel(SimulatedWindow):
     def _scroll_to_end_of_log(self):
         """将日志视图滚动到末尾"""
         if self.is_destroyed:
-            logging.info("_scroll_to_end_of_log: 窗口已销毁，放弃滚动")
+            logging.debug("_scroll_to_end_of_log: 窗口已销毁，放弃滚动")
             return False
         if self.log_text_buffer:
             end_iter = self.log_text_buffer.get_end_iter()
             self.log_textview.scroll_to_iter(end_iter, 0.0, True, 0.0, 1.0)
         return False
 
-    def _on_clear_log_clicked(self, widget):
-        """清空日志按钮的回调"""
-        self.all_log_records.clear()
-        if self.log_text_buffer:
-            self.log_text_buffer.set_text("")
-
     def _create_log_tags(self):
         """为不同的日志级别创建并配置 TextTag"""
         if not self.log_text_buffer:
             return
         tag_table = self.log_text_buffer.get_tag_table()
+        self.log_tags['DEBUG'] = Gtk.TextTag(name="debug")
+        self.log_tags['DEBUG'].set_property("foreground", "#708090")
+        tag_table.add(self.log_tags['DEBUG'])
         self.log_tags['INFO'] = Gtk.TextTag(name="info")
         self.log_tags['INFO'].set_property("foreground", "#2b2b2b")
         tag_table.add(self.log_tags['INFO'])
@@ -4135,19 +4212,14 @@ class ConfigPanel(SimulatedWindow):
         self.log_tags['ERROR'] = Gtk.TextTag(name="error")
         self.log_tags['ERROR'].set_property("foreground", "#DC143C")
         tag_table.add(self.log_tags['ERROR'])
-        self.log_tags['DEBUG'] = Gtk.TextTag(name="debug")
-        self.log_tags['DEBUG'].set_property("foreground", "#00BFFF")
-        tag_table.add(self.log_tags['DEBUG'])
 
     def _on_copy_log_clicked(self, button):
         """复制日志按钮的回调"""
-        if not self.log_text_buffer:
+        if not self.all_log_records:
             return
         clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        start_iter, end_iter = self.log_text_buffer.get_bounds()
-        full_log_text = self.log_text_buffer.get_text(start_iter, end_iter, False)
+        full_log_text = "\n".join([self.log_formatter.format(r) for r in self.all_log_records])
         clipboard.set_text(full_log_text, -1)
-        logging.info("日志内容已复制到剪贴板")
         original_label = button.get_label()
         button.set_sensitive(False)
         button.set_label("已复制!")
@@ -4231,7 +4303,7 @@ class ConfigPanel(SimulatedWindow):
         global hotkey_listener
         if hotkey_listener:
             hotkey_listener.set_normal_keys_grabbed(False)
-            logging.info("开始捕获快捷键，全局热键暂停")
+            logging.debug("开始捕获快捷键，全局热键暂停")
 
     def handle_key_press(self, widget, event):
         if self.capturing_hotkey_button:
@@ -4251,7 +4323,7 @@ class ConfigPanel(SimulatedWindow):
             self.capturing_hotkey_button = None
             if hotkey_listener and not self.input_has_focus and are_hotkeys_enabled:
                 hotkey_listener.set_normal_keys_grabbed(True)
-                logging.info("无效捕获，全局热键恢复")
+                logging.debug("无效捕获，全局热键恢复")
             return True
         dialog_scope = ['dialog_confirm', 'dialog_cancel']
         is_dialog_key = current_key in dialog_scope
@@ -4281,7 +4353,7 @@ class ConfigPanel(SimulatedWindow):
         self.capturing_hotkey_button = None
         if hotkey_listener and not self.input_has_focus and are_hotkeys_enabled:
             hotkey_listener.set_normal_keys_grabbed(True)
-            logging.info("快捷键捕获结束，全局热键恢复")
+            logging.debug("快捷键捕获结束，全局热键恢复")
         return True
 
     def _setup_ui(self):
@@ -4330,6 +4402,13 @@ class ConfigPanel(SimulatedWindow):
         # 底部全局操作区
         self._create_bottom_panel(main_vbox)
 
+    def switch_to_page(self, page_name):
+        self.stack.set_visible_child_name(page_name)
+
+    def set_advanced_mode(self, enabled):
+        if self.advanced_switch.get_active() != enabled:
+            self.advanced_switch.set_active(enabled)
+
     def _create_log_viewer_page(self):
         """创建日志查看器页面"""
         page_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -4340,18 +4419,20 @@ class ConfigPanel(SimulatedWindow):
         # 顶部工具栏
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         page_vbox.pack_start(toolbar, False, False, 0)
-        clear_button = Gtk.Button(label="清空日志")
-        clear_button.connect("clicked", self._on_clear_log_clicked)
-        toolbar.pack_start(clear_button, False, False, 0)
-        copy_button = Gtk.Button(label="复制日志")
+        copy_button = Gtk.Button(label="复制全部日志")
         copy_button.connect("clicked", self._on_copy_log_clicked)
         toolbar.pack_start(copy_button, False, False, 0)
         filter_label = Gtk.Label(label=" | 过滤:")
         toolbar.pack_start(filter_label, False, False, 10)
-        log_levels_to_filter = ["INFO", "WARNING", "ERROR"]
-        for level in log_levels_to_filter:
+        log_levels_config = [
+            ("DEBUG", False),
+            ("INFO", True),
+            ("WARNING", True),
+            ("ERROR", True)
+        ]
+        for level, default_active in log_levels_config:
             checkbox = Gtk.CheckButton(label=level)
-            checkbox.set_active(True)
+            checkbox.set_active(default_active)
             checkbox.connect("toggled", self._on_filter_changed)
             toolbar.pack_start(checkbox, False, False, 0)
             self.filter_checkboxes[level] = checkbox
@@ -4360,6 +4441,7 @@ class ConfigPanel(SimulatedWindow):
         toolbar.pack_start(self.log_autoscroll_checkbutton, False, False, 10)
         # 日志显示区域
         scrolled_window = Gtk.ScrolledWindow()
+        self.log_scrolled_window = scrolled_window
         scrolled_window.set_hexpand(True)
         scrolled_window.set_vexpand(True)
         scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -4406,7 +4488,12 @@ class ConfigPanel(SimulatedWindow):
         x = (valid_w - req_w) // 2
         y = (valid_h - req_h) // 2
         self.parent_overlay.fixed_container.move(self.file_chooser_panel, max(0, x), max(0, y))
-        self.file_chooser_panel.open_for(self.save_dir_entry)
+        def on_dir_selected(path_str):
+            if path_str:
+                self.config.SAVE_DIRECTORY = Path(path_str)
+                self.config.parser.set('Output', 'save_directory', path_str)
+                logging.info(f"保存目录已立即更新为: {self.config.SAVE_DIRECTORY}")
+        self.file_chooser_panel.open_for(self.save_dir_entry, callback=on_dir_selected)
 
     def _show_embedded_color_chooser(self, target_button):
         global_mouse_pos = self.parent_overlay.controller.scroll_manager._get_pointer_position()
@@ -4496,8 +4583,8 @@ class ConfigPanel(SimulatedWindow):
         grid1.attach(label, 0, 0, 1, 1)
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.save_dir_entry = Gtk.Entry()
-        self._connect_focus_handlers(self.save_dir_entry)
         self.save_dir_entry.set_editable(False)
+        self.save_dir_entry.set_placeholder_text("目录未设置 (请选择保存目录)")
         self.save_dir_entry.set_hexpand(True)
         hbox.pack_start(self.save_dir_entry, True, True, 0)
         # 创建“浏览”按钮
@@ -4524,7 +4611,6 @@ class ConfigPanel(SimulatedWindow):
         self.jpeg_label.set_tooltip_markup("设置 JPEG 图片的压缩质量，范围 1-100")
         self.jpeg_quality_spin = Gtk.SpinButton()
         self.jpeg_quality_spin.set_tooltip_markup(self.jpeg_label.get_tooltip_markup())
-        self._connect_focus_handlers(self.jpeg_quality_spin)
         self.jpeg_quality_spin.connect("scroll-event", lambda widget, event: True)
         self.jpeg_quality_spin.set_halign(Gtk.Align.START)
         self.jpeg_quality_spin.set_range(1, 100)
@@ -4547,7 +4633,6 @@ class ConfigPanel(SimulatedWindow):
         label.set_tooltip_markup("定义保存文件的名称模板\n变量 <b>{timestamp}</b> 会被替换为下方格式定义的时间戳")
         self.filename_entry = Gtk.Entry()
         self.filename_entry.set_tooltip_markup(label.get_tooltip_markup())
-        self._connect_focus_handlers(self.filename_entry)
         help_label = Gtk.Label(label="可用变量: {timestamp}")
         help_label.set_markup("<small>可用变量: {timestamp}</small>")
         grid2.attach(label, 0, 0, 1, 1)
@@ -4558,7 +4643,6 @@ class ConfigPanel(SimulatedWindow):
         label.set_tooltip_markup("用于生成文件名的 Python strftime 格式字符串\n常用占位符: <b>%Y</b>(年) <b>%m</b>(月) <b>%d</b>(日) <b>%H</b>(时) <b>%M</b>(分) <b>%S</b>(秒)")
         self.timestamp_entry = Gtk.Entry()
         self.timestamp_entry.set_tooltip_markup(label.get_tooltip_markup())
-        self._connect_focus_handlers(self.timestamp_entry)
         help_label = Gtk.Label(label="遵循 Python strftime 格式")
         help_label.set_markup("<small>遵循 Python strftime 格式</small>")
         grid2.attach(label, 0, 2, 1, 1)
@@ -4825,7 +4909,6 @@ class ConfigPanel(SimulatedWindow):
         # 边框宽度
         label = Gtk.Label(label="边框宽度:", xalign=0)
         self.border_width_spin = Gtk.SpinButton()
-        self._connect_focus_handlers(self.border_width_spin)
         self.border_width_spin.connect("scroll-event", lambda widget, event: True)
         self.border_width_spin.set_range(1, 25)
         self.border_width_spin.set_increments(1, 5)
@@ -4859,7 +4942,6 @@ class ConfigPanel(SimulatedWindow):
             label.set_tooltip_markup(tooltip)
             spin = Gtk.SpinButton()
             spin.set_tooltip_markup(tooltip)
-            self._connect_focus_handlers(spin)
             spin.connect("scroll-event", lambda widget, event: True)
             spin.set_range(min_val, max_val)
             spin.set_increments(1, 5)
@@ -4901,7 +4983,6 @@ class ConfigPanel(SimulatedWindow):
             textview = Gtk.TextView()
             textview.set_wrap_mode(Gtk.WrapMode.WORD)
             scrolled_css.add(textview)
-            self._connect_focus_handlers(textview)
             frame = Gtk.Frame()
             frame.set_shadow_type(Gtk.ShadowType.IN)
             frame.add(scrolled_css)
@@ -4928,7 +5009,7 @@ class ConfigPanel(SimulatedWindow):
                         sounds.append(sound_file.stem)
                 if sounds:
                     themes[theme_name] = sorted(sounds)
-        logging.info(f"发现 {len(themes)} 个声音主题")
+        logging.debug(f"发现 {len(themes)} 个声音主题")
         return themes
 
     def _on_sound_theme_changed(self, combo):
@@ -4954,7 +5035,7 @@ class ConfigPanel(SimulatedWindow):
         theme_name = theme_combo.get_active_id()
         sound_name = sound_combo.get_active_id()
         if theme_name and sound_name:
-            logging.info(f"试听音效: 主题='{theme_name}', 声音='{sound_name}'")
+            logging.debug(f"试听音效: 主题='{theme_name}', 声音='{sound_name}'")
             play_sound(sound_name, theme_name=theme_name)
         elif not theme_name:
             logging.warning("无法试听：请先选择一个声音主题")
@@ -5026,7 +5107,6 @@ class ConfigPanel(SimulatedWindow):
         help_label.set_markup("<small>可用变量: {filepath}, default_browser</small>")
         grid1.attach(label, 0, 2, 1, 1)
         grid1.attach(self.large_opener_entry, 1, 2, 1, 1)
-        self._connect_focus_handlers(self.large_opener_entry)
         grid1.attach(help_label, 1, 3, 1, 1)
         # 声音主题
         frame2 = Gtk.Frame(label="声音主题")
@@ -5097,7 +5177,6 @@ class ConfigPanel(SimulatedWindow):
             label.set_tooltip_markup(tooltip)
             spin = Gtk.SpinButton()
             spin.set_tooltip_markup(tooltip)
-            self._connect_focus_handlers(spin)
             spin.connect("scroll-event", lambda widget, event: True)
             spin.set_range(min_val, max_val)
             spin.set_increments(1, 10)
@@ -5129,7 +5208,6 @@ class ConfigPanel(SimulatedWindow):
             label.set_tooltip_markup(tooltip)
             entry = Gtk.Entry()
             entry.set_tooltip_markup(tooltip)
-            self._connect_focus_handlers(entry)
             entry.set_hexpand(True)
             grid4.attach(label, 0, i, 1, 1)
             grid4.attach(entry, 1, i, 1, 1)
@@ -5176,13 +5254,11 @@ class ConfigPanel(SimulatedWindow):
         hbox.set_margin_bottom(5)
         row.add(hbox)
         entry = Gtk.Entry()
-        self._connect_focus_handlers(entry)
         entry.connect("button-press-event", self._on_grid_row_child_clicked)
         entry.set_placeholder_text("应用程序类名")
         entry.set_text(app_class)
         entry.set_hexpand(True)
         spin = Gtk.SpinButton()
-        self._connect_focus_handlers(spin)
         spin.connect("button-press-event", self._on_grid_row_child_clicked)
         spin.connect("scroll-event", lambda widget, event: True)
         spin.set_range(1, 300)
@@ -5247,7 +5323,6 @@ class ConfigPanel(SimulatedWindow):
         for i, (key, desc) in enumerate(string_configs):
             label = Gtk.Label(label=f"{desc}:", xalign=0)
             entry = Gtk.Entry()
-            self._connect_focus_handlers(entry)
             entry.set_hexpand(True)
             grid.attach(label, 0, i, 1, 1)
             grid.attach(entry, 1, i, 1, 1)
@@ -5355,7 +5430,10 @@ class ConfigPanel(SimulatedWindow):
                 return self.config.parser.get('Hotkeys', key, fallback="")
             return label
         elif isinstance(widget, Gtk.Entry):
-            return widget.get_text()
+            text = widget.get_text()
+            if text == self.DIR_PLACEHOLDER and widget.get_style_context().has_class("dir-not-set"):
+                return ""
+            return text
         elif isinstance(widget, Gtk.ComboBoxText):
             return widget.get_active_id()
         elif isinstance(widget, Gtk.SpinButton):
@@ -5384,7 +5462,12 @@ class ConfigPanel(SimulatedWindow):
                 logging.warning(f"配置文件中的颜色值 '{value}' 格式错误，应为 'r, g, b, a'。跳过设置")
         elif isinstance(widget, (Gtk.Entry, Gtk.Button)):
             if key == 'save_directory':
-                widget.set_text(str(Path(value).expanduser()))
+                if value and value.strip():
+                    widget.get_style_context().remove_class("dir-not-set")
+                    widget.set_text(str(Path(value).expanduser()))
+                else:
+                    widget.get_style_context().add_class("dir-not-set")
+                    widget.set_text(self.DIR_PLACEHOLDER)
             else:
                 widget.set_label(value) if isinstance(widget, Gtk.Button) else widget.set_text(value)
         elif isinstance(widget, Gtk.ComboBoxText):
@@ -5451,12 +5534,15 @@ class ConfigPanel(SimulatedWindow):
                 enabled = check.get_active()
                 value_to_save = f"{unit},{str(enabled).lower()}"
                 p.set('ApplicationScrollUnits', app_class, value_to_save)
+        save_dir_str = p.get('Output', 'save_directory', fallback='')
+        self.config.SAVE_DIRECTORY = Path(save_dir_str).expanduser() if save_dir_str.strip() else None
         try:
             with open(self.config.config_path, 'w') as configfile:
                 p.write(configfile)
             logging.info(f"所有配置已成功保存到 {self.config.config_path}")
         except Exception as e:
             logging.error(f"写入配置文件失败: {e}")
+            send_desktop_notification("配置保存失败", f"无法写入配置文件: {e}\n更改可能未保存", "dialog-error", level="warning")
 
 class PreviewPanel(SimulatedWindow):
     """显示截图预览的滚动窗口"""
@@ -5731,9 +5817,9 @@ class PreviewPanel(SimulatedWindow):
         widget.queue_draw()
 
     def on_model_updated(self, model_instance):
-        logging.info("预览面板收到模型更新信号，准备更新尺寸并重绘")
+        logging.debug("预览面板收到模型更新信号，准备更新尺寸并重绘")
         if self.model.capture_count == 0 and self.is_selection_mode:
-            logging.info("预览面板：模型已空，自动退出选择模式")
+            logging.debug("预览面板：模型已空，自动退出选择模式")
             self._on_cancel_selection_mode(None)
         v_adj = self.scrolled_window.get_vadjustment()
         old_upper = v_adj.get_upper()
@@ -5958,7 +6044,7 @@ class PreviewPanel(SimulatedWindow):
             'y_end_abs': max(y1_abs, y2_abs)
         }
         if self.model.modifications and self.model.modifications[-1] == mod:
-            logging.info("StitchModel: 跳过添加重复的 'delete' 修改")
+            logging.debug("StitchModel: 跳过添加重复的 'delete' 修改")
             return
         self.model.add_modification(mod)
         self.drawing_area.queue_draw()
@@ -5983,7 +6069,7 @@ class PreviewPanel(SimulatedWindow):
             seam_end_abs = next_piece['absolute_y_start'] + original_overlap
             if (seam_start_abs >= selection_start_abs) and (seam_start_abs < selection_end_abs):
                 if i in restored_seams_indices:
-                    logging.info(f"接缝 {i} (a-y {seam_start_abs:.0f}) 已被恢复，跳过重复添加。")
+                    logging.debug(f"接缝 {i} (a-y {seam_start_abs:.0f}) 已被恢复，跳过重复添加。")
                     continue
                 seam_deleted = False
                 for mod in self.model.modifications:
@@ -5992,9 +6078,9 @@ class PreviewPanel(SimulatedWindow):
                             seam_deleted = True
                             break
                 if seam_deleted:
-                    logging.info(f"接缝 {i} (a-y {seam_start_abs:.0f}) 在选区内，但已被删除，跳过恢复。")
+                    logging.debug(f"接缝 {i} (a-y {seam_start_abs:.0f}) 在选区内，但已被删除，跳过恢复。")
                     continue
-                logging.info(f"选区 ({selection_start_abs:.0f}, {selection_end_abs:.0f}) 触碰了接缝 {i} (a-y {seam_start_abs:.0f})。添加恢复修改。")
+                logging.debug(f"选区 ({selection_start_abs:.0f}, {selection_end_abs:.0f}) 触碰了接缝 {i} (a-y {seam_start_abs:.0f})。添加恢复修改。")
                 mod = {
                     'type': 'restore',
                     'seam_index': i,
@@ -6003,9 +6089,9 @@ class PreviewPanel(SimulatedWindow):
                 self.model.add_modification(mod)
                 mods_added += 1
         if mods_added > 0:
-            logging.info(f"已为 {mods_added} 个接缝添加了恢复操作")
+            logging.debug(f"已为 {mods_added} 个接缝添加了恢复操作")
         else:
-            logging.info("选区内未发现可恢复的接缝")
+            logging.debug("选区内未发现可恢复的接缝")
 
     def _on_undo_mod_clicked(self, button):
         self.model.undo()
@@ -6182,7 +6268,7 @@ class PreviewPanel(SimulatedWindow):
                         self.selection_absolute_end_y = absolute_model_y
                     cursor_name = 'n-resize' if handle == 'top' else 's-resize'
                     self.drawing_area.get_window().set_cursor(self.cursors[cursor_name])
-                    logging.info(f"开始调整选区手柄: {handle}")
+                    logging.debug(f"开始调整选区手柄: {handle}")
                 else:
                     self.is_drawing_selection = True
                     self.is_resizing_selection = None
@@ -6238,13 +6324,13 @@ class PreviewPanel(SimulatedWindow):
         self.selection_autoscroll_velocity = velocity
         should_run = abs(self.selection_autoscroll_velocity) > 0.1
         if should_run and self.selection_autoscroll_timer is None:
-            logging.info(f"启动自动滚动定时器")
+            logging.debug(f"启动自动滚动定时器")
             self.selection_autoscroll_timer = GLib.timeout_add(
                 self.AUTOSCROLL_INTERVAL, 
                 self._auto_scroll_selection
             )
         elif not should_run and self.selection_autoscroll_timer is not None:
-            logging.info("速度归零，停止自动滚动定时器")
+            logging.debug("速度归零，停止自动滚动定时器")
             GLib.source_remove(self.selection_autoscroll_timer)
             self.selection_autoscroll_timer = None
 
@@ -6312,7 +6398,7 @@ class PreviewPanel(SimulatedWindow):
             if self.selection_autoscroll_timer:
                 GLib.source_remove(self.selection_autoscroll_timer)
                 self.selection_autoscroll_timer = None
-                logging.info("鼠标释放，停止自动滚动")
+                logging.debug("鼠标释放，停止自动滚动")
             self.selection_autoscroll_velocity = 0.0
             if self.is_drawing_selection:
                 self.is_drawing_selection = False
@@ -6342,11 +6428,11 @@ class PreviewPanel(SimulatedWindow):
         if not (self.is_drawing_selection or self.is_resizing_selection):
             self.selection_autoscroll_timer = None
             self.selection_autoscroll_velocity = 0.0
-            logging.warning("_auto_scroll_selection 触发，但已不在选择/调整大小状态")
+            logging.debug("_auto_scroll_selection 触发，但已不在选择/调整大小状态")
             return False
         if abs(self.selection_autoscroll_velocity) < 0.1:
             self.selection_autoscroll_timer = None
-            logging.warning("_auto_scroll_selection 触发，但滚动速度接近 0")
+            logging.debug("_auto_scroll_selection 触发，但滚动速度接近 0")
             return False
         # 逻辑px
         vadj = self.scrolled_window.get_vadjustment()
@@ -6378,7 +6464,7 @@ class PreviewPanel(SimulatedWindow):
                 self.selection_absolute_end_y = new_absolute_y
             self.drawing_area.queue_draw()
         if abs(new_value_clamped - new_value) > 1e-3:
-            logging.info("自动滚动到达边缘，定时器停止")
+            logging.debug("自动滚动到达边缘，定时器停止")
             self.selection_autoscroll_timer = None
             self.selection_autoscroll_velocity = 0.0
             return False
@@ -6433,6 +6519,21 @@ class CaptureOverlay(Gtk.Window):
         self._initialize_cursors()
         self._connect_events()
         logging.info(f"GTK 覆盖层已创建")
+
+    def _on_global_focus_changed(self, window, widget):
+        global hotkey_listener
+        if not hotkey_listener or not are_hotkeys_enabled:
+            return
+        if widget is None:
+            hotkey_listener.set_normal_keys_grabbed(True)
+            return
+        input_types = (Gtk.Entry, Gtk.SpinButton, Gtk.TextView, Gtk.SearchEntry)
+        is_input_widget = isinstance(widget, input_types)
+        if is_input_widget:
+            hotkey_listener.set_normal_keys_grabbed(False)
+            logging.debug(f"输入控件 {type(widget).__name__} 获得焦点，暂停热键")
+        else:
+            hotkey_listener.set_normal_keys_grabbed(True)
 
     def _setup_overlay_mask(self):
         """创建一个全屏半透明遮罩层，用于模拟模态对话框"""
@@ -6500,18 +6601,22 @@ class CaptureOverlay(Gtk.Window):
         surface = cairo.ImageSurface(cairo.Format.ARGB32, 1, 1)
         self.cursors['blank'] = Gdk.Cursor.new_from_surface(display, surface, 0, 0)
 
-    def show_embedded_notification(self, title, message, level, action_path, controller=None, width=0, height=0):
+    def show_embedded_notification(self, title, message, level, timeout=None, action_config=None):
         """在窗口顶部中间显示内嵌通知"""
         # 窗口坐标
         current_alloc = self.get_allocation()
         if not self.screen_rect and current_alloc.width <= 1:
-            logging.info(f"窗口尚未布局 (width={current_alloc.width})，推迟显示通知: {title}")
-            GLib.timeout_add(300, self.show_embedded_notification, title, message, level, action_path, controller, width, height)
+            logging.debug(f"窗口尚未布局 (width={current_alloc.width})，推迟显示通知: {title}")
+            GLib.timeout_add(300, self.show_embedded_notification, title, message, level, timeout, action_config)
             return
         if self.current_notification_widget:
             self.dismiss_notification(self.current_notification_widget, trigger_cleanup=False)
-        panel = EmbeddedNotificationPanel(self, title, message, level, action_path, width, height)
-        panel.controller_ref = controller
+        act_path = action_config.get('path') if action_config else None
+        act_ctrl = action_config.get('controller') if action_config else None
+        act_w = action_config.get('width', 0) if action_config else 0
+        act_h = action_config.get('height', 0) if action_config else 0
+        panel = EmbeddedNotificationPanel(self, title, message, level, act_path, act_w, act_h)
+        panel.controller_ref = act_ctrl
         self.fixed_container.put(panel, 0, 0)
         panel.show_all()
         _, nat_size = panel.get_preferred_size()
@@ -6523,8 +6628,16 @@ class CaptureOverlay(Gtk.Window):
         y = 40
         self.fixed_container.move(panel, x, y)
         self.current_notification_widget = panel
-        timeout_sec = 8 if level == "warning" or level == "success" else 3
-        if level == "critical": timeout_sec = 0
+        default_timeouts = {
+            "normal": 3,
+            "warning": 8,
+            "success": 8,
+            "critical": 0
+        }
+        if timeout is not None:
+            timeout_sec = timeout
+        else:
+            timeout_sec = default_timeouts.get(level, 3)
         if timeout_sec > 0:
             self.notification_timeout_id = GLib.timeout_add_seconds(timeout_sec, lambda: self.dismiss_notification(panel))
         self._update_input_shape()
@@ -6564,6 +6677,7 @@ class CaptureOverlay(Gtk.Window):
     def _connect_events(self):
         """连接所有Gtk信号和事件"""
         self.connect("map-event", self.on_map_event)
+        self.connect("set-focus", self._on_global_focus_changed)
         self.connect("draw", self.on_draw)
         self.connect("size-allocate", self.on_size_allocate)
         self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK |
@@ -6625,7 +6739,11 @@ class CaptureOverlay(Gtk.Window):
         .no-padding { padding: 0px; }
         """
         load_css(no_padding_css, "No Padding Style")
-        logging.info("已应用所有全局 CSS 样式")
+        dir_placeholder_css = """
+        entry.dir-not-set { color: #888888; opacity: 0.8; }
+        """
+        load_css(dir_placeholder_css, "Dir Placeholder Style")
+        logging.debug("已应用所有全局 CSS 样式")
 
     def on_key_press_event(self, widget, event):
         if self.is_dialog_open:
@@ -6682,9 +6800,12 @@ class CaptureOverlay(Gtk.Window):
 
     def on_map_event(self, widget, event):
         if self.screen_rect is None:
-            logging.info("窗口首次映射，正在初始化屏幕几何信息...")
+            logging.debug("窗口首次映射，正在初始化屏幕几何信息...")
             # 逻辑px全局坐标
             self.screen_rect = WINDOW_MANAGER.get_screen_geometry(self)
+            rect_w = self.screen_rect.width
+            rect_h = self.screen_rect.height
+            logging.debug(f"当前屏幕宽度 {rect_w} 逻辑px，高度 {rect_h} 逻辑px")
             FRAME_GRABBER.set_global_offset(self.screen_rect.x, self.screen_rect.y)
             g_min_x, g_min_y, g_max_x, g_max_y = self.get_all_monitors_geometry()
             if IS_WAYLAND:
@@ -6697,13 +6818,25 @@ class CaptureOverlay(Gtk.Window):
                     with FRAME_GRABBER.frame_lock:
                         if FRAME_GRABBER.latest_frame is not None:
                             detected_buf_h, detected_buf_w, _ = FRAME_GRABBER.latest_frame.shape
+                            logging.debug(f"当前屏幕宽度 {detected_buf_w} 缓冲区px，高度 {detected_buf_h} 缓冲区px")
                             break
+                    if getattr(FRAME_GRABBER, 'last_error', None) or \
+                       getattr(FRAME_GRABBER, 'state', 'IDLE') == "ERROR":
+                        logging.warning("校准等待期间检测到 Grabber 错误，提前中止等待")
+                        break
                     time.sleep(0.05)
-                if detected_buf_w > 0 and self.screen_rect.width > 0:
-                    self.scale = detected_buf_w / self.screen_rect.width
-                    logging.info(f"校准成功: 缓冲区px宽度 {detected_buf_w} / 逻辑px宽度 {self.screen_rect.width} = 真实Scale {self.scale:.6f}")
+                if detected_buf_w > 0 and rect_w > 0:
+                    self.scale = detected_buf_w / rect_w
+                    logging.info(f"校准成功: 真实Scale {self.scale:.6f}")
                 else:
                     logging.warning("校准失败: 未能及时获取视频帧或宽度无效，保持默认 Scale")
+                    err_msg = getattr(FRAME_GRABBER, 'last_error', None)
+                    title = "Wayland 录制初始化失败"
+                    msg = "无法获取屏幕画面，无法进行截图"
+                    if err_msg:
+                        msg += f"\n{err_msg}"
+                    GLib.idle_add(lambda: send_desktop_notification(title, msg, level="critical", sound_name="dialog-error"))
+                    self.is_calibration_done = True
             try:
                 # 逻辑px -> 缓冲区px
                 g_min_x_buf = math.ceil(g_min_x * self.scale)
@@ -6715,19 +6848,19 @@ class CaptureOverlay(Gtk.Window):
                     self.invisible_scroller = None
                     if EVDEV_AVAILABLE:
                         self.evdev_wheel_scroller = EvdevWheelScroller()
-                        if self.screen_rect.width > 0:
+                        if rect_w > 0:
                             self.controller.scroll_manager.evdev_abs_mouse = EvdevAbsoluteMouse(g_min_x_buf, g_min_y_buf, g_max_x_buf, g_max_y_buf)
                         else:
-                            logging.error("无法获取图片分辨率，Wayland 下鼠标移动功能将无法工作。")
+                            logging.error("无法获取图片分辨率，Wayland 下鼠标移动功能将无法工作")
                     else:
-                        logging.error("Wayland 下 evdev 不可用，鼠标移动以及滚动功能将无法工作。")
+                        logging.error("Wayland 下 evdev 不可用，鼠标移动以及滚动功能将无法工作")
                         self.evdev_wheel_scroller = None
                         self.controller.scroll_manager.evdev_abs_mouse = None
                 else:
                     if EVDEV_AVAILABLE:
                         if config.SCROLL_METHOD == 'invisible_cursor':
-                            park_x = self.screen_rect.x + self.screen_rect.width - 1 # 显示器坐标 -> 全局坐标
-                            park_y = self.screen_rect.y + self.screen_rect.height - 1
+                            park_x = self.screen_rect.x + rect_w - 1 # 显示器坐标 -> 全局坐标
+                            park_y = self.screen_rect.y + rect_h - 1
                             # 逻辑px -> 缓冲区px
                             park_x_buf = int(park_x * self.scale)
                             park_y_buf = int(park_y * self.scale)
@@ -6735,11 +6868,11 @@ class CaptureOverlay(Gtk.Window):
                                 g_min_x_buf, g_min_y_buf, g_max_x_buf, g_max_y_buf, park_x_buf, park_y_buf, config
                             )
                             self.invisible_scroller.setup()
-                            logging.info("InvisibleCursorScroller.setup() 正在后台线程中执行")
+                            logging.debug("InvisibleCursorScroller.setup() 正在后台线程中执行")
                         else:
                             self.evdev_wheel_scroller = EvdevWheelScroller()
                     else:
-                        logging.info("Evdev 未导入，X11 下将默认使用 XTest 进行滚动")
+                        logging.debug("Evdev 未导入，X11 下将默认使用 XTest 进行滚动")
                         self.evdev_wheel_scroller = None
                         self.invisible_scroller = None
             except Exception as err:
@@ -6750,8 +6883,8 @@ class CaptureOverlay(Gtk.Window):
                 self.evdev_wheel_scroller = None
                 self.invisible_scroller = None
             if not self.is_selection_done:
-                self.resize(self.screen_rect.width, self.screen_rect.height)
-                self.fixed_container.set_size_request(self.screen_rect.width, self.screen_rect.height)
+                self.resize(rect_w, rect_h)
+                self.fixed_container.set_size_request(rect_w, rect_h)
                 if not IS_WAYLAND:
                     self.move(self.screen_rect.x, self.screen_rect.y) # 全局坐标
         if not self.is_selection_done and not self._initial_grab_done:
@@ -6760,7 +6893,8 @@ class CaptureOverlay(Gtk.Window):
             self.update_layout()
             self._grab_for_selection()
             self._initial_grab_done = True
-            self._initiate_calibration()
+            if not self.is_calibration_done:
+                self._initiate_calibration()
                 
     def _initiate_calibration(self):
         logging.info("初始化坐标校准程序...")
@@ -6842,7 +6976,7 @@ class CaptureOverlay(Gtk.Window):
             if max_val > final_max_val:
                 final_max_val = max_val
             if max_val > 0.90:
-                logging.info(f"校准优化: 在 [{name}] 阶段找到匹配，相似度 {max_val:.4f}")
+                logging.debug(f"校准优化: 在 [{name}] 阶段找到匹配，相似度 {max_val:.4f}")
                 final_match_loc = (x1 + max_loc[0], y1 + max_loc[1])
                 break
         if final_max_val > 0.90 and final_match_loc is not None:
@@ -6920,13 +7054,13 @@ class CaptureOverlay(Gtk.Window):
     def show_quit_confirmation_dialog(self):
         """显示退出确认对话框并返回用户的响应"""
         if self.is_dialog_open:
-            logging.warning("退出对话框已打开，忽略重复请求")
+            logging.debug("退出对话框已打开，忽略重复请求")
             return Gtk.ResponseType.NONE
         GLib.idle_add(self.present)
         self.is_dialog_open = True
         global hotkey_listener
         if hotkey_listener:
-            logging.info("打开退出对话框，进入 Dialog 快捷键模式")
+            logging.debug("打开退出对话框，进入 Dialog 快捷键模式")
             hotkey_listener.set_dialog_mode(True)
         if self.screen_rect:
             target_w, target_h = self.screen_rect.width, self.screen_rect.height
@@ -6987,7 +7121,7 @@ class CaptureOverlay(Gtk.Window):
         self.overlay_mask.hide()
         self.is_dialog_open = False
         if hotkey_listener:
-            logging.info("关闭退出对话框，退出 Dialog 快捷键模式")
+            logging.debug("关闭退出对话框，退出 Dialog 快捷键模式")
             hotkey_listener.set_dialog_mode(False)
         return self._dialog_response
 
@@ -7018,7 +7152,7 @@ class CaptureOverlay(Gtk.Window):
         self.fixed_container.put(self.instruction_panel, 0, 0)
         _, nat_size = self.instruction_panel.get_preferred_size()
         self._instr_panel_natural_w, self._instr_panel_natural_h = nat_size.width, nat_size.height
-        logging.info(f"缓存的 InstructionPanel 自然高度: {self._instr_panel_natural_h} 逻辑px")
+        logging.debug(f"缓存的 InstructionPanel 自然高度: {self._instr_panel_natural_h} 逻辑px")
         self.instruction_panel.connect("size-allocate", lambda w, a: self._update_input_shape())
         self.instruction_panel.hide()
         self.preview_panel = PreviewPanel(self.controller.stitch_model, config, self)
@@ -7034,11 +7168,11 @@ class CaptureOverlay(Gtk.Window):
         """切换配置面板的可见性"""
         if not self.config_panel: return
         if self.config_panel.get_visible():
-            logging.info("隐藏配置面板")
+            logging.debug("隐藏配置面板")
             self.config_panel.hide()
             self._update_input_shape()
         else:
-            logging.info("显示配置面板")
+            logging.debug("显示配置面板")
             if not self.config_panel.user_has_moved:
                 if self.screen_rect:
                     screen_w, screen_h = self.screen_rect.width, self.screen_rect.height
@@ -7061,11 +7195,11 @@ class CaptureOverlay(Gtk.Window):
             logging.error("PreviewPanel 尚未初始化")
             return
         if self.preview_panel.get_visible():
-            logging.info("隐藏预览面板")
+            logging.debug("隐藏预览面板")
             self.preview_panel.hide()
             self._update_input_shape()
         else:
-            logging.info("显示预览面板")
+            logging.debug("显示预览面板")
             if not self.preview_panel.user_has_moved:
                 self._position_and_show_preview()
             else:
@@ -7224,7 +7358,6 @@ class CaptureOverlay(Gtk.Window):
     # 逻辑px {
     def _update_input_shape(self):
         if not self.get_window():
-            logging.info("_update_input_shape: 窗口尚未 realize, 无法设置 input_shape")
             return
         if self.screen_rect:
             win_w, win_h = self.screen_rect.width, self.screen_rect.height
@@ -7321,7 +7454,7 @@ class CaptureOverlay(Gtk.Window):
 
     def on_button_press(self, widget, event):
         if self.current_notification_widget:
-            logging.info("检测到点击通知外部，关闭当前通知")
+            logging.debug("检测到点击通知外部，关闭当前通知")
             self.dismiss_notification(self.current_notification_widget)
         if not self.is_selection_done:
             if event.button == 1:
@@ -7377,7 +7510,7 @@ class CaptureOverlay(Gtk.Window):
             if config.SHOW_PREVIEW_ON_START:
                 self.toggle_preview_panel()
             else:
-                logging.info("配置项 'show_preview_on_start' 为 false，启动时不创建预览窗口。")
+                logging.debug("配置项 'show_preview_on_start' 为 false，启动时不创建预览窗口。")
             return False
         else:
             return self.controller.handle_button_release(event)
@@ -7621,14 +7754,14 @@ class XlibHotkeyInterceptor(threading.Thread):
                     self.root.grab_button(1, X.AnyModifier, 0, X.ButtonPressMask, 
                                           X.GrabModeAsync, X.GrabModeAsync, X.NONE, X.NONE)
                     self.mouse_grabbed = True
-                    logging.info("Xlib: 已抓取鼠标左键用于停止自动滚动")
+                    logging.debug("Xlib: 已抓取鼠标左键用于停止自动滚动")
                 except Exception as e:
                     logging.warning(f"Xlib GrabButton 失败: {e}")
             elif not self.monitor_mouse and self.mouse_grabbed:
                 try:
                     self.root.ungrab_button(1, X.AnyModifier)
                     self.mouse_grabbed = False
-                    logging.info("Xlib: 已释放鼠标左键抓取")
+                    logging.debug("Xlib: 已释放鼠标左键抓取")
                 except Exception as e:
                     logging.warning(f"Xlib UngrabButton 失败: {e}")
             target_set = set((k[0], k[1]) for k in target_key_tuples)
@@ -7682,16 +7815,22 @@ class XlibHotkeyInterceptor(threading.Thread):
             self.running = True
         except Exception as e:
             logging.error(f"XlibHotkeyInterceptor 线程初始化 Display 失败: {e}")
+            GLib.idle_add(
+                send_desktop_notification,
+                "热键服务启动失败",
+                f"无法连接到 X Display (Xlib): {e}\n全局快捷键将不可用",
+                "dialog-error", "warning"
+            )
             self.running = False
             return
         self._schedule_update()
-        logging.info("Xlib 热键拦截线程已启动")
+        logging.debug("Xlib 热键拦截线程已启动")
         while self.running:
             try:
                 event = self.disp.next_event()
                 if event.type == X.ButtonPress and self.running:
                     if self.monitor_mouse and event.detail == 1:
-                        logging.info("Xlib: 检测到鼠标左键点击，停止自动滚动")
+                        logging.debug("Xlib: 检测到鼠标左键点击，停止自动滚动")
                         GLib.idle_add(self.overlay.controller.stop_auto_scroll, "用户点击鼠标左键停止")
                         self.enable_mouse_click_stop(False)
                 if event.type == X.KeyPress and self.running:
@@ -7701,15 +7840,15 @@ class XlibHotkeyInterceptor(threading.Thread):
                     key_name = self.debug_key_map.get(key_id, "UnknownKey")
                     log_key_str = f"key='{key_name}' (kc={keycode})"
                     if key_id in self.toggle_lookup:
-                         logging.info(f"Xlib 拦截到切换键 ({log_key_str}, state={clean_state})")
+                         logging.debug(f"Xlib 拦截到切换键 ({log_key_str}, state={clean_state})")
                          callback = self.toggle_lookup[key_id]
                          if keycode in self.mod_keycodes:
                              self.pending_mod_release = (keycode, callback)
-                             logging.info("修饰键按下，等待松开...")
+                             logging.debug("修饰键按下，等待松开...")
                          else:
                              if self.pending_mod_release:
                                  self.pending_mod_release = None
-                             GLib.idle_add(callback)
+                             GLib.idle_add(lambda: (callback(), False)[1])
                          continue
                     if are_hotkeys_enabled:
                         callback = None
@@ -7722,25 +7861,25 @@ class XlibHotkeyInterceptor(threading.Thread):
                         if callback:
                             if keycode in self.mod_keycodes:
                                 self.pending_mod_release = (keycode, callback)
-                                logging.info(f"修饰键热键 {log_key_str} 按下，等待松开...")
+                                logging.debug(f"修饰键热键 {log_key_str} 按下，等待松开...")
                             else:
                                 if self.pending_mod_release:
-                                    logging.info("检测到组合键，取消待定的修饰键单键动作")
+                                    logging.debug("检测到组合键，取消待定的修饰键单键动作")
                                     self.pending_mod_release = None
-                                logging.info(f"Xlib 拦截到热键 ({log_key_str}) 并执行回调")
-                                GLib.idle_add(callback)
+                                logging.debug(f"Xlib 拦截到热键 ({log_key_str}) 并执行回调")
+                                GLib.idle_add(lambda: (callback(), False)[1])
                 elif event.type == X.KeyRelease and self.running:
                     if self.pending_mod_release:
                         waiting_keycode, waiting_callback = self.pending_mod_release
                         if event.detail == waiting_keycode:
-                            logging.info("修饰键松开且未被组合使用，执行动作")
-                            GLib.idle_add(waiting_callback)
+                            logging.debug("修饰键松开且未被组合使用，执行动作")
+                            GLib.idle_add(lambda: (waiting_callback(), False)[1])
                             self.pending_mod_release = None
             except Exception as e:
                 if self.running:
                     logging.error(f"Xlib 事件循环错误: {e}")
                     time.sleep(0.1)
-        logging.info("Xlib 热键拦截线程正在停止...")
+        logging.debug("Xlib 热键拦截线程正在停止...")
         with self.lock:
             self._apply_grab_state([])
         if self.disp:
@@ -7748,11 +7887,11 @@ class XlibHotkeyInterceptor(threading.Thread):
                 self.disp.close()
             except Exception as e:
                  logging.error(f"关闭 X Display 连接时出错: {e}")
-        logging.info("Xlib 热键拦截线程已停止")
+        logging.debug("Xlib 热键拦截线程已停止")
 
     def stop(self):
         """请求线程停止"""
-        logging.info("收到停止 Xlib 拦截线程的请求...")
+        logging.debug("收到停止 Xlib 拦截线程的请求...")
         self.running = False
         if self.disp and self.root:
             try:
@@ -7763,7 +7902,7 @@ class XlibHotkeyInterceptor(threading.Thread):
                 )
                 self.disp.send_event(self.root, client_event, event_mask=X.NoEventMask)
                 self.disp.flush()
-                logging.info("已发送 ClientMessage 事件以唤醒 Xlib 事件循环")
+                logging.debug("已发送 ClientMessage 事件以唤醒 Xlib 事件循环")
             except Exception as e:
                 logging.warning(f"发送唤醒事件失败: {e}")
         else:
@@ -7802,11 +7941,11 @@ class EvdevHotkeyListener(threading.Thread):
 
     def enable_mouse_click_stop(self, enabled: bool):
         self.mouse_click_stop_enabled = enabled
-        logging.info(f"Evdev: 鼠标点击停止功能已 {'启用' if enabled else '禁用'}")
+        logging.debug(f"Evdev: 鼠标点击停止功能已 {'启用' if enabled else '禁用'}")
 
     def _parse_config(self):
         """解析 Config 对象中的字符串到 evdev codes"""
-        logging.info(f"Evdev 正在注册热键...")
+        logging.debug(f"Evdev 正在注册热键...")
         for action_name, _ in self.callback_map:
             hotkey_str = self.config.parser.get('Hotkeys', action_name, fallback='')
             if not hotkey_str: continue
@@ -7857,12 +7996,14 @@ class EvdevHotkeyListener(threading.Thread):
                     logging.warning(f"Evdev 无法解析按键: {main_key} (完整串: {hotkey_str})")
 
     def set_normal_keys_grabbed(self, grab_state: bool):
+        if self.listening_active == grab_state:
+            return
         self.listening_active = grab_state
-        logging.info(f"Evdev 内部监听状态已设置为: {'活动' if grab_state else '暂停'}")
+        logging.debug(f"Evdev 内部监听状态已设置为: {'活动' if grab_state else '暂停'}")
 
     def set_dialog_mode(self, active: bool):
         self.in_dialog = active
-        logging.info(f"Evdev 内部对话框模式: {active}")
+        logging.debug(f"Evdev 内部对话框模式: {active}")
 
     def _find_input_devices(self):
         """查找所有具有键盘特性或鼠标左键的设备"""
@@ -7884,10 +8025,16 @@ class EvdevHotkeyListener(threading.Thread):
             self.devices = self._find_input_devices()
             if not self.devices:
                 logging.warning("未检测到输入设备，Evdev 监听器无法工作")
+                GLib.idle_add(
+                    send_desktop_notification,
+                    "热键服务启动失败",
+                    "未检测到可用的输入设备，全局快捷键可能无法工作",
+                    "dialog-warning", "warning"
+                )
                 return
             fds = {dev.fd: dev for dev in self.devices}
             self.running = True
-            logging.info(f"Evdev 监听器启动，监控 {len(self.devices)} 个设备")
+            logging.debug(f"Evdev 监听器启动，监控 {len(self.devices)} 个设备")
             while self.running:
                 r, w, x = select.select(fds, [], [], 0.5)
                 for fd in r:
@@ -7908,7 +8055,7 @@ class EvdevHotkeyListener(threading.Thread):
     def _process_key_event(self, event):
         if event.value == 1 or event.value == 2:
             if event.code == e.BTN_LEFT and self.mouse_click_stop_enabled:
-                logging.info("Evdev: 检测到鼠标左键点击，停止自动滚动")
+                logging.debug("Evdev: 检测到鼠标左键点击，停止自动滚动")
                 GLib.idle_add(self.overlay.controller.stop_auto_scroll, "用户点击鼠标左键停止")
                 self.mouse_click_stop_enabled = False
                 return
@@ -7942,19 +8089,19 @@ class EvdevHotkeyListener(threading.Thread):
                                 if name == action_name:
                                     if is_modifier_key:
                                         self.pending_mod_action = (event.code, callback)
-                                        logging.info(f"Evdev: 修饰键 {action_name} 按下，等待松开")
+                                        logging.debug(f"Evdev: 修饰键 {action_name} 按下，等待松开")
                                     else:
-                                        logging.info(f"Evdev 触发热键: {action_name}")
+                                        logging.debug(f"Evdev 触发热键: {action_name}")
                                         self.last_trigger_time = current_time
-                                        GLib.idle_add(callback)
+                                        GLib.idle_add(lambda: (callback(), False)[1])
                                     return
         elif event.value == 0:
             if self.pending_mod_action:
                 waiting_code, waiting_cb = self.pending_mod_action
                 if event.code == waiting_code:
-                    logging.info("Evdev: 修饰键松开且未被组合使用，执行动作")
+                    logging.debug("Evdev: 修饰键松开且未被组合使用，执行动作")
                     self.last_trigger_time = time.time()
-                    GLib.idle_add(waiting_cb)
+                    GLib.idle_add(lambda: (waiting_cb(), False)[1])
                 self.pending_mod_action = None
             if event.code in self.code_to_mod_name:
                 mod_name = self.code_to_mod_name[event.code]
@@ -7976,20 +8123,20 @@ def toggle_all_hotkeys():
     title = "快捷键状态"
     message = f"截图会话的快捷键当前已{state_str}"
     GLib.idle_add(send_desktop_notification, title, message)
-    logging.info(f"快捷键状态已切换为: {state_str}")
+    logging.debug(f"快捷键状态已切换为: {state_str}")
 
 def setup_hotkey_listener(overlay):
     global hotkey_listener
     def global_dialog_confirm():
         if overlay.is_dialog_open and hasattr(overlay, '_current_dialog_setter') and overlay._current_dialog_setter:
-            logging.info("全局热键触发: 确认退出")
+            logging.debug("全局热键触发: 确认退出")
             GLib.idle_add(overlay._current_dialog_setter, Gtk.ResponseType.YES)
             if hasattr(overlay, '_current_dialog_loop') and overlay._current_dialog_loop:
                 GLib.idle_add(overlay._current_dialog_loop.quit)
 
     def global_dialog_cancel():
         if overlay.is_dialog_open and hasattr(overlay, '_current_dialog_setter') and overlay._current_dialog_setter:
-            logging.info("全局热键触发: 取消退出")
+            logging.debug("全局热键触发: 取消退出")
             GLib.idle_add(overlay._current_dialog_setter, Gtk.ResponseType.NO)
             if hasattr(overlay, '_current_dialog_loop') and overlay._current_dialog_loop:
                 GLib.idle_add(overlay._current_dialog_loop.quit)
@@ -8017,13 +8164,19 @@ def setup_hotkey_listener(overlay):
     if IS_WAYLAND:
         logging.info("检测到 Wayland 会话，尝试使用 Evdev 启动全局热键监听...")
         if not EVDEV_AVAILABLE:
-            logging.error("未检测到 evdev 模块，Wayland 下无法使用全局快捷键。请安装 python-evdev。")
+            logging.error("未检测到 evdev 模块，Wayland 下无法使用全局快捷键。请安装 python-evdev")
             return
         try:
             hotkey_listener = EvdevHotkeyListener(overlay, config, hotkey_key_callback_list)
             hotkey_listener.start()
         except Exception as e:
             logging.error(f"启动 Evdev 监听器失败: {e}")
+            GLib.idle_add(
+                send_desktop_notification,
+                "热键服务启动失败",
+                f"无法启动 Evdev 监听: {e}\n全局快捷键将不可用",
+                "dialog-error", "warning"
+            )
         return
         
     def gdk_mask_to_x_mask(gdk_mask):
@@ -8074,7 +8227,7 @@ def setup_hotkey_listener(overlay):
         if name in toggle_key_config_keys: return 'toggle'
         if name in ('dialog_confirm', 'dialog_cancel'): return 'dialog'
         return 'normal'
-    registered_keys = {} # (keycode, mask) -> [(mode, name)]
+    registered_keys = {}
     for key_name, callback in hotkey_key_callback_list:
         hotkey_config_attr_name = f"HOTKEY_{key_name.upper()}"
         hotkey_config = getattr(config, hotkey_config_attr_name, None)
@@ -8102,12 +8255,18 @@ def setup_hotkey_listener(overlay):
             registered_keys[key_id].append((mode, key_name))
             keymap_tuples.append((keycode, x_mask, is_toggle_key_flag, key_name))
     if not any(k[2] for k in keymap_tuples):
-         logging.warning("配置中未找到有效的切换键 (如 toggle_hotkeys_enabled)，热键启用/禁用功能可能无法通过键盘触发。")
+         logging.warning("配置中未找到有效的切换键 (如 toggle_hotkeys_enabled)，热键启用/禁用功能可能无法通过键盘触发")
     try:
         hotkey_listener = XlibHotkeyInterceptor(overlay, callbacks_map, keymap_tuples)
         hotkey_listener.start()
     except Exception as e:
         logging.error(f"启动 XlibHotkeyInterceptor 线程失败: {e}")
+        GLib.idle_add(
+            send_desktop_notification,
+            "热键服务启动失败",
+            f"无法启动 Xlib 监听: {e}\n全局快捷键将不可用",
+            "dialog-error", "warning"
+        )
 
 def cleanup_stale_temp_dirs(config):
     """在启动时清理由已退出的旧进程留下的临时目录"""
@@ -8121,7 +8280,7 @@ def cleanup_stale_temp_dirs(config):
             return
         prefix, suffix = name_template.split('{pid}')
         current_pid = os.getpid()
-        logging.info(f"正在扫描 {parent_dir} 中匹配 '{prefix}*{suffix}' 的残留目录...")
+        logging.debug(f"正在扫描 {parent_dir} 中匹配 '{prefix}*{suffix}' 的残留目录...")
         for item in parent_dir.glob(f'{prefix}*{suffix}'):
             if not item.is_dir():
                 continue
@@ -8134,13 +8293,13 @@ def cleanup_stale_temp_dirs(config):
                 continue
             # 检查旧PID对应的进程是否存在
             if not Path(f"/proc/{pid}").exists():
-                logging.info(f"发现残留目录 {item} (来自已退出的进程 {pid})，正在清理...")
+                logging.debug(f"发现残留目录 {item} (来自已退出的进程 {pid})，正在清理...")
                 try:
                     shutil.rmtree(item)
                 except OSError as e:
                     logging.error(f"清理目录 {item} 失败: {e}")
             else:
-                logging.info(f"发现来自另一正在运行的实例(PID:{pid})的目录 {item}，予以保留")
+                logging.debug(f"发现来自另一正在运行的实例(PID:{pid})的目录 {item}，予以保留")
     except Exception as e:
         logging.error(f"执行残留目录清理时发生未知错误: {e}")
 
@@ -8158,6 +8317,12 @@ def check_dependencies():
             missing_optional.append(f"可选依赖 '{dep}' 缺失: {reason}")
     if missing_optional:
         logging.warning("警告：检测到缺少可选依赖项，部分功能可能无法使用或表现异常")
+        GLib.idle_add(
+            send_desktop_notification,
+            "功能受限警告",
+            f"检测到可选依赖缺失，部分功能可能表现异常或不可用",
+            "dialog-information", "warning", 2
+        )
         for item in missing_optional:
             logging.warning(item)
 
@@ -8178,7 +8343,7 @@ def main():
     if root_logger.hasHandlers():
         for handler in root_logger.handlers[:]:
             root_logger.removeHandler(handler)
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler = logging.FileHandler(config.LOG_FILE, mode='w')
     file_handler.setFormatter(formatter)
@@ -8190,7 +8355,7 @@ def main():
     sys.stdout = StreamToLoggerRedirector(stdout_logger, logging.INFO)
     stderr_logger = logging.getLogger('STDERR')
     sys.stderr = StreamToLoggerRedirector(stderr_logger, logging.ERROR)
-    logging.info("标准输出和标准错误已被重定向到日志系统")
+    logging.debug("标准输出和标准错误已被重定向到日志系统")
     check_dependencies()
     global WINDOW_MANAGER, FRAME_GRABBER
     if IS_WAYLAND:
@@ -8198,12 +8363,12 @@ def main():
         if not GTK_LAYER_SHELL_AVAILABLE:
             logging.warning("未找到 'gtk-layer-shell' 库")
         elif not GtkLayerShell.is_supported():
-            logging.warning("当前的 Wayland 合成器不支持 'wlr-layer-shell-unstable-v1' 协议。")
+            logging.warning("当前的 Wayland 合成器不支持 'wlr-layer-shell-unstable-v1' 协议")
         WINDOW_MANAGER = WaylandWindowManager()
         FRAME_GRABBER = WaylandFrameGrabber()
         if not FRAME_GRABBER.prepare_sync():
-            logging.error("用户未选择屏幕或授权失败，程序退出。")
-            sys.exit(1)
+            logging.info("用户取消了屏幕录制授权，程序静默退出")
+            sys.exit(0)
     else:
         logging.info("检测到 X11 会话，加载 X11 后端")
         WINDOW_MANAGER = X11WindowManager()
@@ -8211,12 +8376,12 @@ def main():
         try:
             X11 = ctypes.cdll.LoadLibrary('libX11.so.6')
             X11.XInitThreads()
-            logging.info("已调用 XInitThreads() 以确保多线程安全")
+            logging.debug("已调用 XInitThreads() 以确保多线程安全")
         except Exception as e:
             logging.warning(f"无法调用 XInitThreads(): {e}。应用可能不稳定")
     display = Gdk.Display.get_default()
     if display is None:
-        logging.error("无法获取 GDK Display，程序无法运行。")
+        logging.error("无法获取 GDK Display，程序无法运行")
         sys.exit(1)
     logging.info("启动全屏覆盖窗口，等待用户选择区域...")
     config.TMP_DIR.mkdir(parents=True, exist_ok=True)
