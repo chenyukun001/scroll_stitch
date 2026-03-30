@@ -1,36 +1,39 @@
 #!/usr/bin/env python3
 import sys
 import ctypes
-from ctypes import POINTER, c_int, c_short, c_ulong, c_char_p, c_void_p, Structure
-import webbrowser
+from ctypes import POINTER, c_int, c_uint, c_short, c_ulong, c_char_p, c_void_p, c_ubyte, c_size_t, Structure, byref, CFUNCTYPE, cast
+from ctypes.util import find_library
 import os
-import shlex
+from pathlib import Path
+import webbrowser
 import shutil
 import re
 import subprocess
+import shlex
 import logging
+from logging.handlers import QueueHandler
 import queue
 import collections
+from collections import Counter
 import threading
-import itertools
+import asyncio
+from enum import Enum, IntFlag, auto
 import abc
-from pathlib import Path
 from datetime import datetime
 import time
 import math
 import bisect
 import select
-from PIL import Image
-import cv2
-import numpy as np
 import configparser
 import argparse
+import cv2
+import numpy as np
+import cairo
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 gi.require_version('PangoCairo', '1.0')
 from gi.repository import Gtk, Gdk, GLib, GObject, Pango, PangoCairo, GdkPixbuf
-import cairo
 IS_WAYLAND = False
 try:
     gdk_display = Gdk.Display.get_default()
@@ -38,46 +41,415 @@ try:
         IS_WAYLAND = "wayland" in gdk_display.get_name().lower()
     else:
         IS_WAYLAND = "wayland" in os.environ.get('XDG_SESSION_TYPE', '').lower()
-except Exception as e:
+except Exception:
     IS_WAYLAND = "wayland" in os.environ.get('XDG_SESSION_TYPE', '').lower()
 if not IS_WAYLAND:
     from Xlib import display, X, protocol, XK
-    from Xlib.ext import xtest
-    Gst, GstVideo, Gio = None, None, None
+    from Xlib.ext import xtest, record, shape
+    from Xlib.protocol import rq
+    Gst = GstVideo = Gio = None
 else:
-    display, X, protocol, XK, xtest = None, None, None, None, None
+    display = X = protocol = XK = xtest = record = rq = shape = None
     try:
         gi.require_version('Gst', '1.0')
         gi.require_version('GstVideo', '1.0')
         gi.require_version('Gio', '2.0')
         from gi.repository import Gst, GstVideo, Gio
-    except ValueError:
-        logging.error("Wayland 环境下缺少 GStreamer 依赖")
+    except (ImportError, ValueError) as e:
+        logging.error("Wayland 环境下无法加载 GStreamer 依赖: {e}")
         sys.exit(1)
+EVDEV_AVAILABLE = False
 try:
     import evdev
     from evdev import UInput, ecodes as e, AbsInfo
     EVDEV_AVAILABLE = True
 except ImportError:
-    EVDEV_AVAILABLE = False
+    pass
+UINPUT_AVAILABLE = os.access('/dev/uinput', os.R_OK | os.W_OK)
+INPUT_AVAILABLE = False
+try:
+    INPUT_AVAILABLE = any(os.access(p, os.R_OK) for p in Path('/dev/input').glob('event*'))
+except OSError:
+    pass
 GTK_LAYER_SHELL_AVAILABLE = False
 try:
     gi.require_version('GtkLayerShell', '0.1')
     from gi.repository import GtkLayerShell
     GTK_LAYER_SHELL_AVAILABLE = True
 except (ImportError, ValueError):
-    GTK_LAYER_SHELL_AVAILABLE = False
-# 全局实例
-WINDOW_MANAGER = None
-FRAME_GRABBER = None
-GLOBAL_OVERLAY = None
-hotkey_listener = None
-are_hotkeys_enabled = True
-log_queue = None
+    pass
 
-class Config:
-    def __init__(self, custom_path= None):
+GLOBAL_OVERLAY = None
+hotkey_manager = None
+
+class HotkeyModifiers(IntFlag):
+    NONE = 0
+    SHIFT = auto()
+    CTRL = auto()
+    ALT = auto()
+    SUPER = auto()
+
+    def __str__(self):
+        if self == self.__class__.NONE:
+            return "NONE"
+        parts = [f"<{mod.name.lower()}>" for mod in self.__class__ if mod != self.__class__.NONE and (self & mod)]
+        return '+'.join(parts)
+
+class HotkeyDefinition:
+    _STD_TO_ALIASES = {
+        'ctrl': ['ctrl', 'control'],
+        'super': ['super', 'win', 'meta'],
+        'enter': ['enter', 'return'],
+        'esc': ['esc', 'escape'],
+        'page_up': ['page_up', 'pageup', 'pgup'],
+        'page_down': ['page_down', 'pagedown', 'pgdn'],
+        'insert': ['insert', 'ins'],
+        'delete': ['delete', 'del'],
+        'print': ['print', 'printscreen', 'prtsc']
+    }
+    _ALIAS_TO_STD = {alias: std for std, aliases in _STD_TO_ALIASES.items() for alias in aliases}
+
+    _MOD_MASK_MAP = {
+        HotkeyModifiers.SHIFT: {'gdk': 'SHIFT_MASK', 'x11': 'ShiftMask', 'evdev': ['LEFTSHIFT', 'RIGHTSHIFT']},
+        HotkeyModifiers.CTRL: {'gdk': 'CONTROL_MASK', 'x11': 'ControlMask', 'evdev': ['LEFTCTRL', 'RIGHTCTRL']},
+        HotkeyModifiers.ALT: {'gdk': 'MOD1_MASK', 'x11': 'Mod1Mask', 'evdev': ['LEFTALT', 'RIGHTALT']},
+        HotkeyModifiers.SUPER: {'gdk': 'SUPER_MASK', 'x11': 'Mod4Mask', 'evdev': ['LEFTMETA', 'RIGHTMETA']}
+    }
+    _STR_TO_MODIFIER = {mod.name.lower(): mod for mod in HotkeyModifiers if mod != HotkeyModifiers.NONE}
+    EVDEV_CODE_TO_MODIFIER = {f"KEY_{code}": mod for mod, backends in _MOD_MASK_MAP.items() for code in backends['evdev']}
+
+    _MAIN_KEY_MAP = {
+        'space': {'gdk': ['space'], 'x11': ['space'], 'evdev': ['SPACE']},
+        'enter': {'gdk': ['Return'], 'x11': ['Return'], 'evdev': ['ENTER']},
+        'tab': {'gdk': ['Tab'], 'x11': ['Tab'], 'evdev': ['TAB']},
+        'backspace': {'gdk': ['BackSpace'], 'x11': ['BackSpace'], 'evdev': ['BACKSPACE']},
+        'esc': {'gdk': ['Escape'], 'x11': ['Escape'], 'evdev': ['ESC']},
+        'minus': {'gdk': ['minus'], 'x11': ['minus'], 'evdev': ['MINUS']},
+        'equal': {'gdk': ['equal'], 'x11': ['equal'], 'evdev': ['EQUAL']},
+        'up': {'gdk': ['Up'], 'x11': ['Up'], 'evdev': ['UP']},
+        'down': {'gdk': ['Down'], 'x11': ['Down'], 'evdev': ['DOWN']},
+        'left': {'gdk': ['Left'], 'x11': ['Left'], 'evdev': ['LEFT']},
+        'right': {'gdk': ['Right'], 'x11': ['Right'], 'evdev': ['RIGHT']},
+        'page_up': {'gdk': ['Page_Up'],   'x11': ['Page_Up', 'Prior'], 'evdev': ['PAGEUP']},
+        'page_down': {'gdk': ['Page_Down'], 'x11': ['Page_Down', 'Next'], 'evdev': ['PAGEDOWN']},
+        'home': {'gdk': ['Home'], 'x11': ['Home'], 'evdev': ['HOME']},
+        'end': {'gdk': ['End'], 'x11': ['End'], 'evdev': ['END']},
+        'insert': {'gdk': ['Insert'], 'x11': ['Insert'], 'evdev': ['INSERT']},
+        'delete': {'gdk': ['Delete'], 'x11': ['Delete'], 'evdev': ['DELETE']},
+        'print': {'gdk': ['Print'], 'x11': ['Print'], 'evdev': ['SYSRQ']},
+        'shift': {'gdk': ['Shift_L', 'Shift_R'], 'x11': ['Shift_L', 'Shift_R'], 'evdev': ['LEFTSHIFT', 'RIGHTSHIFT']},
+        'ctrl': {'gdk': ['Control_L', 'Control_R'], 'x11': ['Control_L', 'Control_R'], 'evdev': ['LEFTCTRL', 'RIGHTCTRL']},
+        'alt': {'gdk': ['Alt_L', 'Alt_R'], 'x11': ['Alt_L', 'Alt_R'], 'evdev': ['LEFTALT', 'RIGHTALT']},
+        'super': {'gdk': ['Super_L', 'Super_R'], 'x11': ['Super_L', 'Super_R'], 'evdev': ['LEFTMETA', 'RIGHTMETA']}
+    }
+    for char_code in range(ord('a'), ord('z') + 1):
+        char = chr(char_code)
+        _MAIN_KEY_MAP[char] = {'gdk': [char], 'x11': [char], 'evdev': [char.upper()]}
+    for i in range(10):
+        k = str(i)
+        _MAIN_KEY_MAP[k] = {'gdk': [k], 'x11': [k], 'evdev': [k]}
+    for i in range(1, 13):
+        _MAIN_KEY_MAP[f'f{i}'] = {'gdk': [f'F{i}'], 'x11': [f'F{i}'], 'evdev': [f'F{i}']}
+    _GDK_TO_STD = {gdk_key: std_key for std_key, backends in _MAIN_KEY_MAP.items() for gdk_key in backends.get('gdk', [])}
+
+    def __init__(self, modifiers: HotkeyModifiers, main_key):
+        self.modifiers = modifiers
+        self.main_key = main_key
+
+    def __hash__(self):
+        return hash((self.modifiers, self.main_key))
+
+    def __eq__(self, other):
+        if not isinstance(other, HotkeyDefinition):
+            return False
+        return self.modifiers == other.modifiers and self.main_key == other.main_key
+
+    @classmethod
+    def from_string(cls, hotkey_str: str):
+        if not hotkey_str:
+            return cls(HotkeyModifiers.NONE, None)
+        parts = [p.strip().lower().replace('<', '').replace('>', '') for p in hotkey_str.split('+') if p.strip()]
+        modifiers = HotkeyModifiers.NONE
+        main_key = None
+        for part in parts:
+            std_name = cls._ALIAS_TO_STD.get(part, part)
+            if std_name in cls._STR_TO_MODIFIER:
+                modifiers |= cls._STR_TO_MODIFIER[std_name]
+            else:
+                main_key = std_name
+        if main_key is None and len(parts) == 1 and modifiers != HotkeyModifiers.NONE:
+            std_name = cls._ALIAS_TO_STD.get(parts[0], parts[0])
+            main_key = std_name
+            modifiers = HotkeyModifiers.NONE
+        return cls(modifiers, main_key)
+
+    @classmethod
+    def from_gdk_event(cls, event):
+        modifiers = HotkeyModifiers.NONE
+        for mod_flag, data in cls._MOD_MASK_MAP.items():
+            gdk_mask = getattr(Gdk.ModifierType, data['gdk'])
+            if event.state & gdk_mask:
+                modifiers |= mod_flag
+        keymap = Gdk.Keymap.get_for_display(Gdk.Display.get_default())
+        success, entries = keymap.get_entries_for_keyval(event.keyval)
+        effective_keyval = event.keyval
+        if success and entries:
+            keycode = entries[0].keycode
+            success_lookup, key_entries, keyvals = keymap.get_entries_for_keycode(keycode)
+            if success_lookup and key_entries and keyvals:
+                for i, entry in enumerate(key_entries):
+                    if entry.group == 0 and entry.level == 0:
+                        effective_keyval = keyvals[i]
+                        break
+        key_name = Gdk.keyval_name(effective_keyval)
+        if not key_name:
+            return cls(HotkeyModifiers.NONE, None)
+        main_key = cls._GDK_TO_STD.get(key_name, key_name)
+        if main_key in cls._STR_TO_MODIFIER:
+            mod_flag = cls._STR_TO_MODIFIER[main_key]
+            if modifiers & mod_flag:
+                modifiers &= ~mod_flag
+            if modifiers != HotkeyModifiers.NONE:
+                modifiers |= mod_flag
+                main_key = None
+        return cls(modifiers, main_key)
+
+    def is_valid(self) -> bool:
+        return self.main_key is not None and self.main_key in self._MAIN_KEY_MAP
+
+    def is_modifier_only(self) -> bool:
+        return self.modifiers == HotkeyModifiers.NONE and self.main_key in self._STR_TO_MODIFIER
+
+    def to_string(self) -> str:
+        if self.main_key is None and self.modifiers == HotkeyModifiers.NONE:
+            return "未知按键"
+        parts = []
+        if self.modifiers != HotkeyModifiers.NONE:
+            parts.append(str(self.modifiers))
+        if self.main_key:
+            if self.main_key in self._STR_TO_MODIFIER:
+                parts.append(f"<{self.main_key}>")
+            else:
+                parts.append(self.main_key)
+        return '+'.join(parts)
+
+    def to_x11(self):
+        x11_masks = []
+        for mod in HotkeyModifiers:
+            if mod != HotkeyModifiers.NONE and (self.modifiers & mod):
+                x11_masks.append(self._MOD_MASK_MAP[mod]['x11'])
+        key_strs = self._MAIN_KEY_MAP[self.main_key]['x11'] if self.is_valid() else []
+        return x11_masks, key_strs
+
+    def to_evdev(self):
+        if self.is_valid():
+            return [f"KEY_{code}" for code in self._MAIN_KEY_MAP[self.main_key]['evdev']]
+        return []
+
+class Config(GObject.Object):
+    __gsignals__ = {
+        'setting-changed': (GObject.SignalFlags.RUN_FIRST, None, (str, str, object)),
+    }
+
+    DEFAULT_CSS = {
+        'info_panel': """
+.info-panel { padding: 5px; border: 1px solid #505070; border-radius: 8px; background-color: rgba(43, 42, 51, 0.8); }
+.info-panel label { font-weight: bold; color: #e0e0e0; }
+.info-panel #label_dimensions { font-size: 26px; color: #948bc1; }
+.info-panel #label_count { font-size: 24px; opacity: 0.9; }
+.info-panel #label_mode { font-size: 23px; opacity: 0.9; }
+""".strip(),
+        'button': """
+.overlay-button { padding: 4px; border: 1px solid #d1d5db; border-radius: 4px; background-color: #f5f5f5; background-image: none; font-size: 24px; color: #374151; }
+.overlay-button:hover { border-color: #9ca3af; background-image: none; }
+.overlay-button:active { background-color: #e5e7eb; background-image: none; }
+.overlay-button:disabled { border-color: #e5e7eb; background-color: #f3f4f6; background-image: none; color: #9ca3af; opacity: 1; }
+""".strip(),
+        'instruction_panel': """
+.instruction-panel { padding: 10px; border: 1px solid #555; border-radius: 6px; background-color: rgba(30, 30, 30, 0.85); font-size: 18px; color: #f0f0f0; }
+.instruction-panel label { margin-bottom: 2px; }
+.key-label { margin-right: 10px; font-weight: bold; color: #8be9fd; }
+.desc-label { color: #f8f8f2; }
+.key-label-inactive { margin-right: 10px; font-weight: bold; color: #8be9fd; opacity: 0.55; }
+.desc-label-inactive { color: #f8f8f2; opacity: 0.55; }
+""".strip(),
+        'simulated_window': """
+.simulated-window { border: 1px solid #b0b0b0; border-radius: 8px; background-color: #fdfdfd; box-shadow: 0 3px 10px rgba(0,0,0,0.2); font-size: 26px; color: #2e3436; }
+.window-header { padding: 6px 10px; border-bottom: 1px solid #dcdcdc; border-radius: 8px 8px 0 0; background-color: #f2f2f2; }
+.window-title { font-size: 28px; font-weight: bold; color: #333333; }
+""".strip(),
+        'preview_panel': """
+@define-color preview_bg #1a1a1a;
+@define-color preview_text #cccccc;
+@define-color preview_mask rgba(26, 26, 26, 0.6);
+@define-color preview_matched_seam #3380ff;
+@define-color preview_unmatched_seam #b34dcc;
+@define-color preview_drawing_border #ffffff;
+@define-color preview_static_border #e6e6e6;
+@define-color preview_delete_line #ff1a1a;
+""".strip(),
+        'config_panel': """
+.config-container { margin: 20px; }
+.config-section { margin: 12px; }
+.config-sidebar { border-right: 1px solid alpha(@theme_fg_color, 0.15); }
+.config-sidebar list row label { color: #2e3436; }
+.config-sidebar list row:selected label { color: #ffffff; }
+.log-view { margin: 5px; font-family: monospace; font-size: 22px; }
+.log-view text { background-color: #ffffff; }
+@define-color log_debug #708090;
+@define-color log_info #2b2b2b;
+@define-color log_warning #e69138;
+@define-color log_error #cc0000;
+""".strip(),
+        'notification': """
+.notification-panel { padding: 24px; border: 1px solid rgba(255,255,255,0.2); border-radius: 12px; background-color: rgba(40, 40, 45, 0.98); box-shadow: 0 2px 5px rgba(0,0,0,0.5); color: white; }
+.notification-critical .notif-title { border-bottom-color: #ff5555; color: #ff5555; }
+.notification-warning .notif-title { border-bottom-color: #ec9028; color: #ec9028; }
+.notification-success .notif-title { border-bottom-color: #78c93f; color: #78c93f; }
+.notif-title { padding-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.5); font-size: 26px; font-weight: bold; color: #f5f5f5; }
+.notif-msg { font-size: 20px; color: #f8f8f2; }
+.notif-btn { min-width: 80px; margin-left: 4px; margin-right: 4px; padding: 6px 20px; border-radius: 6px; font-size: 22px; font-weight: bold; }
+""".strip(),
+        'mask': """
+.mask-layer { background-color: rgba(0, 0, 0, 0.6); }
+""".strip(),
+        'dialog': """
+.embedded-dialog { border: 1px solid #b0b0b0; border-radius: 8px; background-color: #f6f6f6; box-shadow: 0 2px 5px rgba(0,0,0,0.2); color: #2e3436; }
+.dialog-header { padding: 12px; border-bottom: 1px solid #dcdcdc; border-radius: 11px 11px 0 0; background-color: #e8e8e8; }
+.dialog-title { font-size: 26px; font-weight: bold; color: #333333; }
+.dialog-content-area { padding: 15px; }
+.dialog-message { font-size: 24px; color: #444444; }
+.dialog-action-area { padding: 0 15px 10px 10px; }
+.dialog-btn { padding: 8px 15px; border-radius: 6px; font-size: 22px; font-weight: bold; }
+.dialog-list-box { padding: 4px; border: 1px solid #bfbfbf; border-radius: 4px; background-color: #f3f3f3; }
+.dialog-list-row { margin-bottom: 5px; padding: 10px; border: 1px solid #cccccc; border-radius: 4px; background-color: #ffffff; }
+.dialog-list-row:last-child { margin-bottom: 0; }
+.dialog-list-row:selected { border: 1px solid #4A90E2; color: #000000; }
+""".strip(),
+        'feedback_widget': """
+.feedback-panel { border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 12px; background-color: rgba(30, 32, 35, 0.92); }
+.feedback-label { margin-left: 10px; font-size: 20px; font-weight: bold; color: #f0f0f0; }
+.feedback-spinner { min-width: 36px; min-height: 36px; color: #cccccc; }
+.feedback-progress trough { min-height: 5px; border: none; border-radius: 3px; background-color: rgba(255,255,255,0.1); background-image: none; }
+.feedback-progress progress { min-height: 5px; border: none; border-radius: 3px; background-color: #5e81ac; }
+""".strip()
+        }
+    CONFIG_SCHEMA = {
+        'Behavior': {
+            'copy_to_clipboard_on_finish': ('bool', 'true'),
+            'capture_with_cursor': ('bool', 'false'),
+            'enable_free_scroll_matching': ('bool', 'true'),
+            'auto_scroll_ticks_per_step': ('int', '2'),
+            'auto_scroll_interval_ms': ('int', '300'),
+            'scroll_method': ('str', 'move_user_cursor'),
+            'reuse_invisible_cursor': ('bool', 'false'),
+            'grid_scroll_interval_ms': ('int', '200'),
+            'forward_action': ('str', 'capture_scroll'),
+            'backward_action': ('str', 'scroll_delete'),
+            'grid_scroll_ticks_formula': ('str', 'max(1, int(0.7 * {ticks}))'),
+            'calibration_samples': ('int', '4'),
+            'hotkey_debounce_time': ('float', '0.25'),
+        },
+        'Interface.Components': {
+            'enable_buttons': ('bool', 'true'),
+            'enable_side_panel': ('bool', 'true'),
+            'show_instruction_panel_on_start': ('bool', 'true'),
+            'show_preview_on_start': ('bool', 'true'),
+            'enable_auto_scroll_buttons': ('bool', 'true'),
+            'enable_grid_action_buttons': ('bool', 'true'),
+            'show_capture_count': ('bool', 'true'),
+            'show_total_dimensions': ('bool', 'true'),
+            'show_current_mode': ('bool', 'true'),
+        },
+        # 逻辑px {
+        'Interface.Layout': {
+            'border_width': ('int', '4'),
+            'button_panel_width': ('int', '100'),
+            'side_panel_width': ('int', '150'),
+            'preview_panel_height': ('int', '750'),
+            'config_panel_height': ('int', '800'),
+            'notification_width': ('int', '520'),
+            'feedback_widget_width': ('int', '200'),
+            'file_chooser_height': ('int', '800'),
+            'min_selection_size': ('int', '40'),
+        },
+        'Interface.Theme': {
+            'border_color': ('color', '0.73, 0.25, 0.25, 1.00'),
+            'static_bar_color': ('color', '0.60, 0.76, 0.95, 1.00'),
+            'info_panel_css': ('css', DEFAULT_CSS['info_panel']),
+            'button_css': ('css', DEFAULT_CSS['button']),
+            'instruction_panel_css': ('css', DEFAULT_CSS['instruction_panel']),
+            'simulated_window_css': ('css', DEFAULT_CSS['simulated_window']),
+            'preview_panel_css': ('css', DEFAULT_CSS['preview_panel']),
+            'config_panel_css': ('css', DEFAULT_CSS['config_panel']),
+            'notification_css': ('css', DEFAULT_CSS['notification']),
+            'mask_css': ('css', DEFAULT_CSS['mask']),
+            'dialog_css': ('css', DEFAULT_CSS['dialog']),
+            'feedback_widget_css': ('css', DEFAULT_CSS['feedback_widget']),
+        },
+        # 逻辑px }
+        'Output': {
+            'save_directory': ('path', ''),
+            'save_format': ('str', 'PNG'),
+            'jpeg_quality': ('int', '80'),
+            'filename_template': ('str', '长截图 {timestamp}'),
+            'filename_timestamp_format': ('str', '%Y-%m-%d %H-%M-%S'),
+        },
+        'System': {
+            'max_viewer_dimension': ('int', '32767'), # 缓冲区px
+            'large_image_opener': ('str', 'default_browser'),
+            'sound_theme': ('str', 'freedesktop'),
+            'capture_sound': ('str', 'screen-capture'),
+            'undo_sound': ('str', 'bell'),
+            'finalize_sound': ('str', 'complete'),
+            'warning_sound': ('str', 'dialog-warning'),
+            'log_file': ('path', '~/.scroll_stitch.log'),
+            'temp_directory': ('path', '/tmp/scroll_stitch_{pid}'),
+        },
+        'Preview': {
+            'preview_cache_size': ('int', '20'),
+            'preview_drag_sensitivity': ('float', '2.0'),
+            'preview_autoscroll_sensitivity': ('float', '1.0'),
+            'preview_zoom_factor': ('float', '1.26'),
+            'preview_min_zoom': ('float', '0.25'),
+            'preview_max_zoom': ('float', '4.0'),
+            'preview_resize_handle_size': ('int', '10'), # 逻辑px
+        },
+        'Performance': {
+            # 缓冲区px {
+            'max_scroll_per_tick': ('int', '230'),
+            'min_scroll_per_tick': ('int', '30'),
+            # 缓冲区px }
+            'thres_score': ('float', '5.0'),
+            'thres_texture': ('float', '3.0'),
+        },
+        'Hotkeys': {
+            'capture': ('hotkey', 'space'),
+            'finalize': ('hotkey', 'enter'),
+            'undo': ('hotkey', 'backspace'),
+            'cancel': ('hotkey', 'esc'),
+            'auto_scroll_start': ('hotkey', 's'),
+            'auto_scroll_stop': ('hotkey', 'e'),
+            'grid_forward': ('hotkey', 'f'),
+            'grid_backward': ('hotkey', 'b'),
+            'configure_scroll_unit': ('hotkey', 'c'),
+            'toggle_grid_mode': ('hotkey', '<shift>'),
+            'toggle_config_panel': ('hotkey', 'g'),
+            'toggle_preview': ('hotkey', 'w'),
+            'toggle_hotkeys_enabled': ('hotkey', 'f4'),
+            'toggle_instruction_panel': ('hotkey', 'f1'),
+            'preview_zoom_in': ('hotkey', '<ctrl>+equal'),
+            'preview_zoom_out': ('hotkey', '<ctrl>+minus'),
+            'dialog_confirm': ('hotkey', 'space'),
+            'dialog_cancel': ('hotkey', 'esc'),
+        },
+        'ApplicationScrollUnits': {}
+    }
+
+    def __init__(self, custom_path=None):
+        super().__init__()
         self.parser = configparser.ConfigParser(interpolation=None)
+        self._save_timer_id = None
         default_config_path = Path.home() / ".config" / "scroll_stitch" / "config.ini"
         script_dir_config_path = Path(__file__).resolve().parent / "config.ini"
         path_to_load = None
@@ -89,428 +461,191 @@ class Config:
             path_to_load = default_config_path
         if path_to_load:
             self.config_path = path_to_load
-            self.parser.read(self.config_path, encoding='utf-8')
+            self.parser.read(str(self.config_path), encoding='utf-8')
         else:
             self.config_path = default_config_path
             self._create_default_config()
-            self.parser.read(self.config_path, encoding='utf-8')
-        self._gtk_modifier_map = {
-            'ctrl': Gdk.ModifierType.CONTROL_MASK, 'control': Gdk.ModifierType.CONTROL_MASK,
-            'shift': Gdk.ModifierType.SHIFT_MASK,
-            'alt': Gdk.ModifierType.MOD1_MASK,
-            'super': Gdk.ModifierType.SUPER_MASK, 'win': Gdk.ModifierType.SUPER_MASK,
-        }
-        self.GTK_MODIFIER_MASK = (
-            Gdk.ModifierType.CONTROL_MASK | 
-            Gdk.ModifierType.SHIFT_MASK | 
-            Gdk.ModifierType.MOD1_MASK |
-            Gdk.ModifierType.SUPER_MASK
-        )
-        self._key_map_gtk_special = {
-            'space': Gdk.KEY_space, 'enter': Gdk.KEY_Return,
-            'backspace': Gdk.KEY_BackSpace, 'esc': Gdk.KEY_Escape,
-            'up': Gdk.KEY_Up, 'down': Gdk.KEY_Down,
-            'left': Gdk.KEY_Left, 'right': Gdk.KEY_Right,
-            'minus': Gdk.KEY_minus, 'equal': Gdk.KEY_equal,
-            'f1': Gdk.KEY_F1, 'f2': Gdk.KEY_F2, 'f3': Gdk.KEY_F3, 'f4': Gdk.KEY_F4,
-            'f5': Gdk.KEY_F5, 'f6': Gdk.KEY_F6, 'f7': Gdk.KEY_F7, 'f8': Gdk.KEY_F8,
-            'f9': Gdk.KEY_F9, 'f10': Gdk.KEY_F10, 'f11': Gdk.KEY_F11, 'f12': Gdk.KEY_F12,
-        }
-        self._gtk_modifier_keyval_map = {
-            'shift': (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R),
-            'ctrl': (Gdk.KEY_Control_L, Gdk.KEY_Control_R), 'control': (Gdk.KEY_Control_L, Gdk.KEY_Control_R),
-            'alt': (Gdk.KEY_Alt_L, Gdk.KEY_Alt_R),
-            'super': (Gdk.KEY_Super_L, Gdk.KEY_Super_R), 'win': (Gdk.KEY_Super_L, Gdk.KEY_Super_R),
-        }
+            self.parser.read(str(self.config_path), encoding='utf-8')
         self._load_settings()
 
-    def _parse_hotkey_string(self, hotkey_str: str):
-        if not hotkey_str:
-            return {'gtk_keys': tuple(), 'gtk_mask': 0, 'main_key_str': None}
-        original_str = hotkey_str
-        parts = [p.strip() for p in hotkey_str.lower().split('+') if p.strip()]
-        clean_parts = [p.replace('<', '').replace('>', '') for p in parts]
-        gtk_mask = 0
-        gtk_keys_tuple = tuple()
-        main_key_str = None
-        if len(clean_parts) == 1 and clean_parts[0] in self._gtk_modifier_keyval_map:
-            main_key_str = clean_parts[0]
-            gtk_keys_tuple = self._gtk_modifier_keyval_map[main_key_str]
-        else:
-            for part in clean_parts:
-                if part in self._gtk_modifier_map:
-                    gtk_mask |= self._gtk_modifier_map[part]
-                else:
-                    main_key_str = part
-            if main_key_str:
-                key_to_lookup = main_key_str
-                if (gtk_mask & Gdk.ModifierType.SHIFT_MASK) and len(main_key_str) == 1 and main_key_str.isalpha():
-                    key_to_lookup = main_key_str.upper()
-                gtk_key_val = None
-                if key_to_lookup in self._key_map_gtk_special:
-                    gtk_key_val = self._key_map_gtk_special[key_to_lookup]
-                elif len(key_to_lookup) >= 1:
-                    gtk_key_val = Gdk.keyval_from_name(key_to_lookup)
-                else:
-                    logging.warning(f"无法解析GTK主按键: '{main_key_str}' in '{original_str}'")
-                if gtk_key_val:
-                    gtk_keys_tuple = (gtk_key_val,)
-            elif not gtk_mask:
-                 logging.warning(f"快捷键 '{original_str}' 无效")
-        return {
-            'gtk_keys': gtk_keys_tuple,
-            'gtk_mask': gtk_mask,
-            'main_key_str': main_key_str
-        }
-
     def _load_settings(self):
-        # Behavior
-        self.ENABLE_FREE_SCROLL_MATCHING = self.parser.getboolean('Behavior', 'enable_free_scroll_matching', fallback=True)
-        self.SCROLL_METHOD = self.parser.get('Behavior', 'scroll_method', fallback='move_user_cursor')
-        self.CAPTURE_WITH_CURSOR = self.parser.getboolean('Behavior', 'capture_with_cursor', fallback=False)
-        self.REUSE_INVISIBLE_CURSOR = self.parser.getboolean('Behavior', 'reuse_invisible_cursor', fallback=False)
-        self.FORWARD_ACTION = self.parser.get('Behavior', 'forward_action', fallback='capture_scroll')
-        self.BACKWARD_ACTION = self.parser.get('Behavior', 'backward_action', fallback='scroll_delete')
-        # Interface.Components
-        self.ENABLE_BUTTONS = self.parser.getboolean('Interface.Components', 'enable_buttons', fallback=True)
-        self.ENABLE_GRID_ACTION_BUTTONS = self.parser.getboolean('Interface.Components', 'enable_grid_action_buttons', fallback=True)
-        self.ENABLE_AUTO_SCROLL_BUTTONS = self.parser.getboolean('Interface.Components', 'enable_auto_scroll_buttons', fallback=True)
-        self.ENABLE_SIDE_PANEL = self.parser.getboolean('Interface.Components', 'enable_side_panel', fallback=True)
-        self.SHOW_PREVIEW_ON_START = self.parser.getboolean('Interface.Components', 'show_preview_on_start', fallback=True)
-        self.SHOW_CAPTURE_COUNT = self.parser.getboolean('Interface.Components', 'show_capture_count', fallback=True)
-        self.SHOW_TOTAL_DIMENSIONS = self.parser.getboolean('Interface.Components', 'show_total_dimensions', fallback=True)
-        self.SHOW_CURRENT_MODE = self.parser.getboolean('Interface.Components', 'show_current_mode', fallback=True)
-        self.SHOW_INSTRUCTION_PANEL_ON_START = self.parser.getboolean('Interface.Components', 'show_instruction_panel_on_start', fallback=True)
-        # Interface.Layout 
-        # 逻辑px {
-        self.BORDER_WIDTH = self.parser.getint('Interface.Layout', 'border_width', fallback=4)
-        self.HANDLE_HEIGHT = self.parser.getint('Interface.Layout', 'handle_height', fallback=10) 
-        self.BUTTON_PANEL_WIDTH = self.parser.getint('Interface.Layout', 'button_panel_width', fallback=100)
-        self.SIDE_PANEL_WIDTH = self.parser.getint('Interface.Layout', 'side_panel_width', fallback=150)
-        self.BUTTON_SPACING = self.parser.getint('Interface.Layout', 'button_spacing', fallback=5)
-        self.PROCESSING_DIALOG_WIDTH = self.parser.getint('Interface.Layout', 'processing_dialog_width', fallback=200)
-        self.PROCESSING_DIALOG_HEIGHT = self.parser.getint('Interface.Layout', 'processing_dialog_height', fallback=90)
-        self.PROCESSING_DIALOG_SPACING = self.parser.getint('Interface.Layout', 'processing_dialog_spacing', fallback=15)
-        self.PROCESSING_DIALOG_BORDER_WIDTH = self.parser.getint('Interface.Layout', 'processing_dialog_border_width', fallback=20)
-        # Interface.Theme
-        color_str = self.parser.get('Interface.Theme', 'border_color', fallback='0.73, 0.25, 0.25, 1.00')
-        self.BORDER_COLOR = tuple(float(c.strip()) for c in color_str.split(','))
-        indicator_color_str = self.parser.get('Interface.Theme', 'matching_indicator_color', fallback='0.60, 0.76, 0.95, 1.00')
-        self.MATCHING_INDICATOR_COLOR = tuple(float(c.strip()) for c in indicator_color_str.split(','))
-        self.PROCESSING_DIALOG_CSS = self.parser.get('Interface.Theme', 'processing_dialog_css', fallback="""
-.processing-dialog-bg { background-color: rgba(20, 20, 30, 0.85); border-radius: 8px; color: white; font-size: 26px; }
-        """.strip()).lstrip()
-        self.INFO_PANEL_CSS = self.parser.get('Interface.Theme', 'info_panel_css', fallback="""
-.info-panel, .info-panel:backdrop { background-color: rgba(43, 42, 51, 0.8); border: 1px solid #505070; border-radius: 8px; padding: 5px; color: #e0e0e0; }
-.info-panel label, .info-panel label:backdrop { font-weight: bold; color: #e0e0e0; }
-.info-panel #label_dimensions, .info-panel #label_dimensions:backdrop { font-size: 26px; color: #948bc1; }
-.info-panel #label_count, .info-panel #label_count:backdrop { font-size: 24px; opacity: 0.9; color: #e0e0e0; }
-.info-panel #label_mode, .info-panel #label_mode:backdrop { font-size: 23px; opacity: 0.9; color: #e0e0e0; }
-        """.strip()).lstrip()
-        self.INSTRUCTION_PANEL_CSS = self.parser.get('Interface.Theme', 'instruction_panel_css', fallback="""
-.instruction-panel { background-color: rgba(30, 30, 30, 0.85); border: 1px solid #555; border-radius: 6px; padding: 10px; color: #f0f0f0; font-size: 18px; }
-.instruction-panel label { margin-bottom: 2px; }
-.key-label { font-weight: bold; color: #8be9fd; margin-right: 10px; }
-.desc-label { color: #f8f8f2; }
-        """.strip()).lstrip()
-        self.NOTIFICATION_CSS = self.parser.get('Interface.Theme', 'notification_css', fallback="""
-.notification-panel { background-color: rgba(40, 40, 45, 0.98); border: 1px solid rgba(255,255,255,0.2); border-radius: 12px; padding: 24px; color: white; }
-.notification-critical .notif-title { color: #ff5555; border-bottom-color: rgba(255, 85, 85, 0.5); }
-.notification-warning .notif-title { color: #ec9028; border-bottom-color: rgba(236, 144, 40, 0.5); }
-.notification-success .notif-title { color: #78c93f; border-bottom-color: rgba(120, 201, 63, 0.5); }
-.notif-title { font-weight: bold; font-size: 26px; color: #f5f5f5; border-bottom: 1px solid rgba(255,255,255,0.5); padding-bottom: 8px; }
-.notif-msg { font-size: 20px; color: #f8f8f2; }
-.notif-btn { padding: 6px 20px; font-size: 22px; margin-left: 4px; margin-right: 4px; border-radius: 6px; font-weight: bold; min-width: 80px; }
-        """.strip()).lstrip()
-        self.DIALOG_CSS = self.parser.get('Interface.Theme', 'dialog_css', fallback="""
-.embedded-dialog { background-color: rgba(35, 35, 40, 0.95); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 16px; color: #ffffff; padding: 30px; }
-.dialog-title { font-size: 28px; font-weight: bold; color: #f5f5f5; }
-.dialog-message { font-size: 24px; margin-bottom: 10px; color: #e0e0e0; }
-.dialog-btn { border-radius: 8px; border-width: 1px; border-style: solid; padding: 10px 30px; margin: 0 10px; }
-        """.strip()).lstrip()
-        self.MASK_CSS = self.parser.get('Interface.Theme', 'mask_css', fallback="""
-.mask-layer { background-color: rgba(0, 0, 0, 0.6); }
-        """.strip()).lstrip()
-        self.SIMULATED_WINDOW_CSS = self.parser.get('Interface.Theme', 'simulated_window_css', fallback="""
-.simulated-window, .simulated-window:backdrop { background-color: #fdfdfd; color: #2e3436; border: 1px solid #b0b0b0; border-radius: 8px; box-shadow: 0 3px 10px rgba(0,0,0,0.2); }
-.window-header, .window-header:backdrop { background-color: #f2f2f2; border-bottom: 1px solid #dcdcdc; border-radius: 8px 8px 0 0; padding: 6px 10px; }
-.window-title, .window-title:backdrop { font-size: 28px; font-weight: bold; color: #333333; text-shadow: none; }
-        """.strip()).lstrip()
-        # 逻辑px }
-        # Interface.Strings
-        self.DIALOG_QUIT_TITLE = self.parser.get('Interface.Strings', 'dialog_quit_title', fallback='确认放弃截图？')
-        self.DIALOG_QUIT_MESSAGE = self.parser.get('Interface.Strings', 'dialog_quit_message', fallback='您已经截取了 {count} 张图片。确定要放弃它们吗？')
-        self.DIALOG_QUIT_BTN_YES = self.parser.get('Interface.Strings', 'dialog_quit_button_yes', fallback='是 ({key})')
-        self.DIALOG_QUIT_BTN_NO = self.parser.get('Interface.Strings', 'dialog_quit_button_no', fallback='否 ({key})')
-        self.STR_CAPTURE_COUNT_FORMAT = self.parser.get('Interface.Strings', 'capture_count_format', fallback='截图: {count}')
-        self.STR_PROCESSING_TEXT = self.parser.get('Interface.Strings', 'processing_dialog_text', fallback='正在处理…')
-        # Output
-        save_dir_str = self.parser.get('Output', 'save_directory', fallback='')
-        self.SAVE_DIRECTORY = Path(save_dir_str).expanduser() if save_dir_str.strip() else None
-        self.SAVE_FORMAT = self.parser.get('Output', 'save_format', fallback='PNG').upper()
-        self.JPEG_QUALITY = self.parser.getint('Output', 'jpeg_quality', fallback=95)
-        self.FILENAME_TEMPLATE = self.parser.get('Output', 'filename_template', fallback='长截图 {timestamp}')
-        self.FILENAME_TIMESTAMP_FORMAT = self.parser.get('Output', 'filename_timestamp_format', raw=True, fallback='%Y-%m-%d %H-%M-%S')
-        # System
-        self.COPY_TO_CLIPBOARD = self.parser.getboolean('System', 'copy_to_clipboard_on_finish', fallback=True)
-        self.NOTIFICATION_CLICK_ACTION = self.parser.get('System', 'notification_click_action', fallback='open_file').lower().strip()
-        self.LARGE_IMAGE_OPENER = self.parser.get('System', 'large_image_opener', fallback='default_browser').strip()
-        self.SOUND_THEME = self.parser.get('System', 'sound_theme', fallback='freedesktop')
-        self.CAPTURE_SOUND = self.parser.get('System', 'capture_sound', fallback='screen-capture')
-        self.UNDO_SOUND = self.parser.get('System', 'undo_sound', fallback='bell')
-        self.FINALIZE_SOUND = self.parser.get('System', 'finalize_sound', fallback='complete')
-        log_file_path_str = self.parser.get('System', 'log_file', fallback='~/.scroll_stitch.log')
-        self.LOG_FILE = Path(log_file_path_str).expanduser()
-        temp_dir_str = self.parser.get('System', 'temp_directory_base', fallback='/tmp/scroll_stitch_{pid}')
-        self.TMP_DIR = Path(temp_dir_str.format(pid=os.getpid()))
-        # Performance
-        # 缓冲区px {
-        self.GRID_MATCHING_MAX_OVERLAP = self.parser.getint('Performance', 'grid_matching_max_overlap', fallback=20)
-        self.FREE_SCROLL_MATCHING_MAX_OVERLAP = self.parser.getint('Performance', 'free_scroll_matching_max_overlap', fallback=200)
-        self.MIN_SCROLL_PER_TICK = self.parser.getint('Performance', 'min_scroll_per_tick', fallback=30)
-        self.MAX_SCROLL_PER_TICK = self.parser.getint('Performance', 'max_scroll_per_tick', fallback=230)
-        self.MAX_VIEWER_DIMENSION = self.parser.getint('Performance', 'max_viewer_dimension', fallback=32767)
-        # 缓冲区px }
-        self.AUTO_SCROLL_TICKS_PER_STEP = self.parser.getint('Performance', 'auto_scroll_ticks_per_step', fallback=2)
-        self.PREVIEW_DRAG_SENSITIVITY = self.parser.getfloat('Performance', 'preview_drag_sensitivity', fallback=2.0)
-        # Hotkeys
-        self.str_capture = self.parser.get('Hotkeys', 'capture', fallback='space')
-        self.str_finalize = self.parser.get('Hotkeys', 'finalize', fallback='enter')
-        self.str_undo = self.parser.get('Hotkeys', 'undo', fallback='backspace')
-        self.str_cancel = self.parser.get('Hotkeys', 'cancel', fallback='esc')
-        self.str_dialog_confirm = self.parser.get('Hotkeys', 'dialog_confirm', fallback='space')
-        self.str_dialog_cancel = self.parser.get('Hotkeys', 'dialog_cancel', fallback='esc')
-        self.str_grid_backward = self.parser.get('Hotkeys', 'grid_backward', fallback='b')
-        self.str_grid_forward = self.parser.get('Hotkeys', 'grid_forward', fallback='f')
-        self.str_auto_scroll_start = self.parser.get('Hotkeys', 'auto_scroll_start', fallback='s')
-        self.str_auto_scroll_stop = self.parser.get('Hotkeys', 'auto_scroll_stop', fallback='e')
-        self.str_configure_scroll_unit = self.parser.get('Hotkeys', 'configure_scroll_unit', fallback='c')
-        self.str_toggle_grid_mode = self.parser.get('Hotkeys', 'toggle_grid_mode', fallback='<shift>')
-        self.str_open_config_editor = self.parser.get('Hotkeys', 'open_config_editor', fallback='g')
-        self.str_toggle_preview = self.parser.get('Hotkeys', 'toggle_preview', fallback='w')
-        self.str_preview_zoom_in = self.parser.get('Hotkeys', 'preview_zoom_in', fallback='<ctrl>+equal')
-        self.str_preview_zoom_out = self.parser.get('Hotkeys', 'preview_zoom_out', fallback='<ctrl>+minus')
-        self.str_toggle_hotkeys_enabled = self.parser.get('Hotkeys', 'toggle_hotkeys_enabled', fallback='f4')
-        self.str_toggle_instruction_panel = self.parser.get('Hotkeys', 'toggle_instruction_panel', fallback='f1')
-        self.HOTKEY_CAPTURE = self._parse_hotkey_string(self.str_capture)
-        self.HOTKEY_FINALIZE = self._parse_hotkey_string(self.str_finalize)
-        self.HOTKEY_UNDO = self._parse_hotkey_string(self.str_undo)
-        self.HOTKEY_CANCEL = self._parse_hotkey_string(self.str_cancel)
-        self.HOTKEY_GRID_BACKWARD = self._parse_hotkey_string(self.str_grid_backward)
-        self.HOTKEY_GRID_FORWARD = self._parse_hotkey_string(self.str_grid_forward)
-        self.HOTKEY_AUTO_SCROLL_START = self._parse_hotkey_string(self.str_auto_scroll_start)
-        self.HOTKEY_AUTO_SCROLL_STOP = self._parse_hotkey_string(self.str_auto_scroll_stop)
-        self.HOTKEY_CONFIGURE_SCROLL_UNIT = self._parse_hotkey_string(self.str_configure_scroll_unit)
-        self.HOTKEY_TOGGLE_GRID_MODE = self._parse_hotkey_string(self.str_toggle_grid_mode)
-        self.HOTKEY_TOGGLE_PREVIEW = self._parse_hotkey_string(self.str_toggle_preview)
-        self.HOTKEY_OPEN_CONFIG_EDITOR = self._parse_hotkey_string(self.str_open_config_editor)
-        self.HOTKEY_TOGGLE_INSTRUCTION_PANEL = self._parse_hotkey_string(self.str_toggle_instruction_panel)
-        self.HOTKEY_TOGGLE_HOTKEYS_ENABLED = self._parse_hotkey_string(self.str_toggle_hotkeys_enabled)
-        self.HOTKEY_PREVIEW_ZOOM_IN = self._parse_hotkey_string(self.str_preview_zoom_in)
-        self.HOTKEY_PREVIEW_ZOOM_OUT = self._parse_hotkey_string(self.str_preview_zoom_out)
-        self.HOTKEY_DIALOG_CONFIRM = self._parse_hotkey_string(self.str_dialog_confirm)
-        self.HOTKEY_DIALOG_CANCEL = self._parse_hotkey_string(self.str_dialog_cancel)
+        for section, items in self.CONFIG_SCHEMA.items():
+            for key, _ in items.items():
+                raw_str = self.get_raw_string(section, key)
+                val = self.parse_string_to_value(section, key, raw_str)
+                attr_name = f"HOTKEY_{key.upper()}" if section == 'Hotkeys' else key.upper()
+                setattr(self, attr_name, val)
 
-    @staticmethod
-    def get_default_config_string():
-        """返回包含所有默认设置的配置字符串"""
-        return """
-[Behavior]
-enable_free_scroll_matching = true
-scroll_method = move_user_cursor
-capture_with_cursor = false
-reuse_invisible_cursor = false
-forward_action = capture_scroll
-backward_action = scroll_delete
+    def parse_string_to_value(self, section: str, key: str, raw_string: str):
+        if section == 'ApplicationScrollUnits':
+            parts = [p.strip() for p in raw_string.split(',')]
+            try:
+                unit = int(float(parts[0]))
+                enabled = parts[1].lower() == 'true' if len(parts) > 1 else True
+                return (unit, enabled)
+            except (ValueError, IndexError):
+                return (0, False)
+        if section not in self.CONFIG_SCHEMA or key not in self.CONFIG_SCHEMA[section]:
+            return None
+        type_str = self.CONFIG_SCHEMA[section][key][0]
+        try:
+            if type_str == 'bool':
+                return raw_string.strip().lower() == 'true'
+            elif type_str == 'int':
+                return int(float(raw_string.strip()))
+            elif type_str == 'float':
+                return float(raw_string.strip())
+            elif type_str == 'color':
+                return tuple(float(c.strip()) for c in raw_string.split(','))
+            elif type_str == 'path':
+                val = raw_string.strip()
+                if not val: return None
+                if '{pid}' in val:
+                    val = val.replace('{pid}', str(os.getpid()))
+                return Path(val).expanduser()
+            elif type_str == 'hotkey':
+                return HotkeyDefinition.from_string(raw_string)
+            elif type_str == 'css':
+                return raw_string.strip()
+            else:
+                return raw_string
+        except Exception as e:
+            logging.warning(f"配置解析失败 [{section}] {key}='{raw_string}': {e}，将使用默认值")
+            default_str = self.CONFIG_SCHEMA[section][key][1]
+            if raw_string != default_str:
+                return self.parse_string_to_value(section, key, default_str)
+            return None
 
-[Interface.Components]
-enable_buttons = true
-enable_grid_action_buttons = true
-enable_auto_scroll_buttons = true
-enable_side_panel = true
-show_preview_on_start = true
-show_capture_count = true
-show_total_dimensions = true
-show_current_mode = true
-show_instruction_panel_on_start = true
+    def is_restart_required(self, key: str) -> bool:
+        restart_keys = {'log_file', 'temp_directory'}
+        if IS_WAYLAND:
+            restart_keys.add('capture_with_cursor')
+        return key in restart_keys
 
-[Interface.Layout]
-border_width = 4
-handle_height = 10
-button_panel_width = 100
-side_panel_width = 150
-button_spacing = 5
-processing_dialog_width = 200
-processing_dialog_height = 90
-processing_dialog_spacing = 15
-processing_dialog_border_width = 20
+    def get_section_items(self, section: str):
+        if self.parser.has_section(section):
+            return self.parser.items(section)
+        return []
 
-[Interface.Theme]
-border_color = 0.73, 0.25, 0.25, 1.00
-matching_indicator_color = 0.60, 0.76, 0.95, 1.00
-processing_dialog_css = 
-    .processing-dialog-bg { background-color: rgba(20, 20, 30, 0.85); border-radius: 8px; color: white; font-size: 26px; }
-info_panel_css = 
-    .info-panel, .info-panel:backdrop { background-color: rgba(43, 42, 51, 0.8); border: 1px solid #505070; border-radius: 8px; padding: 5px; color: #e0e0e0; }
-    .info-panel label, .info-panel label:backdrop { font-weight: bold; color: #e0e0e0; }
-    .info-panel #label_dimensions, .info-panel #label_dimensions:backdrop { font-size: 26px; color: #948bc1; }
-    .info-panel #label_count, .info-panel #label_count:backdrop { font-size: 24px; opacity: 0.9; color: #e0e0e0; }
-    .info-panel #label_mode, .info-panel #label_mode:backdrop { font-size: 23px; opacity: 0.9; color: #e0e0e0; }
-instruction_panel_css = 
-    .instruction-panel { background-color: rgba(30, 30, 30, 0.85); border: 1px solid #555; border-radius: 6px; padding: 10px; color: #f0f0f0; font-size: 18px; }
-	.instruction-panel label { margin-bottom: 2px; }
-	.key-label { font-weight: bold; color: #8be9fd; margin-right: 10px; }
-	.desc-label { color: #f8f8f2; }
-notification_css = 
-    .notification-panel { background-color: rgba(40, 40, 45, 0.98); border: 1px solid rgba(255,255,255,0.2); border-radius: 12px; padding: 24px; color: white; }
-	.notification-critical .notif-title { color: #ff5555; border-bottom-color: rgba(255, 85, 85, 0.5); }
-	.notification-warning .notif-title { color: #ec9028; border-bottom-color: rgba(236, 144, 40, 0.5); }
-    .notification-success .notif-title { color: #78c93f; border-bottom-color: rgba(120, 201, 63, 0.5); }
-	.notif-title { font-weight: bold; font-size: 26px; color: #f5f5f5; border-bottom: 1px solid rgba(255,255,255,0.5); padding-bottom: 8px; }
-	.notif-msg { font-size: 20px; color: #f8f8f2; }
-	.notif-btn { padding: 6px 20px; font-size: 22px; margin-left: 4px; margin-right: 4px; border-radius: 6px; font-weight: bold; min-width: 80px; }
-dialog_css = 
-    .embedded-dialog { background-color: rgba(35, 35, 40, 0.95); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 16px; color: #ffffff; padding: 30px; }
-	.dialog-title { font-size: 28px; font-weight: bold; color: #f5f5f5; }
-	.dialog-message { font-size: 24px; margin-bottom: 10px; color: #e0e0e0; }
-	.dialog-btn { border-radius: 8px; border-width: 1px; border-style: solid; padding: 10px 30px; margin: 0 10px; }
-mask_css = 
-    .mask-layer { background-color: rgba(0, 0, 0, 0.6); }
-simulated_window_css = 
-    .simulated-window, .simulated-window:backdrop { background-color: #fdfdfd; color: #2e3436; border: 1px solid #b0b0b0; border-radius: 8px; box-shadow: 0 3px 10px rgba(0,0,0,0.2); }
-	.window-header, .window-header:backdrop { background-color: #f2f2f2; border-bottom: 1px solid #dcdcdc; border-radius: 8px 8px 0 0; padding: 6px 10px; }
-	.window-title, .window-title:backdrop { font-size: 28px; font-weight: bold; color: #333333; text-shadow: none; }
+    def get_raw_string(self, section: str, key: str) -> str:
+        if self.parser.has_option(section, key):
+            return self.parser.get(section, key)
+        return self.get_default_string(section, key)
 
-[Interface.Strings]
-dialog_quit_title = 确认放弃截图？
-dialog_quit_message = 您已经截取了 {count} 张图片。确定要放弃它们吗？
-dialog_quit_button_yes = 是 ({key})
-dialog_quit_button_no = 否 ({key})
-processing_dialog_text = 正在处理…
-capture_count_format = 截图: {count}
+    def get_default_string(self, section: str, key: str) -> str:
+        if section in self.CONFIG_SCHEMA and key in self.CONFIG_SCHEMA[section]:
+            return self.CONFIG_SCHEMA[section][key][1]
+        return ""
 
-[Output]
-save_directory =
-save_format = PNG
-jpeg_quality = 95
-filename_template = 长截图 {timestamp}
-filename_timestamp_format = %Y-%m-%d %H-%M-%S
+    def get_default_css_color(self, css_key: str, color_name: str, fallback: str = "#000000") -> str:
+        css_str = self.DEFAULT_CSS.get(css_key, "")
+        if css_str:
+            match = re.search(fr'@define-color\s+{re.escape(color_name)}\s+([^;]+);', css_str)
+            if match:
+                return match.group(1).strip()
+        return fallback
 
-[System]
-copy_to_clipboard_on_finish = true
-notification_click_action = open_file
-large_image_opener = default_browser
-sound_theme = freedesktop
-capture_sound = screen-capture
-undo_sound = bell
-finalize_sound = complete
-log_file = ~/.scroll_stitch.log
-temp_directory_base = /tmp/scroll_stitch_{pid}
+    def remove_value(self, section: str, key: str):
+        if self.parser.has_option(section, key):
+            self.parser.remove_option(section, key)
+            self._schedule_save()
+            self.emit('setting-changed', section, key, None)
 
-[Performance]
-grid_matching_max_overlap = 20
-free_scroll_matching_max_overlap = 200
-auto_scroll_ticks_per_step = 2
-max_scroll_per_tick = 230
-min_scroll_per_tick = 30
-max_viewer_dimension = 32767
-preview_drag_sensitivity = 2.0
+    def set_value(self, section: str, key: str, value):
+        str_value = str(value)
+        if not self.parser.has_section(section):
+            self.parser.add_section(section)
+        try:
+            current_str = self.parser.get(section, key, fallback=None)
+            if current_str == str_value:
+                return
+        except:
+            pass
+        self.parser.set(section, key, str_value)
+        parsed_val = self.parse_string_to_value(section, key, str_value)
+        attr_name = f"HOTKEY_{key.upper()}" if section == 'Hotkeys' else key.upper()
+        if hasattr(self, attr_name) and not self.is_restart_required(key):
+            setattr(self, attr_name, parsed_val)
+        self._schedule_save()
+        self.emit('setting-changed', section, key, str_value)
+        logging.debug(f"配置已更新: [{section}] {key} = {str_value}")
 
-[Hotkeys]
-capture = space
-finalize = enter
-undo = backspace
-cancel = esc
-grid_backward = b
-grid_forward = f
-auto_scroll_start = s
-auto_scroll_stop = e
-configure_scroll_unit = c
-toggle_grid_mode = <shift>
-open_config_editor = g
-toggle_preview = w
-toggle_instruction_panel = f1
-toggle_hotkeys_enabled = f4
-preview_zoom_in = <ctrl>+equal
-preview_zoom_out = <ctrl>+minus
-dialog_confirm = space
-dialog_cancel = esc
+    def _perform_save_to_disk(self):
+        try:
+            with open(self.config_path, 'w', encoding='utf-8') as configfile:
+                self.parser.write(configfile)
+        except Exception as e:
+            logging.error(f"保存配置文件失败: {e}")
+        self._save_timer_id = None
+        return False
 
-[ApplicationScrollUnits]
-        """.strip()
+    def flush_save(self):
+        if self._save_timer_id:
+            GLib.source_remove(self._save_timer_id)
+            self._perform_save_to_disk()
+
+    def _schedule_save(self):
+        if self._save_timer_id:
+            GLib.source_remove(self._save_timer_id)
+        self._save_timer_id = GLib.timeout_add(1000, self._perform_save_to_disk)
 
     def _create_default_config(self):
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_parser = configparser.ConfigParser(interpolation=None)
+        for section, items in self.CONFIG_SCHEMA.items():
+            temp_parser.add_section(section)
+            for key, (type_str, default_val) in items.items():
+                temp_parser.set(section, key, default_val)
         with open(self.config_path, 'w', encoding='utf-8') as f:
-            f.write(Config.get_default_config_string())
+            temp_parser.write(f)
         logging.info(f"已在 {self.config_path} 目录下创建默认配置文件")
 
-    def get_scroll_unit(self, app_class: str):
-        """从配置中获取指定应用程序的滚动单位和模板匹配设置"""
-        if self.parser.has_section('ApplicationScrollUnits'):
-            value_str = self.parser.get('ApplicationScrollUnits', app_class, fallback='0,false')
-            parts = [p.strip() for p in value_str.split(',')]
-            try:
-                unit = int(parts[0])
-                enabled = parts[1].lower() == 'true' if len(parts) > 1 else False
-                return unit, enabled
-            except (ValueError, IndexError):
-                return 0, False
-        return 0, False
-
-    def save_scroll_unit(self, app_class: str, unit_value: int, matching_enabled: bool):
-        # unit_value: 缓冲区px
-        value_to_save = f"{unit_value},{str(matching_enabled).lower()}"
-        return self.save_setting('ApplicationScrollUnits', app_class, value_to_save)
-
-    def save_setting(self, section: str, key: str, value: str):
-        try:
-            if not self.parser.has_section(section):
-                self.parser.add_section(section)
-            self.parser.set(section, key, str(value))
-            with open(self.config_path, 'w', encoding='utf-8') as configfile:
-                self.parser.write(configfile)
-            logging.debug(f"成功将配置 '{key} = {value}' 写入 [{section}]")
-            return True
-        except Exception as e:
-            logging.error(f"写入配置文件失败: {e}")
-            return False
+class CoordSys(str, Enum):
+    GLOBAL = "global"
+    WINDOW = "window"
+    MONITOR = "monitor"
 
 class InvisibleCursorScroller:
-    def __init__(self, min_x, min_y, max_x, max_y, park_x, park_y, config: Config):
-        self.config = config
+    def __init__(self, min_x, min_y, max_x, max_y, park_x, park_y, config_obj: Config):
+        self.config = config_obj
         # 缓冲区px全局坐标
-        self.min_x = min_x
-        self.min_y = min_y
-        self.max_x = max_x
-        self.max_y = max_y
-        self.park_x = park_x
-        self.park_y = park_y
+        self.bounds = (min_x, min_y, max_x, max_y)
+        self.park_pos = (park_x, park_y)
         self.master_id = None
-        self.ui_mouse = None
         self.unique_name = "scroll-stitch-cursor"
+        self.ui_mouse = None
+        self.virtual_mouse_name = f"VirtualMouse-{self.unique_name}"
         self.is_ready = False
 
-    def _device_exists(self, device_name):
-        """检查具有给定名称的 xinput 设备是否存在"""
-        try:
-            output = subprocess.check_output(['xinput', 'list', '--name-only']).decode()
-            return device_name in output.splitlines()
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return False
-
     def _get_all_master_ids(self, master_name):
-        """获取所有具有指定名称的主指针设备的ID列表"""
         ids = []
         try:
             output = subprocess.check_output(['xinput', 'list']).decode()
-            pattern = fr'{re.escape(master_name)} pointer\s+id=(\d+)'
-            matches = re.findall(pattern, output)
+            pattern = re.compile(fr'{re.escape(master_name)} pointer\s+id=(\d+)')
+            matches = pattern.findall(output)
             ids = [int(match) for match in matches]
             logging.debug(f"找到 {len(ids)} 个名为 '{master_name}' 的主指针设备: {ids}")
         except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
             logging.error(f"查找主设备 ID 时出错: {e}")
         return ids
+
+    def _remove_master_device(self, master_id):
+        if master_id is None:
+            return
+        try:
+            result = subprocess.run(
+                ['xinput', 'remove-master', str(master_id)],
+                check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=1
+            )
+            if result.returncode == 0:
+                logging.debug(f"成功移除主设备 ID: {master_id}")
+            else:
+                logging.warning(f"尝试移除主设备 ID {master_id} 未成功: {result.stderr.strip()}")
+        except subprocess.TimeoutExpired:
+            logging.warning(f"移除主设备 ID {master_id} 超时")
+        except Exception as e:
+            logging.warning(f"尝试移除主设备 ID {master_id} 时发生异常: {e}")
 
     def _wait_for_device(self, device_name, timeout=3):
         """轮询 'xinput list' 直到找到指定的设备或超时"""
@@ -520,182 +655,132 @@ class InvisibleCursorScroller:
                 output = subprocess.check_output(['xinput', 'list']).decode()
                 if device_name in output:
                     logging.debug(f"设备 '{device_name}' 已被 X Server 识别")
-                    return True
+                    return
             except subprocess.CalledProcessError:
                 pass
             time.sleep(0.1)
-        logging.error(f"等待设备 '{device_name}' 超时（{timeout}秒）")
-        return False
-
-    def setup(self):
-        try:
-            master_pointer_name = f"{self.unique_name} pointer"
-            mouse_dev_name = f"VirtualMouse-{self.unique_name}"
-            existing_master_ids = self._get_all_master_ids(self.unique_name)
-            master_id_to_use = None
-            if not self.config.REUSE_INVISIBLE_CURSOR:
-                if existing_master_ids:
-                    logging.info("隐形光标设备配置为不复用，正在尝试清理所有检测到的旧主设备...")
-                    for old_id in existing_master_ids:
-                        try:
-                            result = subprocess.run(
-                                ['xinput', 'remove-master', str(old_id)],
-                                check=False, capture_output=True, text=True, timeout=1
-                            )
-                            if result.returncode == 0:
-                                logging.debug(f"成功移除旧主设备 ID: {old_id}")
-                            else:
-                                logging.warning(f"尝试移除旧主设备 ID {old_id} 未成功 (可能已被移除或权限问题). stderr: {result.stderr.strip()}")
-                        except subprocess.TimeoutExpired:
-                            logging.warning(f"移除旧主设备 ID {old_id} 超时")
-                        except Exception as e_remove:
-                            logging.warning(f"尝试移除旧主设备 ID {old_id} 时发生异常: {e_remove}")
-                    existing_master_ids = []
-                else:
-                    logging.info("隐形光标设备配置为不复用，且未检测到旧主设备")
-            else:
-                if len(existing_master_ids) == 0:
-                    logging.info("配置为复用，但未找到现有设备，将创建新设备")
-                elif len(existing_master_ids) == 1:
-                    master_id_to_use = existing_master_ids[0]
-                    logging.info(f"配置为复用，找到唯一现有设备 ID: {master_id_to_use}，将复用")
-                else:
-                    logging.warning(f"配置为复用，但检测到多个 ({len(existing_master_ids)}) 同名主设备: {existing_master_ids}。将尝试复用第一个 ID: {existing_master_ids[0]}")
-                    master_id_to_use = existing_master_ids[0]
-            if master_id_to_use is None:
-                logging.info(f"创建新的主指针设备 '{self.unique_name}'")
-                ids_before = self._get_all_master_ids(self.unique_name)
-                subprocess.check_call(['xinput', 'create-master', self.unique_name])
-                time.sleep(0.2)
-                new_master_id = None
-                output_after = ""
-                for _ in range(10):
-                    ids_after = self._get_all_master_ids(self.unique_name)
-                    diff_ids = list(set(ids_after) - set(ids_before))
-                    if len(diff_ids) == 1:
-                        new_master_id = diff_ids[0]
-                        logging.debug(f"成功识别新创建的主设备 ID: {new_master_id}")
-                        break
-                    elif len(diff_ids) > 1:
-                         logging.warning(f"检测到多个新设备 ID: {diff_ids}，将使用第一个: {diff_ids[0]}")
-                         new_master_id = diff_ids[0]
-                         break
-                    time.sleep(0.1)
-                else:
-                    ids_now = self._get_all_master_ids(self.unique_name)
-                    if len(ids_now) == len(ids_before) + 1:
-                        new_master_id = max(ids_now) if ids_now else None
-                    else:
-                        raise RuntimeError(f"创建主设备后无法可靠地识别其 ID。创建前: {ids_before}, 当前: {ids_now}")
-                self.master_id = new_master_id
-                self._create_virtual_devices()
-                if not self._wait_for_device(mouse_dev_name):
-                    logging.error("虚拟设备未能及时被 X Server 识别。尝试清理...")
-                    try:
-                        subprocess.run(['xinput', 'remove-master', str(self.master_id)], check=False)
-                    except Exception as e_cleanup:
-                        logging.warning(f"清理失败的主设备 {self.master_id} 时出错: {e_cleanup}")
-                logging.debug(f"将新虚拟设备附加到主设备 ID {self.master_id}")
-                subprocess.check_call(['xinput', 'reattach', mouse_dev_name, str(self.master_id)])
-            else:
-                self.master_id = master_id_to_use
-                try:
-                    self._create_virtual_devices()
-                    logging.debug(f"尝试重新打开 UInput 句柄以复用设备 (Master ID: {self.master_id})")
-                    subprocess.check_call(['xinput', 'reattach', mouse_dev_name, str(self.master_id)])
-                    logging.debug(f"已重新附加虚拟设备到 Master ID: {self.master_id}")
-                except Exception as e_reopen:
-                    logging.warning(f"复用设备 (Master ID: {self.master_id}) 时重新打开 UInput 或重新附加失败: {e_reopen}。滚动功能可能无效")
-                    GLib.idle_add(
-                        send_desktop_notification,
-                        "隐形光标复用失败",
-                        "无法重新连接虚拟设备，滚动功能可能无效",
-                        "dialog-warning", "warning"
-                    )
-            self.park()
-            logging.debug(f"隐形光标设置完成 (Master ID: {self.master_id})")
-            self.is_ready = True
-            return self
-        except Exception as e:
-            logging.error(f"创建/设置隐形光标失败: {e}")
-            self.cleanup()
-            self.is_ready = False
-            GLib.idle_add(
-                send_desktop_notification,
-                "隐形光标初始化失败",
-                f"无法创建虚拟设备: {e}",
-                "dialog-error", "warning"
-            )
-            return self
-
-    def park(self):
-        self.move(self.park_x, self.park_y)
-        logging.debug(f"隐形光标已停放至全局坐标 ({self.park_x}, {self.park_y})处")
+        raise TimeoutError(f"等待虚拟设备 '{device_name}' 超时（{timeout}秒）")
 
     def _create_virtual_devices(self):
-        # 虚拟鼠标 (用于移动光标)
+        min_x, min_y, max_x, max_y = self.bounds
         mouse_caps = {
             e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT],
             e.EV_REL: [e.REL_WHEEL],
             e.EV_ABS: [
-                (e.ABS_X, AbsInfo(value=self.min_x, min=self.min_x, max=self.max_x, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_Y, AbsInfo(value=self.min_y, min=self.min_y, max=self.max_y, fuzz=0, flat=0, resolution=0)),
+                (e.ABS_X, AbsInfo(value=min_x, min=min_x, max=max_x, fuzz=0, flat=0, resolution=0)),
+                (e.ABS_Y, AbsInfo(value=min_y, min=min_y, max=max_y, fuzz=0, flat=0, resolution=0)),
             ],
         }
-        self.ui_mouse = UInput(mouse_caps, name=f'VirtualMouse-{self.unique_name}')
+        self.ui_mouse = UInput(mouse_caps, name=self.virtual_mouse_name)
+
+    def setup(self):
+        try:
+            existing_master_ids = self._get_all_master_ids(self.unique_name)
+            master_id_to_use = None
+            if not self.config.REUSE_INVISIBLE_CURSOR:
+                if existing_master_ids:
+                    logging.info("隐形光标设备配置为不复用，尝试清理所有检测到的旧主设备...")
+                    for old_id in existing_master_ids:
+                        self._remove_master_device(old_id)
+                    existing_master_ids = []
+            else:
+                if not existing_master_ids:
+                    logging.info("配置为复用，但未找到现有设备，将创建新设备")
+                else:
+                    master_id_to_use = existing_master_ids[0]
+                    if len(existing_master_ids) > 1:
+                        logging.warning(f"配置为复用，但检测到多个同名主设备: {existing_master_ids}。将复用第一个 ID: {existing_master_ids[0]}")
+            if master_id_to_use is None:
+                logging.info(f"创建新的主指针设备 '{self.unique_name}'")
+                ids_before = self._get_all_master_ids(self.unique_name)
+                subprocess.check_call(['xinput', 'create-master', self.unique_name])
+                time.sleep(0.1)
+                new_master_id = None
+                for _ in range(10):
+                    ids_after = self._get_all_master_ids(self.unique_name)
+                    diff_ids = list(set(ids_after) - set(ids_before))
+                    if diff_ids:
+                        new_master_id = diff_ids[0]
+                        if len(diff_ids) > 1:
+                            logging.warning(f"检测到多个新设备 ID: {diff_ids}，将使用第一个: {new_master_id}")
+                        else:
+                            logging.debug(f"成功识别新创建的主设备 ID: {new_master_id}")
+                        break
+                    time.sleep(0.1)
+                else:
+                    ids_now = self._get_all_master_ids(self.unique_name)
+                    raise RuntimeError(f"创建主设备后无法识别其 ID。创建前: {ids_before}, 当前: {ids_now}")
+                self.master_id = new_master_id
+                self._create_virtual_devices()
+                self._wait_for_device(self.virtual_mouse_name)
+                logging.debug(f"将新虚拟设备附加到主设备 ID {self.master_id}")
+                subprocess.check_call(['xinput', 'reattach', self.virtual_mouse_name, str(self.master_id)])
+            else:
+                self.master_id = master_id_to_use
+                try:
+                    self._create_virtual_devices()
+                    subprocess.check_call(['xinput', 'reattach', self.virtual_mouse_name, str(self.master_id)])
+                    logging.debug(f"已重新附加虚拟设备到 Master ID: {self.master_id}")
+                except Exception as e_reopen:
+                    logging.warning(f"复用设备 (Master ID: {self.master_id}) 时失败: {e_reopen}。滚动功能可能无效")
+                    GLib.idle_add(send_notification, "隐形光标复用失败", "无法重新连接虚拟设备，滚动功能可能无效", "warning", config.WARNING_SOUND)
+            self.park()
+            logging.debug(f"隐形光标设置完成")
+            self.is_ready = True
+        except Exception as e:
+            logging.error(f"创建/设置隐形光标失败: {e}")
+            self.cleanup()
+            GLib.idle_add(send_notification, "隐形光标初始化失败", f"无法创建虚拟设备: {e}", "warning", config.WARNING_SOUND)
 
     def move(self, x, y):
         # x, y: 缓冲区px全局坐标
-        self.ui_mouse.write(e.EV_ABS, e.ABS_X, x)
-        self.ui_mouse.write(e.EV_ABS, e.ABS_Y, y)
+        self.ui_mouse.write(e.EV_ABS, e.ABS_X, int(x))
+        self.ui_mouse.write(e.EV_ABS, e.ABS_Y, int(y))
         self.ui_mouse.syn()
 
-    def discrete_scroll(self, num_clicks):
-        """模拟鼠标滚轮进行离散滚动"""
+    def park(self):
+        self.move(*self.park_pos)
+        logging.debug(f"隐形光标已停放至全局坐标 {self.park_pos} 处")
+
+    def scroll_discrete(self, num_clicks):
         if num_clicks == 0:
             return
-        value = -1 if num_clicks < 0 else 1
+        value = -1 if num_clicks > 0 else 1
         for _ in range(abs(num_clicks)):
             self.ui_mouse.write(e.EV_REL, e.REL_WHEEL, value)
             self.ui_mouse.syn()
             time.sleep(0.01)
 
     def cleanup(self):
-        if not self.config.REUSE_INVISIBLE_CURSOR:
-            logging.info("清理隐形光标资源")
-            if self.ui_mouse:
-                self.ui_mouse.close()
-                self.ui_mouse = None
-            if self.master_id is not None:
-                try:
-                     command = ['xinput', 'remove-master', str(self.master_id)]
-                     subprocess.check_call(command)
-                     logging.debug(f"已移除隐形光标 (Master ID: {self.master_id})")
-                except Exception as e:
-                     logging.warning(f"清理隐形光标主设备时出错: {e}")
+        logging.info("清理隐形光标资源")
+        if self.master_id is not None:
+            self._remove_master_device(self.master_id)
             self.master_id = None
-        else:
-            logging.info("跳过隐形光标资源清理（启用复用）")
-            if self.is_ready:
-                self.park()
+        if self.ui_mouse:
+            self.ui_mouse.close()
+            self.ui_mouse = None
+        self.is_ready = False
 
 class EvdevWheelScroller:
-    """一个虚拟鼠标，用于触发滚轮事件"""
+    """虚拟鼠标，用于触发滚轮事件"""
     def __init__(self):
         self.REL_WHEEL_HI_RES = getattr(e, 'REL_WHEEL_HI_RES', 0x08)
         capabilities = {
             e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT],
             e.EV_REL: [e.REL_WHEEL, self.REL_WHEEL_HI_RES],
         }
-        # UInput 的初始化
-        self.ui_device = UInput(capabilities, name='scroll_stitch-wheel-mouse', version=0x1)
+        self.ui_device = UInput(capabilities, name='scroll-stitch-wheel-mouse', version=0x1)
         logging.debug("EvdevWheelScroller 初始化成功，虚拟滚轮鼠标已创建")
+        def _trigger_refresh():
+            global hotkey_manager
+            if hotkey_manager and hotkey_manager.listener and hasattr(hotkey_manager.listener, 'refresh_devices'):
+                hotkey_manager.listener.refresh_devices()
+        threading.Timer(0.5, _trigger_refresh).start()
 
     def scroll_discrete(self, num_clicks):
-        """模拟鼠标滚轮进行离散滚动"""
         if num_clicks == 0:
             return
-        value = -1 if num_clicks < 0 else 1
+        value = -1 if num_clicks > 0 else 1
         hi_res_value = value * 120
         for _ in range(abs(num_clicks)):
             self.ui_device.write(e.EV_REL, e.REL_WHEEL, value)
@@ -711,23 +796,19 @@ class EvdevWheelScroller:
 class EvdevAbsoluteMouse:
     """在 Wayland 下使用绝对定位设备来移动鼠标"""
     def __init__(self, min_x, min_y, max_x, max_y):
-        # 缓冲区px全局坐标
-        self.min_x = min_x
-        self.min_y = min_y
-        self.max_x = max_x
-        self.max_y = max_y
+        # min_x, min_y, max_x, max_y: 缓冲区px全局坐标
         caps = {
             e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
             e.EV_ABS: [
-                (e.ABS_X, AbsInfo(value=self.min_x, min=self.min_x, max=self.max_x, fuzz=0, flat=0, resolution=0)),
-                (e.ABS_Y, AbsInfo(value=self.min_y, min=self.min_y, max=self.max_y, fuzz=0, flat=0, resolution=0)),
+                (e.ABS_X, AbsInfo(value=min_x, min=min_x, max=max_x, fuzz=0, flat=0, resolution=0)),
+                (e.ABS_Y, AbsInfo(value=min_y, min=min_y, max=max_y, fuzz=0, flat=0, resolution=0)),
             ]
         }
         self.device = UInput(caps, name='scroll-stitch-mover', version=0x1)
         logging.debug(f"EvdevAbsoluteMouse 已创建: 全局坐标范围 ({min_x},{min_y}) -> ({max_x},{max_y})")
 
     def move(self, x, y):
-        # x,y: 缓冲区px全局坐标
+        # x, y: 缓冲区px全局坐标
         self.device.write(e.EV_ABS, e.ABS_X, int(x))
         self.device.write(e.EV_ABS, e.ABS_Y, int(y))
         self.device.syn()
@@ -736,43 +817,289 @@ class EvdevAbsoluteMouse:
         if self.device:
             self.device.close()
 
-def play_sound(sound_name: str, theme_name: str = None):
-    if not sound_name:
-        return
-    effective_theme = theme_name if theme_name is not None else config.SOUND_THEME
-    if not effective_theme:
-        logging.warning("播放声音失败：未指定有效的主题")
-        return
-    base_path = Path(f"/usr/share/sounds/{effective_theme}/stereo/")
-    if not base_path.is_dir():
-        logging.warning(f"声音主题目录不存在: {base_path}")
-        return
-    sound_file_path = None
-    for ext in ['.oga', '.wav', '.ogg']:
-        path_to_check = base_path / f"{sound_name}{ext}"
-        if path_to_check.is_file():
-            sound_file_path = str(path_to_check)
-            break
-    if not sound_file_path:
-        logging.warning(f"在主题 '{effective_theme}' 中未找到声音文件: {sound_name}")
-        return
-    try:
-        subprocess.Popen(["paplay", sound_file_path])
-        logging.debug(f"正在播放声音: {sound_file_path}")
-    except FileNotFoundError:
-        logging.warning(f"播放命令 'paplay' 未找到，请确保已安装")
+class StreamToLogger:
+    def __init__(self, logger, level):
+        self.logger = logger
+        self.level = level
+        self.linebuf = ''
 
-class EmbeddedNotificationPanel(Gtk.EventBox):
-    def __init__(self, overlay, title, message, level="normal", action_path=None, width=0, height=0):
+    def write(self, buf):
+        self.linebuf += buf
+        while '\n' in self.linebuf:
+            line, self.linebuf = self.linebuf.split('\n', 1)
+            if line.rstrip():
+                self.logger.log(self.level, line.rstrip())
+
+    def flush(self):
+        if self.linebuf.rstrip():
+            self.logger.log(self.level, self.linebuf.rstrip())
+        self.linebuf = ''
+
+class SystemInteraction:
+    _sound_themes = None
+    MARKER_FILENAME = ".scroll_stitch_owned"
+
+    @classmethod
+    def ensure_temp_directory(cls, target_dir: Path):
+        if target_dir.exists():
+            return
+        highest_new_dir = target_dir
+        for parent in target_dir.parents:
+            if parent.exists():
+                break
+            highest_new_dir = parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            marker_path = highest_new_dir / cls.MARKER_FILENAME
+            marker_path.touch()
+            logging.debug(f"已在顶层新建目录 {highest_new_dir} 放置安全删除标记")
+        except Exception as e:
+            logging.error(f"创建安全删除标记文件失败: {e}")
+
+    @classmethod
+    def get_sound_themes(cls):
+        if cls._sound_themes is not None:
+            return cls._sound_themes
+        sound_base_path = Path("/usr/share/sounds")
+        themes = {}
+        if not sound_base_path.is_dir():
+            logging.warning(f"声音目录 {sound_base_path} 不存在，无法扫描主题")
+            return themes
+        for theme_path in sound_base_path.iterdir():
+            stereo_path = theme_path / "stereo"
+            if theme_path.is_dir() and stereo_path.is_dir():
+                theme_name = theme_path.name
+                sounds = {}
+                for sound_file in stereo_path.iterdir():
+                    if sound_file.is_file() and sound_file.suffix in ['.oga', '.wav', '.ogg']:
+                        if sound_file.stem not in sounds:
+                            sounds[sound_file.stem] = str(sound_file)
+                if sounds:
+                    themes[theme_name] = dict(sorted(sounds.items()))
+        logging.debug(f"发现 {len(themes)} 个声音主题")
+        cls._sound_themes = themes
+        return themes
+
+    @classmethod
+    def play_sound(cls, sound_name: str, theme_name: str = None):
+        if not sound_name:
+            return
+        effective_theme = theme_name if theme_name is not None else config.SOUND_THEME
+        if not effective_theme:
+            logging.warning("播放声音失败：未指定有效的主题")
+            return
+        themes = cls.get_sound_themes()
+        sounds_in_theme = themes.get(effective_theme, {})
+        sound_file_path = sounds_in_theme.get(sound_name)
+        if not sound_file_path:
+            logging.warning(f"在主题 '{effective_theme}' 中未找到声音文件: {sound_name}")
+            return
+        try:
+            subprocess.Popen(["paplay", sound_file_path])
+            logging.debug(f"正在播放声音: {sound_file_path}")
+        except FileNotFoundError:
+            logging.warning(f"播放命令 'paplay' 未找到，请确保已安装")
+
+    @classmethod
+    def copy_to_clipboard(cls, image_path: Path) -> tuple:
+        copy_start_time = time.perf_counter()
+        str_path = str(image_path)
+        def _copy_path_fallback(path_str, fallback_msg):
+            try:
+                clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+                clipboard.set_text(path_str, -1)
+                return True, fallback_msg
+            except Exception as e:
+                combined_error = f"{fallback_msg}，复制路径也失败了: {e}"
+                logging.error(combined_error)
+                return False, combined_error
+        try:
+            file_info, w, h = GdkPixbuf.Pixbuf.get_file_info(str_path)
+            if file_info:
+                raw_size = w * h * 4
+                SAFE_LIMIT = 500 * 1024 * 1024
+                if raw_size > SAFE_LIMIT:
+                    logging.warning(f"图片原始数据过大（{raw_size/1024/1024:.0f} MB），跳过位图复制")
+                    return _copy_path_fallback(str_path, "图片过大（>500MB），已改为复制路径")
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(str_path)
+            clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            clipboard.set_image(pixbuf)
+            copy_duration = time.perf_counter() - copy_start_time
+            logging.info(f"图片 {image_path} 已通过 GTK 复制到剪贴板，耗时: {copy_duration:.3f} 秒")
+            return True, "并已复制到剪贴板"
+        except Exception as e:
+            logging.error(f"复制到剪贴板发生异常: {e}")
+            return _copy_path_fallback(str_path, f"写入剪贴板出错，已改为复制路径 ({e})")
+
+    @classmethod
+    def cleanup_directory(cls, path: Path, known_files=None):
+        if path and path.exists():
+            current = path.resolve()
+            while current != current.parent:
+                if (current / cls.MARKER_FILENAME).is_file():
+                    try:
+                        shutil.rmtree(current)
+                        logging.debug(f"已清理带有安全删除标记的整个目录树: {current}")
+                    except OSError as e:
+                        logging.error(f"清理目录树 {current} 失败: {e}")
+                    break
+                current = current.parent
+            else:
+                logging.debug(f"目录 {path} 及其父目录均无安全删除标记，执行保守清理")
+                if known_files:
+                    count = 0
+                    for f in known_files:
+                        fp = Path(f)
+                        if fp.exists() and fp.is_file():
+                            try: fp.unlink(); count += 1
+                            except OSError: pass
+                    logging.debug(f"已删除 {count} 个已知文件")
+
+    @classmethod
+    def cleanup_temp_dirs(cls, config_obj, is_exiting=False, known_files=None):
+        try:
+            raw_template = config_obj.get_raw_string('System', 'temp_directory')
+            if '{pid}' not in raw_template:
+                if is_exiting:
+                    cls.cleanup_directory(config_obj.TEMP_DIRECTORY, known_files)
+                else:
+                    logging.debug("临时目录模板不包含 {pid}，跳过旧目录清理")
+                return
+            template_path = Path(raw_template).expanduser()
+            base_dir = Path(template_path.anchor)
+            pid_part = ""
+            for part in template_path.parts:
+                if '{pid}' in part:
+                    pid_part = part
+                    break
+                if part != template_path.anchor:
+                    base_dir = base_dir / part
+            if not base_dir.is_dir():
+                return
+            escaped_part = re.escape(pid_part)
+            pattern_str = "^" + escaped_part.replace(r'\{pid\}', r'(\d+)') + "$"
+            regex = re.compile(pattern_str)
+            current_pid = os.getpid()
+            for item in base_dir.iterdir():
+                if not item.is_dir(): continue
+                match = regex.match(item.name)
+                if not match: continue
+                try:
+                    pids = match.groups()
+                    if not all(p == pids[0] for p in pids):
+                        continue
+                    pid = int(pids[0])
+                except (ValueError, IndexError): continue
+                is_current_process = (pid == current_pid)
+                if is_current_process and not is_exiting:
+                    continue
+                if not is_current_process and Path(f"/proc/{pid}").exists():
+                    continue
+                cls.cleanup_directory(item, known_files if is_current_process else None)
+        except Exception as e:
+            logging.error(f"执行残留目录清理时发生未知错误: {e}")
+
+    @classmethod
+    def check_dependencies(cls):
+        optional_deps = {
+            'paplay': '用于播放音效',
+            'xdg-open': '用于打开文件或目录',
+        }
+        if not IS_WAYLAND:
+            optional_deps['xinput'] = '用于 X11 下“隐形光标”滚动模式'
+        missing_optional = []
+        for dep, purpose in optional_deps.items():
+            if not shutil.which(dep):
+                missing_optional.append(f"可选依赖 '{dep}' ({purpose}) 缺失")
+        if missing_optional:
+            logging.warning("检测到缺少可选依赖项，部分功能将无法使用或表现异常")
+            GLib.idle_add(
+                send_notification,
+                "功能受限警告",
+                f"检测到可选依赖缺失，部分功能将不可用\n请查看日志以获取详细信息",
+                "warning", config.WARNING_SOUND, 2
+            )
+            for item in missing_optional:
+                logging.warning(item)
+
+    @classmethod
+    def open_file(cls, path: Path, opener_command: str = "xdg-open"):
+        if not path or not path.exists(): return
+        try:
+            if opener_command == 'default_browser':
+                webbrowser.open(path.as_uri())
+            elif opener_command == 'xdg-open' or not opener_command:
+                subprocess.Popen(['xdg-open', str(path)])
+            else:
+                command_str = opener_command.replace('{filepath}', str(path))
+                subprocess.Popen(shlex.split(command_str))
+        except Exception as e:
+            logging.error(f"打开文件失败 (cmd={opener_command}): {e}")
+
+    @classmethod
+    def open_directory(cls, path: Path):
+        if not path: return
+        try:
+            target = path if path.is_dir() else path.parent
+            subprocess.Popen(['xdg-open', str(target)])
+        except Exception as e:
+            logging.error(f"打开目录失败: {e}")
+
+    @classmethod
+    def load_library(cls, names, fallback_name=None):
+        for name in names:
+            try:
+                return ctypes.CDLL(name)
+            except OSError:
+                continue
+        if fallback_name:
+            lib_path = find_library(fallback_name)
+            if lib_path:
+                try:
+                    return ctypes.CDLL(lib_path)
+                except OSError:
+                    pass
+        return None
+
+    @classmethod
+    def setup_logging(cls, config_obj):
+        logging.raiseExceptions = False
+        root_logger = logging.getLogger()
+        if root_logger.hasHandlers():
+            for handler in root_logger.handlers[:]:
+                root_logger.removeHandler(handler)
+        root_logger.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)-7s - %(message)s')
+        file_handler = logging.FileHandler(config_obj.LOG_FILE, mode='w', encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        log_queue = queue.Queue()
+        queue_handler = QueueHandler(log_queue)
+        root_logger.addHandler(queue_handler)
+        logging.getLogger('asyncio').setLevel(logging.WARNING)
+        stdout_logger = logging.getLogger('STDOUT')
+        sys.stdout = StreamToLogger(stdout_logger, logging.INFO)
+        stderr_logger = logging.getLogger('STDERR')
+        sys.stderr = StreamToLogger(stderr_logger, logging.ERROR)
+        logging.debug("标准输出和标准错误已被重定向到日志系统")
+        return log_queue
+
+class EmbeddedWidget(Gtk.EventBox):
+    """嵌入式组件基类"""
+    def __init__(self, css_class=None):
         super().__init__()
-        self.overlay = overlay
-        self.action_path = Path(action_path) if action_path else None
-        self.width = width
-        self.height = height
-        # 逻辑px {
-        self.set_size_request(520, -1)
         self.set_visible_window(True)
-        self.get_style_context().add_class("notification-panel")
+        if css_class:
+            self.get_style_context().add_class(css_class)
+
+class NotificationWidget(EmbeddedWidget):
+    def __init__(self, overlay, title, message, level="normal", action_config=None):
+        super().__init__(css_class="notification-panel")
+        self.overlay = overlay
+        self.action_config = action_config
+        self.action_path = Path(action_config['path']) if action_config and action_config.get('path') else None
+        # 逻辑px {
+        self.set_size_request(config.NOTIFICATION_WIDTH, -1)
         if level and level != "normal":
             self.get_style_context().add_class(f"notification-{level}")
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
@@ -787,7 +1114,7 @@ class EmbeddedNotificationPanel(Gtk.EventBox):
         lbl_msg.set_halign(Gtk.Align.CENTER)
         lbl_msg.set_justify(Gtk.Justification.CENTER)
         lbl_msg.set_line_wrap(True)
-        lbl_msg.set_max_width_chars(50)
+        lbl_msg.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
         lbl_msg.get_style_context().add_class("notif-msg")
         vbox.pack_start(lbl_msg, False, False, 0)
         hbox_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -815,84 +1142,117 @@ class EmbeddedNotificationPanel(Gtk.EventBox):
             self.btn_open_file.set_no_show_all(True)
             self.btn_open_file.hide()
         self.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK | Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
-        self.connect("enter-notify-event", self._on_enter)
-        self.connect("leave-notify-event", self._on_leave)
-        self.connect("button-press-event", self._on_button_press)
-        self.connect("button-release-event", self._on_button_release)
+        self.connect("realize", self._on_realize)
+        self.connect("button-press-event", lambda w, e: True)
+        self.connect("button-release-event", lambda w, e: True)
+        self.connect("destroy", self._on_destroy)
 
-    def _on_enter(self, widget, event):
-        if self.overlay and self.overlay.get_window():
-            self.overlay.get_window().set_cursor(self.overlay.cursors['default'])
-        return False
+    def do_get_preferred_width(self):
+        return config.NOTIFICATION_WIDTH, config.NOTIFICATION_WIDTH # 逻辑px
 
-    def _on_leave(self, widget, event):
-        if event.detail == Gdk.NotifyType.INFERIOR:
-            return False
-        if self.overlay and self.overlay.get_window():
-            target = self.overlay.cursors['crosshair'] if not self.overlay.is_selection_done else None
-            self.overlay.get_window().set_cursor(target)
-        return False
-
-    def _on_button_press(self, widget, event):
-        return True
-
-    def _on_button_release(self, widget, event):
-        return True
+    def _on_realize(self, widget):
+        if self.get_window() and self.overlay:
+            self.get_window().set_cursor(self.overlay.cursors['default'])
 
     def _on_open_file(self, widget):
         if not self.action_path: return
-        try:
-            is_large = False
-            if config.MAX_VIEWER_DIMENSION >= 0 and self.width > 0 and self.height > 0:
-                if max(self.width, self.height) > config.MAX_VIEWER_DIMENSION:
-                    is_large = True
-            opener = config.LARGE_IMAGE_OPENER
-            if is_large and opener == 'default_browser':
-                webbrowser.open(self.action_path.as_uri())
-            elif is_large and opener.strip():
-                command_str = opener.replace('{filepath}', str(self.action_path))
-                subprocess.Popen(shlex.split(command_str))
-            else:
-                subprocess.Popen(['xdg-open', str(self.action_path)])
-            self.close()
-        except Exception as e:
-            logging.error(f"打开文件失败: {e}")
+        opener_to_use = "xdg-open"
+        is_large = False
+        w = self.action_config.get('width', 0) if self.action_config else 0
+        h = self.action_config.get('height', 0) if self.action_config else 0
+        if config.MAX_VIEWER_DIMENSION >= 0 and w > 0 and h > 0:
+            if max(w, h) > config.MAX_VIEWER_DIMENSION:
+                is_large = True
+        if is_large:
+            opener_to_use = config.LARGE_IMAGE_OPENER
+        SystemInteraction.open_file(self.action_path, opener_command=opener_to_use)
+        self.close()
 
     def _on_open_dir(self, widget):
         if not self.action_path: return
-        try:
-            target = self.action_path if self.action_path.is_dir() else self.action_path.parent
-            subprocess.Popen(['xdg-open', str(target)])
-            self.close()
-        except Exception as e:
-            logging.error(f"打开目录失败: {e}")
+        SystemInteraction.open_directory(self.action_path)
+        self.close()
 
     def close(self):
-        self.overlay.dismiss_notification(self)
+        if self.overlay and self.overlay.overlay_manager:
+            self.overlay.overlay_manager.dismiss(self)
 
-def send_desktop_notification(title, message, sound_name=None, level="normal", timeout=None, action_config=None):
+    def _on_destroy(self, widget):
+        if self.action_config:
+            logging.info("通知关闭且处于完成状态，触发最终退出")
+            self.overlay.controller.perform_cleanup()
+
+def send_notification(title, message, level="normal", sound_name=None, timeout=None, action_config=None):
     try:
-        if sound_name:
-            play_sound(sound_name)
-        overlay = None
-        if action_config and action_config.get('controller') and hasattr(action_config['controller'], 'view'):
-            overlay = action_config['controller'].view
-        elif GLOBAL_OVERLAY:
-            overlay = GLOBAL_OVERLAY
-        if overlay:
-            overlay.show_embedded_notification(title, message, level, timeout, action_config)
+        if GLOBAL_OVERLAY:
+            alloc = GLOBAL_OVERLAY.get_allocation()
+            if not GLOBAL_OVERLAY.session.screen_rect or alloc.width <= 1:
+                logging.debug(f"窗口尚未布局，推迟显示通知: {title}")
+                GLib.timeout_add(500, send_notification, title, message, level, sound_name, timeout, action_config)
+                return
+            GLOBAL_OVERLAY.overlay_manager.dismiss_by_type(NotificationWidget)
+            if sound_name:
+                SystemInteraction.play_sound(sound_name)
+            widget = NotificationWidget(GLOBAL_OVERLAY, title, message, level, action_config)
+            if timeout is None:
+                default_timeouts = {"normal": 3, "warning": 8, "success": 8, "critical": 0}
+                timeout_sec = default_timeouts.get(level, 3)
+            else:
+                timeout_sec = timeout
+            GLOBAL_OVERLAY.overlay_manager.show(widget, anchor='top-center', layer=OverlayManager.LAYER_TOP, auto_dismiss=timeout_sec)
         else:
             logging.warning("无法找到主窗口覆盖层，通知仅记录日志: " + message)
     except Exception as e:
         logging.error(f"发送内嵌通知失败: {e}")
-        if action_config and action_config.get('controller'):
-            GLib.idle_add(action_config['controller']._perform_cleanup)
+        if action_config and GLOBAL_OVERLAY and GLOBAL_OVERLAY.controller:
+            GLib.idle_add(GLOBAL_OVERLAY.controller.perform_cleanup)
+
+class FrameGrabber(abc.ABC):
+    @property
+    @abc.abstractmethod
+    def target_coords(self) -> CoordSys:
+        pass
+
+    @abc.abstractmethod
+    def prepare(self):
+        pass
+
+    @abc.abstractmethod
+    def capture(self, x, y, w, h, filepath: Path, scale: float = 1.0, include_cursor: bool = False) -> bool:
+        pass
+
+    @abc.abstractmethod
+    def cleanup(self):
+        pass
+
+class XImageFuncs(Structure):
+    _fields_ = [
+        ("create_image", c_void_p),
+        ("destroy_image", c_void_p),
+        ("get_pixel", c_void_p),
+        ("put_pixel", c_void_p),
+        ("sub_image", c_void_p),
+        ("add_pixel", c_void_p),
+    ]
+
+# 缓冲区px {
+class XImage(Structure):
+    _fields_ = [
+        ("width", c_int), ("height", c_int), ("xoffset", c_int), ("format", c_int),
+        ("data", c_void_p), ("byte_order", c_int), ("bitmap_unit", c_int),
+        ("bitmap_bit_order", c_int), ("bitmap_pad", c_int), ("depth", c_int),
+        ("bytes_per_line", c_int), ("bits_per_pixel", c_int),
+        ("red_mask", c_ulong), ("green_mask", c_ulong), ("blue_mask", c_ulong),
+        ("obdata", c_void_p), ("f", XImageFuncs),
+    ]
+
+class XShmSegmentInfo(Structure):
+    _fields_ = [("shmseg", c_ulong), ("shmid", c_int), ("shmaddr", c_void_p), ("readOnly", c_int)]
 
 class XFixesCursorImage(Structure):
-    # 缓冲区px {
     _fields_ = [
         ('x', c_short), # 全局坐标
-        ('y', c_short), # 全局坐标
+        ('y', c_short),
         ('width', c_short),
         ('height', c_short),
         ('xhot', c_short),
@@ -903,118 +1263,216 @@ class XFixesCursorImage(Structure):
         ('name', c_char_p),
     ]
 
-class FrameGrabberBase(abc.ABC):
+IPC_PRIVATE = 0
+IPC_CREAT = 0o1000
+IPC_RMID = 0
+ZPixmap = 2
+ALL_PLANES = c_ulong(-1).value
+
+class X11FrameGrabber(FrameGrabber):
     def __init__(self):
-        self.global_offset_x = 0
-        self.global_offset_y = 0
+        super().__init__()
+        self.libx11 = SystemInteraction.load_library(['libX11.so.6', 'libX11.so'], 'X11')
+        self.libxext = SystemInteraction.load_library(['libXext.so.6', 'libXext.so'], 'Xext')
+        self.libxfixes = SystemInteraction.load_library(['libXfixes.so.3', 'libXfixes.so'], 'Xfixes')
+        self.libc = SystemInteraction.load_library(['libc.so.6', 'libc.so'], 'c')
+        self.dpy = None
+        self.shminfo = None
+        self.img = None
+        self.root_w = 0
+        self.root_h = 0
+        self.has_xfixes = False
+        self._setup_x11_funcs()
 
-    def set_global_offset(self, x, y):
-        self.global_offset_x = x
-        self.global_offset_y = y
+    def _setup_x11_funcs(self):
+        if not self.libx11 or not self.libxext or not self.libc:
+            logging.error("无法加载 X11/Xext/Libc 库，XShm 截图不可用")
+            return
+        self.libx11.XOpenDisplay.restype = c_void_p
+        self.libx11.XOpenDisplay.argtypes = [c_char_p]
+        self.libx11.XCloseDisplay.argtypes = [c_void_p]
+        self.libx11.XDefaultScreen.restype = c_int
+        self.libx11.XDefaultScreen.argtypes = [c_void_p]
+        self.libx11.XDefaultRootWindow.restype = c_ulong
+        self.libx11.XDefaultRootWindow.argtypes = [c_void_p]
+        self.libx11.XGetGeometry.restype = c_int
+        self.libx11.XGetGeometry.argtypes = [c_void_p, c_ulong, POINTER(c_ulong), POINTER(c_int), POINTER(c_int), POINTER(c_uint), POINTER(c_uint), POINTER(c_uint), POINTER(c_uint)]
+        self.libx11.XSync.argtypes = [c_void_p, c_int]
+        self.libx11.XDefaultVisual.restype = c_void_p
+        self.libx11.XDefaultVisual.argtypes = [c_void_p, c_int]
+        self.libx11.XDefaultDepth.restype = c_int
+        self.libx11.XDefaultDepth.argtypes = [c_void_p, c_int]
+        self.libx11.XFree.argtypes = [c_void_p]
+        self.libx11.XQueryExtension.restype = c_int
+        self.libx11.XQueryExtension.argtypes = [c_void_p, c_char_p, POINTER(c_int), POINTER(c_int), POINTER(c_int)]
+        self.libxext.XShmQueryExtension.restype = c_int
+        self.libxext.XShmQueryExtension.argtypes = [c_void_p]
+        self.libxext.XShmCreateImage.restype = POINTER(XImage)
+        self.libxext.XShmCreateImage.argtypes = [c_void_p, c_void_p, c_uint, c_int, c_char_p, POINTER(XShmSegmentInfo), c_uint, c_uint]
+        self.libxext.XShmAttach.restype = c_int
+        self.libxext.XShmAttach.argtypes = [c_void_p, POINTER(XShmSegmentInfo)]
+        self.libxext.XShmDetach.restype = c_int
+        self.libxext.XShmDetach.argtypes = [c_void_p, POINTER(XShmSegmentInfo)]
+        self.libxext.XShmGetImage.restype = c_int
+        self.libxext.XShmGetImage.argtypes = [c_void_p, c_ulong, POINTER(XImage), c_int, c_int, c_ulong]
+        self.libc.shmget.restype = c_int
+        self.libc.shmget.argtypes = [c_int, c_size_t, c_int]
+        self.libc.shmat.restype = c_void_p
+        self.libc.shmat.argtypes = [c_int, c_void_p, c_int]
+        self.libc.shmdt.restype = c_int
+        self.libc.shmdt.argtypes = [c_void_p]
+        self.libc.shmctl.restype = c_int
+        self.libc.shmctl.argtypes = [c_int, c_int, c_void_p]
+        if self.libxfixes:
+            self.libxfixes.XFixesGetCursorImage.restype = POINTER(XFixesCursorImage)
+            self.libxfixes.XFixesGetCursorImage.argtypes = [c_void_p]
 
-    @abc.abstractmethod
-    def capture(self, x: int, y: int, w: int, h: int, filepath: Path, scale: float = 1.0, include_cursor: bool = False) -> bool:
-        pass
+    @property
+    def target_coords(self) -> CoordSys:
+        return CoordSys.GLOBAL
 
     def prepare(self):
-        pass
+        if self.dpy: return True
+        self.dpy = self.libx11.XOpenDisplay(None)
+        if not self.dpy:
+            logging.error("无法打开 Display")
+            return False
+        if not self.libxext.XShmQueryExtension(self.dpy):
+            logging.error("当前环境不支持 SHM 扩展")
+            self.cleanup()
+            return False
+        dummy1, dummy2, dummy3 = c_int(), c_int(), c_int()
+        if self.libx11.XQueryExtension(self.dpy, b"XFIXES", byref(dummy1), byref(dummy2), byref(dummy3)):
+            self.has_xfixes = True
+        else:
+            self.has_xfixes = False
+            logging.warning("XFIXES 扩展不可用，将无法捕获光标")
+        self.screen = self.libx11.XDefaultScreen(self.dpy)
+        self.root = self.libx11.XDefaultRootWindow(self.dpy)
+        self.visual = self.libx11.XDefaultVisual(self.dpy, self.screen)
+        self.depth = self.libx11.XDefaultDepth(self.dpy, self.screen)
+        self._init_shm_image()
+        return True
 
-    def cleanup(self):
-        pass
+    def _get_root_geometry(self):
+        if not self.dpy: return 0, 0
+        root_return = c_ulong()
+        x_return = c_int()
+        y_return = c_int()
+        width_return = c_uint()
+        height_return = c_uint()
+        border_width_return = c_uint()
+        depth_return = c_uint()
+        status = self.libx11.XGetGeometry(
+            self.dpy, self.root,
+            byref(root_return), byref(x_return), byref(y_return),
+            byref(width_return), byref(height_return),
+            byref(border_width_return), byref(depth_return)
+        )
+        if status == 0:
+            logging.warning("XGetGeometry 失败")
+            return 0, 0
+        return width_return.value, height_return.value
 
-class X11FrameGrabber(FrameGrabberBase):
-    def _get_cursor_image(self):
-        """使用 ctypes 调用 X11 和 XFixes 获取当前光标图像"""
-        dpy = None
+    def _init_shm_image(self):
+        self.root_w, self.root_h = self._get_root_geometry()
+        if self.root_w == 0 or self.root_h == 0:
+            raise RuntimeError("无法获取根窗口尺寸")
+        self.shminfo = XShmSegmentInfo()
+        self.img = self.libxext.XShmCreateImage(
+            self.dpy, self.visual, self.depth, ZPixmap, None,
+            byref(self.shminfo), self.root_w, self.root_h
+        )
+        if not self.img: raise RuntimeError("XShmCreateImage 失败")
+        size = self.img.contents.height * self.img.contents.bytes_per_line
+        self.shminfo.shmid = self.libc.shmget(IPC_PRIVATE, size, IPC_CREAT | 0o600)
+        if self.shminfo.shmid < 0: raise RuntimeError("shmget 失败")
         try:
-            try: libx11 = ctypes.CDLL('libX11.so.6')
-            except OSError:
-                libx11 = ctypes.CDLL('libX11.so')
-            try: libxfixes = ctypes.CDLL('libXfixes.so.3')
-            except OSError:
-                try: libxfixes = ctypes.CDLL('libXfixes.so')
-                except OSError:
-                    logging.error('无法加载 libXfixes.so 库')
-                    return None
-            XOpenDisplay = libx11.XOpenDisplay
-            XOpenDisplay.restype = c_void_p
-            XOpenDisplay.argtypes = [c_char_p]
-            XCloseDisplay = libx11.XCloseDisplay
-            XCloseDisplay.argtypes = [c_void_p]
-            XQueryExtension = libx11.XQueryExtension
-            XQueryExtension.restype = c_int
-            XQueryExtension.argtypes = [c_void_p, c_char_p, 
-                                        POINTER(c_int), POINTER(c_int), POINTER(c_int)]
-            display_name = os.environ.get('DISPLAY', ':0').encode('utf-8')
-            dpy = XOpenDisplay(display_name)
-            if not dpy:
-                logging.error(f'无法打开 X Display: {display_name.decode()}')
-                return None
-            opcode = c_int()
-            event_base = c_int()
-            error_base = c_int()
-            has_xfixes = XQueryExtension(
-                dpy, 
-                b'XFIXES',
-                ctypes.byref(opcode),
-                ctypes.byref(event_base),
-                ctypes.byref(error_base)
-            )
-            if not has_xfixes:
-                logging.warning('XFIXES 扩展不可用')
-                XCloseDisplay(dpy)
-                return None
-            XFixesGetCursorImage = libxfixes.XFixesGetCursorImage
-            XFixesGetCursorImage.restype = POINTER(XFixesCursorImage)
-            XFixesGetCursorImage.argtypes = [c_void_p]
-            cursor_image_ptr = XFixesGetCursorImage(dpy)
-            if not cursor_image_ptr:
-                logging.warning('XFixesGetCursorImage 返回 NULL')
-                XCloseDisplay(dpy)
-                return None
-            cursor_image = cursor_image_ptr.contents
-            x = cursor_image.x
-            y = cursor_image.y
-            width = cursor_image.width
-            height = cursor_image.height
-            xhot = cursor_image.xhot
-            yhot = cursor_image.yhot
-            if width <= 0 or height <= 0:
-                logging.warning(f'光标尺寸无效: {width}x{height}')
-                libx11.XFree(cursor_image_ptr)
-                XCloseDisplay(dpy)
-                return None
-            pixel_count = width * height
-            pixels = cursor_image.pixels
-            if sys.maxsize > 2**32:
-                cursor_data = np.array([pixels[i] & 0xFFFFFFFF for i in range(pixel_count)], 
-                                       dtype=np.uint32).reshape(height, width)
-            else:
-                cursor_data = np.array([pixels[i] for i in range(pixel_count)], 
-                                       dtype=np.uint32).reshape(height, width)
-            bgra = np.zeros((height, width, 4), dtype=np.uint8)
-            bgra[..., 2] = (cursor_data >> 16) & 0xFF
-            bgra[..., 1] = (cursor_data >> 8) & 0xFF
-            bgra[..., 0] = cursor_data & 0xFF
-            bgra[..., 3] = (cursor_data >> 24) & 0xFF
-            libx11.XFree.argtypes = [c_void_p]
-            libx11.XFree(cursor_image_ptr)
-            XCloseDisplay(dpy)
-            logging.debug(f'成功获取光标图像: {width}x{height} at ({x},{y}), hotspot=({xhot},{yhot})')
-            return {
-                'image': bgra,
-                'x': x,
-                'y': y,
-                'xhot': xhot,
-                'yhot': yhot,
-                'width': width,
-                'height': height
-            }
+            addr = self.libc.shmat(self.shminfo.shmid, None, 0)
+            if addr == c_void_p(-1).value: raise RuntimeError("shmat 失败")
+            self.shminfo.shmaddr = addr
+            self.shminfo.readOnly = 0
+            self.img.contents.data = addr
+            if not self.libxext.XShmAttach(self.dpy, byref(self.shminfo)):
+                raise RuntimeError("XShmAttach 失败")
+        finally:
+            self.libc.shmctl(self.shminfo.shmid, IPC_RMID, None)
+        self.libx11.XSync(self.dpy, 0)
+        logging.debug(f"XShm 初始化完成，根窗口：{self.root_w} x {self.root_h} 缓冲区px")
+
+    def capture(self, x, y, w, h, filepath: Path, scale: float = 1.0, include_cursor: bool = False) -> bool:
+        """使用 XShm 从根窗口截取指定区域并保存到文件"""
+        # x, y: 全局坐标; x, y, w, h: 逻辑px
+        try:
+            if not self.prepare(): return False
+            cur_w, cur_h = self._get_root_geometry()
+            if cur_w > 0 and cur_h > 0 and (cur_w != self.root_w or cur_h != self.root_h):
+                logging.debug(f"检测到根窗口变更（{self.root_w} x {self.root_h} -> {cur_w} x {cur_h}），正在重新初始化 XShm...")
+                self.cleanup()
+                if not self.prepare(): return False
+            cursor_info = None
+            if include_cursor:
+                cursor_info = self._get_cursor_image()
+            # 逻辑px -> 缓冲区px
+            g_x_buf = math.ceil(x * scale)
+            g_y_buf = math.ceil(y * scale)
+            g_x_end_buf = int((x + w) * scale)
+            g_y_end_buf = int((y + h) * scale)
+            w_buf = g_x_end_buf - g_x_buf
+            h_buf = g_y_end_buf - g_y_buf
+            if g_x_buf < 0: g_x_buf = 0
+            if g_y_buf < 0: g_y_buf = 0
+            if g_x_buf + w_buf > self.root_w: w_buf = self.root_w - g_x_buf
+            if g_y_buf + h_buf > self.root_h: h_buf = self.root_h - g_y_buf
+            if w_buf <= 0 or h_buf <= 0:
+                logging.warning(f"截图区域无效")
+                return False
+            if not self.libxext.XShmGetImage(self.dpy, self.root, self.img, 0, 0, ALL_PLANES):
+                logging.error("XShmGetImage 失败")
+                return False
+            h_total = self.img.contents.height
+            stride = self.img.contents.bytes_per_line
+            buf_len = h_total * stride
+            buf_ptr = cast(self.img.contents.data, POINTER(c_ubyte * buf_len))
+            raw_view = np.ctypeslib.as_array(buf_ptr.contents).reshape(h_total, stride)
+            bpp = self.img.contents.bits_per_pixel // 8
+            roi_raw = raw_view[g_y_buf : g_y_buf + h_buf, g_x_buf * bpp : (g_x_buf + w_buf) * bpp]
+            src_bgra = roi_raw.reshape(h_buf, w_buf, 4)
+            final_bgr = cv2.cvtColor(src_bgra, cv2.COLOR_BGRA2BGR)
+            if cursor_info:
+                final_bgr = self._blend_cursor(final_bgr, cursor_info, g_x_buf, g_y_buf)
+            success = cv2.imwrite(str(filepath), final_bgr)
+            if not success:
+                logging.error(f"XShm 截图写入文件 {filepath} 失败")
+                return False
+            return True
         except Exception as e:
-            logging.error(f'获取光标图像失败: {e}', exc_info=True)
-            if dpy:
-                try: XCloseDisplay(dpy)
-                except: pass
+            logging.error(f"XShm 截图失败: {e}")
+            return False
+
+    def _get_cursor_image(self):
+        if not self.dpy or not self.libxfixes or not self.has_xfixes: return None
+        try:
+            cursor_ptr = self.libxfixes.XFixesGetCursorImage(self.dpy)
+            if not cursor_ptr: return None
+            c = cursor_ptr.contents
+            width, height = c.width, c.height
+            if width <= 0 or height <= 0:
+                self.libx11.XFree(cursor_ptr)
+                return None
+            count = width * height
+            raw_data = np.ctypeslib.as_array(c.pixels, shape=(count,))
+            raw_data = raw_data.astype(np.uint32)
+            bgra = raw_data.view(np.uint8)
+            result = {
+                'image': bgra.reshape((height, width, 4)),
+                'x': c.x, 'y': c.y, 'xhot': c.xhot, 'yhot': c.yhot,
+                'width': width, 'height': height
+            }
+            self.libx11.XFree(cursor_ptr)
+            return result
+        except Exception as e:
+            logging.warning(f"获取光标图像失败: {e}")
             return None
 
     def _blend_cursor(self, screenshot_array, cursor_info, cap_g_x, cap_g_y):
@@ -1045,51 +1503,24 @@ class X11FrameGrabber(FrameGrabberBase):
         except Exception as e:
             logging.error(f'混合光标图像失败: {e}')
             return screenshot_array
-    # 缓冲区px }
+# 缓冲区px }
 
-    def capture(self, x: int, y: int, w: int, h: int, filepath: Path, scale: float = 1.0, include_cursor: bool = False) -> bool:
-        """使用 GDK 从根窗口截取指定区域并保存到文件"""
-        # x, y: 显示器坐标; x, y, w, h: 逻辑px
-        try:
-            cursor_info = None
-            if include_cursor:
-                cursor_info = self._get_cursor_image()
-            root_window = Gdk.get_default_root_window()
-            if not root_window:
-                logging.error("无法获取 GDK 根窗口")
-                return False
-            g_x, g_y = x + self.global_offset_x, y + self.global_offset_y # 显示器坐标 -> 全局坐标
-            pixbuf = Gdk.pixbuf_get_from_window(root_window, g_x, g_y, w, h)
-            if not pixbuf:
-                logging.error(f"从区域 {w}x{h}+{x}+{y} 抓取 pixbuf 失败")
-                return False
-            if cursor_info:
-                width = pixbuf.get_width()
-                height = pixbuf.get_height()
-                channels = pixbuf.get_n_channels()
-                pixels = pixbuf.get_pixels()
-                if channels == 3:
-                    img = Image.frombuffer('RGB', (width, height), pixels, 
-                                           'raw', 'RGB', pixbuf.get_rowstride(), 1)
-                else:
-                    img = Image.frombuffer('RGBA', (width, height), pixels, 
-                                           'raw', 'RGBA', pixbuf.get_rowstride(), 1)
-                screenshot_array = np.array(img)
-                # 逻辑px -> 缓冲区px
-                g_x_buf = round(g_x * scale)
-                g_y_buf = round(g_y * scale)
-                screenshot_array = self._blend_cursor(screenshot_array, cursor_info, g_x_buf, g_y_buf)
-                img = Image.fromarray(screenshot_array)
-                img.save(str(filepath), 'PNG')
-            else:
-                pixbuf.savev(str(filepath), 'png', [], [])
-                logging.debug(f"成功使用 GDK 截图到: {filepath}")
-            return True
-        except Exception as e:
-            logging.error(f"使用 GDK 截图失败: {e}")
-            return False
+    def cleanup(self):
+        if self.dpy:
+            if self.shminfo and self.shminfo.shmaddr:
+                self.libxext.XShmDetach(self.dpy, byref(self.shminfo))
+                self.libx11.XSync(self.dpy, 0)
+            if self.img:
+                destroy_func = ctypes.CFUNCTYPE(c_int, POINTER(XImage))(self.img.contents.f.destroy_image)
+                destroy_func(self.img)
+                self.img = None
+            if self.shminfo:
+                if self.shminfo.shmaddr: self.libc.shmdt(self.shminfo.shmaddr)
+                self.shminfo = None
+            self.libx11.XCloseDisplay(self.dpy)
+            self.dpy = None
 
-class WaylandFrameGrabber(FrameGrabberBase):
+class WaylandFrameGrabber(FrameGrabber):
     def __init__(self):
         Gst.init(None)
         self.state = "IDLE"
@@ -1116,15 +1547,19 @@ class WaylandFrameGrabber(FrameGrabberBase):
                 'org.freedesktop.portal.ScreenCast', None
             )
         except Exception as e:
-            logging.error(f"Wayland Grabber: DBus 连接失败: {e}")
+            logging.error(f"DBus 连接失败: {e}")
 
-    def prepare_sync(self):
+    @property
+    def target_coords(self) -> CoordSys:
+        return CoordSys.MONITOR
+
+    def prepare(self):
         if self.state != "IDLE": return True
-        logging.info("Wayland Grabber: 正在请求屏幕录制权限...")
+        logging.info("正在请求屏幕录制权限...")
         self.init_loop = GLib.MainLoop()
         self._start_portal_request()
         if self.state == "ERROR":
-            logging.warning("Wayland Grabber: 初始化请求失败，跳过事件循环")
+            logging.warning("WaylandFrameGrabber: 初始化请求失败，跳过事件循环")
             self.init_loop = None
             return True
         try:
@@ -1134,12 +1569,12 @@ class WaylandFrameGrabber(FrameGrabberBase):
             return False
         self.init_loop = None
         if self.user_cancelled:
-            logging.info("Wayland Grabber: 用户取消了授权")
+            logging.info("WaylandFrameGrabber: 用户取消了授权")
             return False
         if self.state == "STREAMING":
-            logging.info("Wayland Grabber: 授权成功，后台流已启动")
+            logging.info("WaylandFrameGrabber: 授权成功，后台流已启动")
         else:
-            logging.warning(f"Wayland Grabber: 未进入流状态 (State: {self.state})")
+            logging.warning(f"WaylandFrameGrabber: 未进入流状态 (state: {self.state})")
         return True
 
     def _start_portal_request(self):
@@ -1155,8 +1590,7 @@ class WaylandFrameGrabber(FrameGrabberBase):
             'session_handle_token': GLib.Variant('s', f"session_{request_token}")
         }
         try:
-            self.portal.call_sync('CreateSession', GLib.Variant('(a{sv})', (options,)),
-                                  Gio.DBusCallFlags.NONE, -1, None)
+            self.portal.call_sync('CreateSession', GLib.Variant('(a{sv})', (options,)), Gio.DBusCallFlags.NONE, -1, None)
         except Exception as e:
             err_msg = f"CreateSession 失败:\n{e}"
             logging.error(err_msg)
@@ -1174,7 +1608,7 @@ class WaylandFrameGrabber(FrameGrabberBase):
             return
         elif response_code != 0:
             logging.error(f"Portal 请求失败 (code={response_code})")
-            self.last_error = f"屏幕录制请求失败 (错误码: {response_code})"
+            self.last_error = f"屏幕录制请求失败 (code: {response_code})"
             self.state = "ERROR"
             if self.init_loop: self.init_loop.quit()
             return
@@ -1189,16 +1623,12 @@ class WaylandFrameGrabber(FrameGrabberBase):
                     'multiple': GLib.Variant('b', False),
                     'cursor_mode': GLib.Variant('u', cursor_mode_val)
                 }
-                self.portal.call_sync('SelectSources', 
-                                      GLib.Variant('(oa{sv})', (self.session_handle, opts)),
-                                      Gio.DBusCallFlags.NONE, -1, None)
+                self.portal.call_sync('SelectSources', GLib.Variant('(oa{sv})', (self.session_handle, opts)), Gio.DBusCallFlags.NONE, -1, None)
                 self.state = "SELECTING"
         elif self.state == "SELECTING":
             self.state = "STARTING"
             opts = {'handle_token': GLib.Variant('s', f"start_{os.getpid()}")}
-            self.portal.call_sync('Start', 
-                                  GLib.Variant('(osa{sv})', (self.session_handle, '', opts)),
-                                  Gio.DBusCallFlags.NONE, -1, None)
+            self.portal.call_sync('Start', GLib.Variant('(osa{sv})', (self.session_handle, '', opts)), Gio.DBusCallFlags.NONE, -1, None)
         elif self.state == "STARTING":
             if 'streams' in result_dict and len(result_dict['streams']) > 0:
                 self.pipewire_node_id = result_dict['streams'][0][0]
@@ -1228,7 +1658,7 @@ class WaylandFrameGrabber(FrameGrabberBase):
     def _on_bus_message(self, bus, message):
         if message.type == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            self.last_error = f"GStreamer 错误: {err.message}\n(Debug: {debug})"
+            self.last_error = f"GStreamer 错误: {err.message}\n(debug: {debug})"
             logging.error(self.last_error)
 
     def _on_new_sample(self, appsink):
@@ -1243,24 +1673,39 @@ class WaylandFrameGrabber(FrameGrabberBase):
             info = GstVideo.VideoInfo.new_from_caps(caps)
             w, h = info.width, info.height
             stride = info.stride[0]
-            arr = np.frombuffer(map_info.data, dtype=np.uint8)
-            if arr.size >= h * stride:
-                frame_bgr = arr[:h*stride].reshape((h, stride))[:, :w*4].reshape((h, w, 4))[:, :, :3]
+            if map_info.size >= h * stride:
+                raw_bgra = np.ndarray(shape=(h, w, 4), dtype=np.uint8, buffer=map_info.data, strides=(stride, 4, 1))
+                frame_bgr = cv2.cvtColor(raw_bgra, cv2.COLOR_BGRA2BGR)
                 with self.frame_lock:
-                    self.latest_frame = frame_bgr.copy()
+                    self.latest_frame = frame_bgr
         finally:
             buffer.unmap(map_info)
         return Gst.FlowReturn.OK
 
-    def capture(self, x: int, y: int, w: int, h: int, filepath: Path, scale: float = 1.0, include_cursor: bool = False) -> bool:
+    def wait_for_valid_frame(self, timeout=2.0):
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            with self.frame_lock:
+                if self.latest_frame is not None:
+                    h, w, _ = self.latest_frame.shape
+                    if w > 0 and h > 0:
+                        return w, h
+            if self.last_error or self.state == "ERROR":
+                raise RuntimeError(self.last_error or "GStreamer 发生未知错误")
+            time.sleep(0.05)
+        raise TimeoutError("等待视频流初始化超时")
+
+    def capture(self, x, y, w, h, filepath: Path, scale: float = 1.0, include_cursor: bool = False) -> bool:
         # x, y: 显示器坐标; x, y, w, h: 逻辑px
         with self.frame_lock:
             if self.latest_frame is None: return False
             # 逻辑px -> 缓冲区px
             x_buf = math.ceil(x * scale)
             y_buf = math.ceil(y * scale)
-            w_buf = int(w * scale)
-            h_buf = int(h * scale)
+            x_end_buf = int((x + w) * scale)
+            y_end_buf = int((y + h) * scale)
+            w_buf = x_end_buf - x_buf
+            h_buf = y_end_buf - y_buf
             img_h, img_w, _ = self.latest_frame.shape # 缓冲区px
             x1 = max(0, x_buf)
             y1 = max(0, y_buf)
@@ -1268,278 +1713,403 @@ class WaylandFrameGrabber(FrameGrabberBase):
             y2 = min(img_h, y_buf + h_buf)
             crop = self.latest_frame[y1:y2, x1:x2]
         try:
-            cv2.imwrite(str(filepath), crop)
+            success = cv2.imwrite(str(filepath), crop)
+            if not success:
+                logging.error(f"Wayland 截图写入文件 {filepath} 失败")
+                return False
             return True
         except Exception as e:
-            logging.error(f"Wayland 保存失败: {e}")
+            logging.error(f"Wayland 截图保存失败: {e}")
             return False
-            
+
     def cleanup(self):
-        if self.pipeline: self.pipeline.set_state(Gst.State.NULL)
-        if self.session_handle:
-            try: self.portal.call_sync('Close', None, Gio.DBusCallFlags.NONE, -1, None)
-            except: pass
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+            self.appsink = None
+        if self.session_handle and self.connection:
+            try:
+                self.connection.call_sync(
+                    'org.freedesktop.portal.Desktop',
+                    self.session_handle,
+                    'org.freedesktop.portal.Session',
+                    'Close',
+                    None, None, Gio.DBusCallFlags.NONE, -1, None
+                )
+            except Exception as e:
+                logging.warning(f"关闭 session 失败: {e}")
+        self.session_handle = None
+        self.pipewire_node_id = None
+        self.state = "IDLE"
 
-class WindowManagerBase(abc.ABC):
-    @abc.abstractmethod
-    def setup_overlay_window(self, window: Gtk.Window):
-        """配置 Gtk.Window 以作为覆盖层运行"""
-        pass
+class ImageMatcher:
+    THRES_ABS_GOOD, THRES_ABS_VALID, THRES_ABS_BAD = 0.005, 0.02, 0.03
+    THRES_SQ_GOOD, THRES_SQ_VALID = 0.01, 0.15
+    THRES_CC_GOOD, THRES_CC_VALID = 0.95, 0.80
+    THRES_STATIC_ABS = 0.005
+    THRES_SCORE = 5.0
+    THRES_TEXTURE = 3.0
 
-    def get_screen_geometry(self, window: Gtk.Window) -> Gdk.Rectangle:
-        """获取覆盖层应在的显示器的几何信息"""
-        # 逻辑px全局坐标
-        display = Gdk.Display.get_default()
-        if window.get_window() and window.get_window().is_visible():
-            monitor = display.get_monitor_at_window(window.get_window())
-            if monitor:
-                return monitor.get_geometry()
-        monitor = display.get_primary_monitor()
-        if monitor:
-            return monitor.get_geometry()
-        logging.warning("无法确定显示器，将使用 1920x1080 作为回退")
-        rect = Gdk.Rectangle()
-        rect.x = 0
-        rect.y = 0
-        rect.width = 1920
-        rect.height = 1080
-        return rect
+    @classmethod
+    def configure(cls, config_obj):
+        cls.THRES_SCORE = config_obj.THRES_SCORE
+        cls.THRES_TEXTURE = config_obj.THRES_TEXTURE
 
-class X11WindowManager(WindowManagerBase):
-    """X11 窗口管理器实现"""
-    def setup_overlay_window(self, window: Gtk.Window):
-        window.set_decorated(False)
-        window.set_keep_above(True)
-        window.set_app_paintable(True)
-        window.set_type_hint(Gdk.WindowTypeHint.NORMAL)
-        window.set_skip_taskbar_hint(True)
-        window.set_skip_pager_hint(True)
-        visual = window.get_screen().get_rgba_visual()
-        if visual and window.get_screen().is_composited():
-            window.set_visual(visual)
+    @staticmethod
+    def _compute_similarity_metrics(region1, region2):
+        if region1.shape != region2.shape:
+            return False, 0
+        mean_bgr = cv2.mean(cv2.absdiff(region1, region2))
+        s_abs = (mean_bgr[0] + mean_bgr[1] + mean_bgr[2]) / (3 * 255.0)
+        if s_abs > ImageMatcher.THRES_ABS_BAD:
+            return False, 0
+        res_sq = cv2.matchTemplate(region1, region2, cv2.TM_SQDIFF_NORMED)
+        s_sq = res_sq[0][0]
+        res_cc = cv2.matchTemplate(region1, region2, cv2.TM_CCOEFF_NORMED)
+        s_cc = res_cc[0][0]
+        is_valid = (s_cc >= ImageMatcher.THRES_CC_VALID and s_sq <= ImageMatcher.THRES_SQ_VALID and s_abs <= ImageMatcher.THRES_ABS_VALID)
+        points = 0
+        if s_cc > ImageMatcher.THRES_CC_GOOD: points += 1
+        if s_sq < ImageMatcher.THRES_SQ_GOOD: points += 1
+        if s_abs < ImageMatcher.THRES_ABS_GOOD: points += 1
+        return is_valid, points
 
-class WaylandWindowManager(WindowManagerBase):
-    """Wayland 窗口管理器实现"""
-    def setup_overlay_window(self, window: Gtk.Window):
-        window.set_app_paintable(True)
-        visual = window.get_screen().get_rgba_visual()
-        if visual and window.get_screen().is_composited():
-            window.set_visual(visual)
+    @staticmethod
+    def detect_static_bars(img_top, img_bottom, prev_y=0, curr_y=0):
+        h_top, w_top = img_top.shape[:2]
+        h_bot, w_bot = img_bottom.shape[:2]
+        box_shift = curr_y - prev_y
+        delta_h = h_bot - h_top
+        def_bot_h_header = max(0, -box_shift)
+        def_bot_h_footer = max(0, box_shift + delta_h)
+        y_start_intersect = max(prev_y, curr_y)
+        y_end_intersect = min(prev_y + h_top, curr_y + h_bot)
+        h_header_found = 0
+        h_footer_found = 0
+        w_left = 0
+        w_right = 0
+        if y_end_intersect > y_start_intersect:
+            t_y1 = y_start_intersect - prev_y
+            t_y2 = y_end_intersect - prev_y
+            b_y1 = y_start_intersect - curr_y
+            b_y2 = y_end_intersect - curr_y
+            strip_top = img_top[t_y1:t_y2, :]
+            strip_bot = img_bottom[b_y1:b_y2, :]
+            intersect_h = t_y2 - t_y1
+            max_header_search = intersect_h
+            for y in range(max_header_search):
+                row_top = strip_top[y:y+1, :]
+                row_bot = strip_bot[y:y+1, :]
+                mb = cv2.mean(cv2.absdiff(row_top, row_bot))
+                mae = (mb[0] + mb[1] + mb[2]) / (3 * 255.0)
+                if mae <= ImageMatcher.THRES_STATIC_ABS: h_header_found = y + 1
+                else: break
+            max_footer_search = intersect_h - h_header_found
+            for y in range(max_footer_search):
+                row_top = strip_top[intersect_h - 1 - y : intersect_h - y, :]
+                row_bot = strip_bot[intersect_h - 1 - y : intersect_h - y, :]
+                mb = cv2.mean(cv2.absdiff(row_top, row_bot))
+                mae = (mb[0] + mb[1] + mb[2]) / (3 * 255.0)
+                if mae <= ImageMatcher.THRES_STATIC_ABS: h_footer_found = y + 1
+                else: break
+            max_left_search = w_bot
+            for x in range(max_left_search):
+                col_top = strip_top[:, x:x+1]
+                col_bot = strip_bot[:, x:x+1]
+                mb = cv2.mean(cv2.absdiff(col_top, col_bot))
+                mae = (mb[0] + mb[1] + mb[2]) / (3 * 255.0)
+                if mae <= ImageMatcher.THRES_STATIC_ABS: w_left = x + 1
+                else: break
+            max_right_search = w_bot - w_left
+            for x in range(max_right_search):
+                col_top = strip_top[:, w_top - 1 - x : w_top - x]
+                col_bot = strip_bot[:, w_bot - 1 - x : w_bot - x]
+                mb = cv2.mean(cv2.absdiff(col_top, col_bot))
+                mae = (mb[0] + mb[1] + mb[2]) / (3 * 255.0)
+                if mae <= ImageMatcher.THRES_STATIC_ABS: w_right = x + 1
+                else: break
+        final_bot_header = def_bot_h_header + h_header_found
+        final_bot_footer = def_bot_h_footer + h_footer_found
+        if final_bot_header + final_bot_footer >= 0.6 * h_bot:
+            final_bot_header = def_bot_h_header
+            final_bot_footer = def_bot_h_footer
+        if w_left + w_right >= 0.6 * w_bot:
+            w_left = 0
+            w_right = 0
+        return final_bot_header, final_bot_footer, w_left, w_right
+
+    @staticmethod
+    def verify_region(img_top, img_bottom, shift, match_y_bot, static_bars, box_shift=0):
+        h_top = img_top.shape[0]
+        h_bot = img_bottom.shape[0]
+        w_bot = img_bottom.shape[1]
+        bot_h_header, bot_h_footer, w_left, w_right = static_bars
+        match_y_top = match_y_bot + shift
+        if match_y_top < 0:
+            match_y_bot -= match_y_top
+            match_y_top = 0
+        delta_h = h_bot - h_top
+        top_h_footer = bot_h_footer - (box_shift + delta_h)
+        if match_y_top >= h_top - top_h_footer:
+            top_h_footer = 0
+        max_h_valid_top = h_top - top_h_footer - match_y_top
+        max_h_valid_bot = h_bot - bot_h_footer - match_y_bot
+        check_h = min(max_h_valid_top, max_h_valid_bot)
+        if check_h <= 0:
+            return float('-inf'), match_y_bot
+        valid_w_end = w_bot - w_right
+        region_top = img_top[match_y_top : match_y_top + check_h, w_left : valid_w_end]
+        region_bot = img_bottom[match_y_bot : match_y_bot + check_h, w_left : valid_w_end]
+        rows, cols = 6, 6
+        if check_h < 2 * rows: rows = 1
+        h_step = check_h // rows
+        w_step = region_bot.shape[1] // cols
+        score = 0.0
+        best_row_score = float('-inf')
+        best_row_idx = 0
+        debug_grid = [["" for _ in range(cols)] for _ in range(rows)]
+        for r in range(rows):
+            row_score = 0.0
+            y1, y2 = r*h_step, (r+1)*h_step
+            for c in range(cols):
+                x1, x2 = c*w_step, (c+1)*w_step
+                b_top = region_top[y1:y2, x1:x2]
+                b_bot = region_bot[y1:y2, x1:x2]
+                mean_bgr = cv2.mean(cv2.absdiff(b_top, b_bot))
+                mae = (mean_bgr[0] + mean_bgr[1] + mean_bgr[2]) / (3 * 255.0)
+                delta = 0.0
+                if mae > ImageMatcher.THRES_ABS_BAD:
+                    delta = -1.5
+                    debug_grid[r][c] = "X"
+                elif mae < ImageMatcher.THRES_ABS_GOOD:
+                    std_top = cv2.meanStdDev(cv2.cvtColor(b_top, cv2.COLOR_BGR2GRAY))[1][0][0]
+                    std_bot = cv2.meanStdDev(cv2.cvtColor(b_bot, cv2.COLOR_BGR2GRAY))[1][0][0]
+                    if std_top > ImageMatcher.THRES_TEXTURE and std_bot > ImageMatcher.THRES_TEXTURE:
+                        delta = 1.0
+                        debug_grid[r][c] = "O"
+                    else:
+                        delta = 0.0
+                        debug_grid[r][c] = "-"
+                else:
+                    delta = 0.0
+                    debug_grid[r][c] = "."
+                score += delta
+                row_score += delta
+            if row_score > best_row_score:
+                best_row_score = row_score
+                best_row_idx = r
+        log_msg = [f"\n  score={score:.1f}（shift={shift}，top: y=[{match_y_top}:{match_y_top + check_h}]，bot: y=[{match_y_bot}:{match_y_bot + check_h}]）"]
+        for r in range(rows):
+            row_str = "  " + " ".join([f"[{char}]" for char in debug_grid[r]])
+            log_msg.append(row_str)
+        logging.debug("\n".join(log_msg))
+        best_cut_y = match_y_bot + (best_row_idx * h_step) + (h_step // 2)
+        return score, best_cut_y
+
+    @staticmethod
+    def _search_in_row(img_top, row_img, row_rect, static_bars, box_shift, delta_h, min_shift, max_shift):
+        rx, ry, rw, rh = row_rect
+        bot_h_header, bot_h_footer, w_left, w_right = static_bars
+        top_h_header = bot_h_header + box_shift
+        top_h_footer = bot_h_footer - (box_shift + delta_h)
+        valid_rw = rw - w_left - w_right
+        num_cols = max(1, round(valid_rw ** 0.5 / 3.5))
+        col_w = valid_rw // num_cols
+        blocks = []
+        row_gray = cv2.cvtColor(row_img[:, w_left : rw - w_right], cv2.COLOR_BGR2GRAY)
+        for c in range(num_cols):
+            cx = c * col_w
+            cw = col_w
+            if cx + cw > rw: cw = rw - cx
+            block_roi = row_gray[:, cx:cx+cw]
+            tex_score = cv2.meanStdDev(block_roi)[1][0][0]
+            if tex_score > ImageMatcher.THRES_TEXTURE:
+                blocks.append({
+                    'tex_score': tex_score,
+                    'rect': (rx + w_left + cx, ry, cw, rh),
+                    'block_bgr': row_img[:, w_left + cx : w_left + cx + cw]
+                })
+        blocks.sort(key=lambda x: x['tex_score'], reverse=True)
+        target_blocks = blocks[:4]
+        if not target_blocks: return None
+        candidates = []
+        h_top = img_top.shape[0]
+        strip_start_y = max(top_h_header, ry + min_shift)
+        if top_h_footer == bot_h_footer:
+            limit_y = h_top - top_h_footer
         else:
-            logging.warning("无法设置 RGBA visual，透明度可能无法工作")
-        if not GTK_LAYER_SHELL_AVAILABLE or not GtkLayerShell.is_supported():
-            window.set_decorated(False)
-            empty_titlebar = Gtk.Fixed()
-            window.set_titlebar(empty_titlebar)
-            send_desktop_notification("窗口未置顶", "需手动置顶", level="warning")
-        else:
-            logging.debug("WaylandWindowManager: 正在应用 GtkLayerShell 属性...")
-            GtkLayerShell.init_for_window(window)
-            GtkLayerShell.set_layer(window, GtkLayerShell.Layer.OVERLAY)
-            GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.TOP, True)
-            GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.BOTTOM, True)
-            GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.LEFT, True)
-            GtkLayerShell.set_anchor(window, GtkLayerShell.Edge.RIGHT, True)
-            GtkLayerShell.set_namespace(window, "scroll_stitch_overlay")
-            protocol_version = GtkLayerShell.get_protocol_version()
-            logging.debug(f"GtkLayerShell 协议版本: {protocol_version}")
-            if protocol_version >= 4:
-                GtkLayerShell.set_keyboard_mode(window, GtkLayerShell.KeyboardMode.ON_DEMAND)
+            limit_y = h_top
+        strip_end_y = min(limit_y, ry + max_shift + rh)
+        search_area_h = strip_end_y - strip_start_y
+        if search_area_h < rh:
+            return None
+        scale_factor = max(0.08, (8.0 / search_area_h) ** 0.5)
+        fine_radius = max(3, int(0.8 / scale_factor))
+        for b in target_blocks:
+            bx, by, bw, bh = b['rect']
+            strip_top = img_top[strip_start_y : strip_end_y, bx : bx + bw]
+            if strip_top.shape[0] < bh: continue
+            small_strip = cv2.resize(strip_top, (0,0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
+            small_block = cv2.resize(b['block_bgr'], (0,0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
+            if small_strip.shape[0] < small_block.shape[0]: continue
+            res = cv2.matchTemplate(small_strip, small_block, cv2.TM_SQDIFF_NORMED)
+            _, _, min_loc, _ = cv2.minMaxLoc(res)
+            found_y_small = min_loc[1]
+            center_y = int(found_y_small / scale_factor)
+            fy_start = max(0, center_y - fine_radius)
+            fy_end = min(strip_top.shape[0] - bh, center_y + fine_radius + 1)
+            if fy_end <= fy_start: continue
+            roi_fine = strip_top[fy_start : fy_end+bh, :]
+            res_fine = cv2.matchTemplate(roi_fine, b['block_bgr'], cv2.TM_SQDIFF_NORMED)
+            _, _, min_loc_fine, _ = cv2.minMaxLoc(res_fine)
+            best_y_in_strip = fy_start + min_loc_fine[1]
+            y_top_global = strip_start_y + best_y_in_strip
+            shift = y_top_global - by
+            match_region = strip_top[best_y_in_strip : best_y_in_strip+bh, :]
+            is_valid, points = ImageMatcher._compute_similarity_metrics(match_region, b['block_bgr'])
+            if is_valid:
+                candidates.append({'shift': shift, 'points': points})
+        if not candidates: return None
+        candidates.sort(key=lambda x: x['shift'])
+        clusters = []
+        curr_cluster = [candidates[0]]
+        for i in range(1, len(candidates)):
+            if abs(candidates[i]['shift'] - curr_cluster[-1]['shift']) <= 3:
+                curr_cluster.append(candidates[i])
             else:
-                logging.warning(f"Wayland 协议版本 {protocol_version} < 4，回退到独占键盘模式")
-            GtkLayerShell.set_keyboard_mode(window, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+                clusters.append(curr_cluster)
+                curr_cluster = [candidates[i]]
+        clusters.append(curr_cluster)
+        best_cluster = max(clusters, key=lambda cl: sum(c['points'] for c in cl))
+        best_cluster.sort(key=lambda x: (-x['points'], x['shift']))
+        best_candidate = best_cluster[0]
+        return int(best_candidate['shift'])
 
-# 缓冲区px {
-def _find_overlap_brute_force(img_top, img_bottom, min_h, max_h):
-    h1, _, _ = img_top.shape
-    best_match_score = -1.0
-    found_overlap = 0
-    for h in range(max_h, min_h - 1, -1):
-        region_top = img_top[h1 - h:, :]
-        template_bottom = img_bottom[0:h, :]
-        result = cv2.matchTemplate(region_top, template_bottom, cv2.TM_CCOEFF_NORMED)
-        score = result[0][0]
-        if score > best_match_score:
-            best_match_score = score
-            found_overlap = h
-        if score > 0.98:
-            break
-    return found_overlap, best_match_score
+    @staticmethod
+    def detect_visual_shift(img_top, img_bottom, static_bars, box_shift, min_shift, max_shift):
+        h_bot, w_bot = img_bottom.shape[:2]
+        h_top = img_top.shape[0]
+        bot_h_header, bot_h_footer, w_left, w_right = static_bars
+        y_start_scan = bot_h_header if box_shift == 0 else 0
+        y_end_scan = h_bot - bot_h_footer
+        search_h_bot = y_end_scan - y_start_scan
+        num_rows = max(1, round(search_h_bot ** 0.5 / 3.5))
+        row_h = search_h_bot // num_rows
+        best_score = float('-inf')
+        best_shift = h_top
+        best_cut = 0
+        for r in range(num_rows):
+            y_start = y_start_scan + r * row_h
+            y_end = y_start + row_h
+            if y_end > y_end_scan: break
+            row_img = img_bottom[y_start:y_end, :]
+            valid_row_img = row_img[:, w_left : w_bot - w_right]
+            gray_row = cv2.cvtColor(valid_row_img, cv2.COLOR_BGR2GRAY)
+            tex_score = cv2.meanStdDev(gray_row)[1][0][0]
+            if tex_score < ImageMatcher.THRES_TEXTURE:
+                continue
+            delta_h = h_bot - h_top
+            shift_candidate = ImageMatcher._search_in_row(img_top, row_img, (0, y_start, w_bot, row_h), static_bars, box_shift, delta_h, min_shift, max_shift)
+            if shift_candidate is not None:
+                score, verified_cut_y = ImageMatcher.verify_region(img_top, img_bottom, shift_candidate, y_start, static_bars, box_shift)
+                if score > ImageMatcher.THRES_SCORE:
+                    return shift_candidate, verified_cut_y, score
+                if score > best_score:
+                    best_score = score
+                    best_shift = shift_candidate
+                    best_cut = verified_cut_y
+        return best_shift, best_cut, best_score
 
-def _run_pyramid_step(img_top, img_bottom, max_overlap_search, scale_factor):
-    """执行单次金字塔匹配步骤"""
-    search_radius = max(3, int(0.8 / scale_factor))
-    small_top = cv2.resize(img_top, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
-    small_bottom = cv2.resize(img_bottom, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
-    max_overlap_scaled = int(max_overlap_search * scale_factor)
-    coarse_overlap_scaled, _ = _find_overlap_brute_force(small_top, small_bottom, 1, max_overlap_scaled)
-    estimated_overlap = int(coarse_overlap_scaled / scale_factor)
-    h1, _, _ = img_top.shape
-    h2, _, _ = img_bottom.shape
-    min_fine_search = max(1, estimated_overlap - search_radius)
-    max_fine_search = min(max_overlap_search, estimated_overlap + search_radius, h1 - 1, h2 - 1)
-    if max_fine_search <= min_fine_search:
-        return estimated_overlap, 0.0
-    return _find_overlap_brute_force(img_top, img_bottom, min_fine_search, max_fine_search)
-
-def _find_overlap_pyramid(img_top, img_bottom, max_overlap_search):
-    PYRAMID_CUTOFF_THRESHOLD = 50
-    if max_overlap_search < PYRAMID_CUTOFF_THRESHOLD:
-        return _find_overlap_brute_force(img_top, img_bottom, 1, max_overlap_search)
-    scale_factor_1 = (2.0 / max_overlap_search)**0.5
-    scale_factor_1 = max(0.08, min(scale_factor_1, 0.5))
-    overlap_1, score_1 = _run_pyramid_step(img_top, img_bottom, max_overlap_search, scale_factor_1)
-    if score_1 > 0.90:
-        return overlap_1, score_1
-    if scale_factor_1 >= 0.3:
-        return overlap_1, score_1
-    logging.debug(f"快速匹配分数低 ({score_1:.3f})，尝试更高精度重试...")
-    scale_factor_2 = 1.5 * scale_factor_1
-    overlap_2, score_2 = _run_pyramid_step(img_top, img_bottom, max_overlap_search, scale_factor_2)
-    if score_2 > score_1:
-        logging.debug(f"高精度重试成功: score {score_1:.3f} -> {score_2:.3f}")
-        return overlap_2, score_2
-    return overlap_1, score_1
+    @staticmethod
+    def detect_micro_overlap(img_top, img_bottom, static_bars, row_h, box_shift):
+        h_top, w_top = img_top.shape[:2]
+        h_bot, w_bot = img_bottom.shape[:2]
+        bot_h_header, bot_h_footer, w_left, w_right = static_bars
+        delta_h = h_bot - h_top
+        top_h_footer = bot_h_footer - (box_shift + delta_h)
+        candidates_top = []
+        if h_top >= row_h:
+            candidates_top.append({'img': img_top[h_top - row_h : h_top, :], 'base_y': h_top - row_h})
+        if top_h_footer > 0 and h_top >= top_h_footer + row_h:
+            base_y = h_top - top_h_footer - row_h
+            candidates_top.append({'img': img_top[base_y : base_y + row_h, :], 'base_y': base_y})
+        candidates_bot = []
+        if h_bot >= row_h:
+            candidates_bot.append({'img': img_bottom[0 : row_h, :], 'base_y': 0})
+        if bot_h_header > 0 and h_bot >= bot_h_header + row_h:
+            candidates_bot.append({'img': img_bottom[bot_h_header : bot_h_header + row_h, :], 'base_y': bot_h_header})
+        valid_w_slice = slice(w_left, w_bot - w_right if w_right > 0 else None)
+        best_candidate = None
+        for item_top in candidates_top:
+            gray_top = cv2.cvtColor(item_top['img'][:, valid_w_slice], cv2.COLOR_BGR2GRAY)
+            if cv2.meanStdDev(gray_top)[1][0][0] < ImageMatcher.THRES_TEXTURE:
+                continue
+            for item_bot in candidates_bot:
+                gray_bot = cv2.cvtColor(item_bot['img'][:, valid_w_slice], cv2.COLOR_BGR2GRAY)
+                if cv2.meanStdDev(gray_bot)[1][0][0] < ImageMatcher.THRES_TEXTURE:
+                    continue
+                chosen_h = -1
+                min_mae = 1.0
+                for h in range(row_h, 0, -1):
+                    slice_top = item_top['img'][row_h - h :, :]
+                    slice_bot = item_bot['img'][0 : h, :]
+                    mb = cv2.mean(cv2.absdiff(slice_top, slice_bot))
+                    mae = (mb[0] + mb[1] + mb[2]) / (3 * 255.0)
+                    if mae < ImageMatcher.THRES_ABS_GOOD:
+                        chosen_h = h
+                        min_mae = mae
+                        break
+                    if mae < min_mae:
+                        chosen_h = h
+                        min_mae = mae
+                if chosen_h > 0 and min_mae < ImageMatcher.THRES_ABS_VALID:
+                    shift = (item_top['base_y'] + row_h - chosen_h) - item_bot['base_y']
+                    match_y_bot = item_bot['base_y']
+                    score, cut_y = ImageMatcher.verify_region(img_top, img_bottom, shift, match_y_bot, static_bars, box_shift)
+                    if score > ImageMatcher.THRES_SCORE:
+                        if best_candidate is None or score > best_candidate['score'] or (abs(score - best_candidate['score']) < 0.1 and shift < best_candidate['shift']):
+                            best_candidate = {'score': score, 'shift': shift, 'cut_y': cut_y}
+        if best_candidate:
+            return best_candidate['shift'], best_candidate['cut_y']
+        return None
 
 def stitch_images_in_memory_from_model(render_plan: list, image_width: int, total_height: int, progress_callback=None):
     if not render_plan:
         return None
     num_pieces = len(render_plan)
-    final_width_int = int(round(image_width))
-    final_height_int = int(round(total_height))
-    logging.debug(f"开始从 {num_pieces} 个渲染片段拼接图像，最终尺寸: {final_width_int}x{final_height_int} (原始浮点高度: {total_height})")
-    pil_cache = {}
+    logging.debug(f"开始从 {num_pieces} 个渲染片段拼接图像，最终尺寸: {image_width}x{total_height}")
+    current_img_path = None
     try:
-        stitched_image = Image.new('RGBA', (final_width_int, final_height_int))
-        y_offset = 0
+        stitched_image = np.zeros((total_height, image_width, 3), dtype=np.uint8)
         for i, piece in enumerate(render_plan):
             filepath = piece['filepath']
             src_y = piece['src_y']
-            src_height = piece['height']
+            height = piece['height']
             dest_y = piece['render_y_start']
             try:
-                if filepath not in pil_cache:
-                    pil_cache[filepath] = Image.open(filepath)
-                img_pil = pil_cache[filepath]
-                box_upper = int(round(src_y))
-                box_lower = int(round(src_y + src_height))
-                box = (0, box_upper, img_pil.width, box_lower)
-                cropped_img = img_pil.crop(box)
-                if cropped_img.width != final_width_int:
-                    logging.warning(f"图片片段 {filepath} 宽度 {cropped_img.width} 与预期 {final_width_int} 不符")
-                stitched_image.paste(cropped_img, (0, int(round(dest_y))))
+                if filepath != current_img_path:
+                    current_img = cv2.imread(str(filepath))
+                    if current_img is None:
+                        raise ValueError(f"cv2 无法读取图片: {filepath}")
+                    current_img_path = filepath
+                img_h, img_w = current_img.shape[:2]
+                if img_w != image_width:
+                    logging.warning(f"图片片段 {filepath} 宽度 {img_w} 与预期 {image_width} 不符")
+                copy_h = min(height, img_h - src_y)
+                copy_w = min(image_width, img_w)
+                stitched_image[dest_y:dest_y + copy_h, :copy_w] = current_img[src_y:src_y + copy_h, :copy_w]
             except Exception as e_load:
-                logging.error(f"加载/裁剪/粘贴图片失败 {filepath} (src_y={src_y}): {e_load}")
+                logging.error(f"拼接图片失败 {filepath}：{e_load}")
             if progress_callback:
-                GLib.idle_add(progress_callback, (i + 1) / num_pieces)
+                progress_callback((i + 1) / num_pieces)
         logging.info("图像拼接完成")
         return stitched_image
     except Exception as e:
         msg = f"拼接图像时发生错误: {e}"
         logging.error(msg)
-        GLib.idle_add(send_desktop_notification, "拼接失败", msg, "dialog-error", "critical")
+        GLib.idle_add(send_notification, "拼接失败", msg, "critical", "dialog-error")
         return None
-    finally:
-        for img in pil_cache.values():
-            img.close()
-        logging.debug(f"PIL 缓存中的 {len(pil_cache)} 张图片已关闭")
 # 缓冲区px }
-
-def copy_to_clipboard(image_path: Path) -> bool:
-    """使用 Gtk.Clipboard 将图片复制到剪贴板"""
-    copy_start_time = time.perf_counter()
-    try:
-        pixbuf = GdkPixbuf.Pixbuf.new_from_file(str(image_path))
-        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        clipboard.set_image(pixbuf)
-        copy_duration = time.perf_counter() - copy_start_time
-        logging.info(f"图片 {image_path} 已通过 GTK 复制到剪贴板，耗时: {copy_duration:.3f} 秒")
-        return True
-    except GLib.Error as e:
-        copy_duration = time.perf_counter() - copy_start_time
-        logging.error(f"使用 GTK 复制到剪贴板失败: {e}，耗时: {copy_duration:.3f} 秒")
-        GLib.idle_add(lambda: send_desktop_notification("复制失败", f"无法写入剪贴板: {e}", level="warning"))
-        return False
-
-def create_feedback_panel(text, show_progress_bar=False):
-    # 逻辑px
-    container = Gtk.EventBox()
-    container.set_visible_window(False)
-    panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=config.PROCESSING_DIALOG_SPACING // 2)
-    container.add(panel)
-    panel.get_style_context().add_class("processing-dialog-bg")
-    top_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=config.PROCESSING_DIALOG_SPACING)
-    spinner = Gtk.Spinner()
-    spinner.start()
-    label = Gtk.Label()
-    label.set_markup(f"<span color='white'>{GLib.markup_escape_text(text)}</span>")
-    top_hbox.pack_start(spinner, True, True, 0)
-    top_hbox.pack_start(label, True, True, 0)
-    panel.set_border_width(config.PROCESSING_DIALOG_BORDER_WIDTH)
-    panel.pack_start(top_hbox, True, True, 0)
-    progress_bar = None
-    if show_progress_bar:
-        progress_bar = Gtk.ProgressBar()
-        progress_bar.set_fraction(0.0)
-        panel.pack_start(progress_bar, True, True, 5)
-    container.set_size_request(config.PROCESSING_DIALOG_WIDTH, config.PROCESSING_DIALOG_HEIGHT)
-    container.show_all()
-    return container, progress_bar
-
-class CalibrationWidget(Gtk.DrawingArea):
-    """用于坐标校准的控件，绘制特定的点阵图案"""
-    # 逻辑px
-    def __init__(self):
-        super().__init__()
-        self.pixel_scale = 2
-        self.padding = 12
-        self.content_w = 48 * self.pixel_scale
-        self.content_h = 16 * self.pixel_scale
-        self.set_size_request(self.content_w + self.padding * 2, self.content_h + self.padding * 2)
-        self.bitmap = self.get_calibration_bitmap()
-
-    def get_calibration_bitmap(self):
-        bitmap = np.zeros((16, 48), dtype=bool)
-        # 校准用的 HZK16 点阵数据 (拼, 长, 图)
-        CALIBRATION_BYTES_PIN = b'\x12\x08\x11\x18\x10\xa0\x13\xfc\xfd\x10\x11\x10\x15\x10\x19\x147\xfe\xd1\x10\x11\x10\x11\x10\x11\x10\x11\x10R\x10$\x10'
-        CALIBRATION_BYTES_CHANG = b'\x08\x00\x08\x10\x080\x08@\x08\x80\t\x00\x08\x04\xff\xfe\t\x00\t\x00\x08\x80\x08@\x08 \t\x1c\x0e\x08\x08\x00'
-        CALIBRATION_BYTES_TU = b'\x00\x04\x7f\xfeD\x04G\xe4LDR\x84A\x04B\x84FDI<p\x94F\x04A\x04@\x84\x7f\xfc@\x04'
-        data_list = [CALIBRATION_BYTES_PIN, CALIBRATION_BYTES_CHANG, CALIBRATION_BYTES_TU]
-        for char_idx, char_bytes in enumerate(data_list):
-            x_offset = char_idx * 16
-            for row in range(16):
-                b1 = char_bytes[row * 2]
-                b2 = char_bytes[row * 2 + 1]
-                for bit in range(8):
-                    if b1 & (0x80 >> bit): bitmap[row, x_offset + bit] = True
-                    if b2 & (0x80 >> bit): bitmap[row, x_offset + 8 + bit] = True
-        return bitmap
-
-    def do_draw(self, cr):
-        w = self.get_allocated_width()
-        h = self.get_allocated_height()
-        cr.set_source_rgb(0.15, 0.15, 0.15)
-        radius = 8
-        degrees = math.pi / 180.0
-        cr.new_sub_path()
-        cr.arc(w - radius, radius, radius, -90 * degrees, 0 * degrees)
-        cr.arc(w - radius, h - radius, radius, 0 * degrees, 90 * degrees)
-        cr.arc(radius, h - radius, radius, 90 * degrees, 180 * degrees)
-        cr.arc(radius, radius, radius, 180 * degrees, 270 * degrees)
-        cr.close_path()
-        cr.fill()
-        cr.translate(self.padding, self.padding)
-        cr.set_source_rgb(1, 1, 1)
-        # 关闭抗锯齿
-        cr.set_antialias(cairo.ANTIALIAS_NONE)
-        rows, cols = self.bitmap.shape
-        ps = self.pixel_scale
-        for y in range(rows):
-            for x in range(cols):
-                if self.bitmap[y, x]:
-                    cr.rectangle(x * ps, y * ps, ps, ps)
-        cr.fill()
-        return False
 
 class StitchModel(GObject.Object):
     """管理拼接数据的模型，支持异步更新和信号通知"""
@@ -1547,6 +2117,7 @@ class StitchModel(GObject.Object):
     __gsignals__ = {
         'model-updated': (GObject.SignalFlags.RUN_FIRST, None, ()),
         'modification-stack-changed': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'image-ready': (GObject.SignalFlags.RUN_FIRST, None, (str, object)),
     }
     def __init__(self):
         super().__init__()
@@ -1555,112 +2126,126 @@ class StitchModel(GObject.Object):
         self.total_virtual_height = 0
         self.modifications = []
         self.redo_stack = []
-        self.absolute_plan = []    # 基础层
-        self.collapsed_plan = []   # 中间层
-        self.render_plan = []      # 渲染层
-        self.pixbuf_cache = collections.OrderedDict()
-        self.CACHE_SIZE = config.parser.getint('Performance', 'preview_cache_size', fallback=10)
+        self.render_plan = [] # 渲染层
+        self.merged_del_regions = []
+        self.surface_cache = collections.OrderedDict()
+        self.CACHE_SIZE = config.PREVIEW_CACHE_SIZE
+        self._load_queue = []
+        self._loading_set = set()
+        self._roi_filepaths = set()
+        self._queue_lock = threading.Lock()
+        self._worker_condition = threading.Condition(self._queue_lock)
+        self._worker_running = True
+        self._loader_thread = threading.Thread(target=self._image_loader_worker, daemon=True, name="ImageLoader")
+        self._loader_thread.start()
 
     @property
     def capture_count(self) -> int:
-        """返回当前截图数量"""
         return len(self.entries)
 
-    def _get_cached_pixbuf(self, filepath):
-        if filepath in self.pixbuf_cache:
-            self.pixbuf_cache.move_to_end(filepath)
-            return self.pixbuf_cache[filepath]
-        try:
-            pixbuf = GdkPixbuf.Pixbuf.new_from_file(filepath)
-            self.pixbuf_cache[filepath] = pixbuf
-            if len(self.pixbuf_cache) > self.CACHE_SIZE:
-                oldest_key, _ = self.pixbuf_cache.popitem(last=False)
-            return pixbuf
-        except GLib.Error as e:
-            logging.error(f"无法加载图片文件用于缓存 {filepath}: {e}")
-            if filepath in self.pixbuf_cache:
-                 del self.pixbuf_cache[filepath]
-            return None
-        except Exception as e:
-            logging.error(f"加载 Pixbuf 时发生意外错误 {filepath}: {e}")
-            if filepath in self.pixbuf_cache:
-                 del self.pixbuf_cache[filepath]
-            return None
+    def update_roi(self, roi_set):
+        with self._queue_lock:
+            self._roi_filepaths = roi_set
+
+    def request_image(self, filepath):
+        if filepath in self.surface_cache:
+            self.surface_cache.move_to_end(filepath)
+            return self.surface_cache[filepath]
+        with self._queue_lock:
+            if filepath in self._loading_set:
+                return None
+            self._loading_set.add(filepath)
+            self._load_queue.append(filepath)
+            self._worker_condition.notify()
+        return None
+
+    def _image_loader_worker(self):
+        while True:
+            filepath_to_load = None
+            with self._worker_condition:
+                while not self._load_queue and self._worker_running:
+                    self._worker_condition.wait()
+                if not self._worker_running:
+                    break
+                candidate = self._load_queue.pop()
+                is_needed = candidate in self._roi_filepaths
+                if is_needed:
+                    filepath_to_load = candidate
+                else:
+                    if candidate in self._loading_set:
+                        self._loading_set.remove(candidate)
+                    continue
+            if filepath_to_load:
+                if not os.path.exists(filepath_to_load):
+                    GLib.idle_add(self._on_image_loaded_ui, filepath_to_load, None)
+                    continue
+                img_bgra = None
+                try:
+                    img_bgr = cv2.imread(str(filepath_to_load))
+                    if img_bgr is not None:
+                        img_bgra = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2BGRA)
+                except Exception as e:
+                    logging.warning(f"异步加载图片失败 {filepath_to_load}: {e}")
+                GLib.idle_add(self._on_image_loaded_ui, filepath_to_load, img_bgra)
+
+    def _on_image_loaded_ui(self, filepath, img_bgra):
+        with self._queue_lock:
+            if filepath in self._loading_set:
+                self._loading_set.remove(filepath)
+        if img_bgra is not None:
+            surface = cairo.ImageSurface.create_for_data(img_bgra, cairo.FORMAT_ARGB32, img_bgra.shape[1], img_bgra.shape[0], img_bgra.strides[0])
+            self.surface_cache[filepath] = (surface, img_bgra)
+            self.surface_cache.move_to_end(filepath)
+            self._prune_cache()
+            self.emit('image-ready', filepath, surface)
+
+    def update_cache_limit(self, new_size):
+        self.CACHE_SIZE = new_size
+        self._prune_cache()
+
+    def _prune_cache(self):
+        excess = len(self.surface_cache) - self.CACHE_SIZE
+        if excess <= 0: return
+        keys_to_evict = []
+        for key in self.surface_cache:
+            if key not in self._roi_filepaths:
+                keys_to_evict.append(key)
+                if len(keys_to_evict) == excess:
+                    break
+        for key in keys_to_evict:
+            del self.surface_cache[key]
 
     def _regenerate_plans(self):
-        """依次生成三层：Absolute, Collapsed, Render"""
-        if not self.entries:
-            self.total_virtual_height = 0
-            self.absolute_plan = []
-            self.collapsed_plan = []
-            self.render_plan = []
-            GLib.idle_add(self.emit, 'model-updated')
-            return
-        self._generate_absolute_plan()
-        self._generate_collapsed_plan()
-        self._generate_render_plan()
-        GLib.idle_add(self.emit, 'model-updated')
-
-    def _generate_absolute_plan(self):
-        self.absolute_plan = []
-        current_a_y = 0
-        if not self.entries:
-            self.total_absolute_height = 0
-            return
-        for i, entry in enumerate(self.entries):
-            self.absolute_plan.append({
-                'entry_index': i,
-                'filepath': entry['filepath'],
-                'absolute_y_start': current_a_y,
-                'height': entry['height'],
-                'overlap_with_next': entry['overlap'] if i < len(self.entries) - 1 else 0
-            })
-            current_a_y += entry['height']
-        self.total_absolute_height = current_a_y
-
-    def _generate_collapsed_plan(self):
-        self.collapsed_plan = []
-        current_c_y = 0
-        if not self.absolute_plan:
-            self.total_collapsed_height = 0
-            return
-        restored_seams = {mod['seam_index'] for mod in self.modifications if mod['type'] == 'restore'}
-        for i, abs_piece in enumerate(self.absolute_plan):
-            is_last = (i == len(self.absolute_plan) - 1)
-            if is_last:
-                effective_overlap = 0
-            elif i in restored_seams:
-                effective_overlap = 0
-                logging.info(f"接缝 {i} 已恢复，设置 effective_overlap = 0")
-            else:
-                effective_overlap = abs_piece['overlap_with_next']
-            visible_height = abs_piece['height'] - effective_overlap
-            self.collapsed_plan.append({
-                'entry_index': abs_piece['entry_index'],
-                'filepath': abs_piece['filepath'],
-                'absolute_y_start': abs_piece['absolute_y_start'],
-                'absolute_y_end': abs_piece['absolute_y_start'] + abs_piece['height'],
-                'collapsed_y_start': current_c_y,
-                'height': visible_height,
-                'src_y': 0,
-                'original_height': abs_piece['height']
-            })
-            current_c_y += visible_height
-        self.total_collapsed_height = current_c_y
-
-    def _generate_render_plan(self):
+        """生成渲染层并通知视图更新"""
         self.render_plan = []
         current_r_y = 0
-        if not self.collapsed_plan:
-            self.total_virtual_height = 0
-            return
-        delete_regions = [(mod['y_start_abs'], mod['y_end_abs']) 
-                          for mod in self.modifications if mod['type'] == 'delete']
-        for collapsed_piece in self.collapsed_plan:
-            piece_abs_start = collapsed_piece['absolute_y_start']
-            piece_abs_end = collapsed_piece['absolute_y_start'] + collapsed_piece['original_height']
-            visible_intervals = [(piece_abs_start, piece_abs_end)]
-            for del_start, del_end in delete_regions:
+        restored_seams = {mod['seam_index'] for mod in self.modifications if mod['type'] == 'restore'}
+        raw_deletes = [(mod['y_start_abs'], mod['y_end_abs']) for mod in self.modifications if mod['type'] == 'delete']
+        raw_deletes.sort(key=lambda x: x[0])
+        merged_deletes = []
+        for start, end in raw_deletes:
+            if merged_deletes and start <= merged_deletes[-1][1]:
+                merged_deletes[-1] = (merged_deletes[-1][0], max(merged_deletes[-1][1], end))
+            else:
+                merged_deletes.append((start, end))
+        self.merged_del_regions = merged_deletes
+        for i, entry in enumerate(self.entries):
+            c_top = entry['crop_top']
+            c_bottom = entry['crop_bottom']
+            original_h = entry['height']
+            if i in restored_seams:
+                c_bottom = original_h
+            if (i - 1) in restored_seams:
+                c_top = 0
+            entry_abs_origin = entry['absolute_y_start']
+            valid_abs_start = entry_abs_origin + c_top
+            valid_abs_end = entry_abs_origin + c_bottom
+            if valid_abs_start >= valid_abs_end:
+                continue
+            visible_intervals = [(valid_abs_start, valid_abs_end)]
+            for del_start, del_end in self.merged_del_regions:
+                if not visible_intervals:
+                    break
                 new_intervals = []
                 for vis_start, vis_end in visible_intervals:
                     if del_start < vis_end and del_end > vis_start:
@@ -1671,22 +2256,14 @@ class StitchModel(GObject.Object):
                     else:
                         new_intervals.append((vis_start, vis_end))
                 visible_intervals = new_intervals
-            final_render_intervals = []
-            c_visible_abs_start = collapsed_piece['absolute_y_start']
-            c_visible_abs_end = collapsed_piece['absolute_y_start'] + collapsed_piece['height']
-            for vis_start, vis_end in visible_intervals:
-                final_abs_start = max(vis_start, c_visible_abs_start)
-                final_abs_end = min(vis_end, c_visible_abs_end)
-                if final_abs_end > final_abs_start:
-                    final_render_intervals.append((final_abs_start, final_abs_end))
-            for abs_start, abs_end in final_render_intervals:
+            for abs_start, abs_end in visible_intervals:
                 height = abs_end - abs_start
-                if height <= 1e-5:
+                if height < 1:
                     continue
-                src_y = abs_start - collapsed_piece['absolute_y_start']
+                src_y = abs_start - entry_abs_origin
                 self.render_plan.append({
-                    'entry_index': collapsed_piece['entry_index'],
-                    'filepath': collapsed_piece['filepath'],
+                    'entry_index': i,
+                    'filepath': entry['filepath'],
                     'absolute_y_start': abs_start,
                     'absolute_y_end': abs_end,
                     'render_y_start': current_r_y,
@@ -1695,9 +2272,9 @@ class StitchModel(GObject.Object):
                 })
                 current_r_y += height
         self.total_virtual_height = current_r_y
+        GLib.idle_add(self.emit, 'model-updated')
 
     def undo(self):
-        """撤销上一个修改"""
         if not self.modifications:
             logging.debug("StitchModel: 撤销栈为空，无操作")
             return
@@ -1708,7 +2285,6 @@ class StitchModel(GObject.Object):
         GLib.idle_add(self.emit, 'modification-stack-changed')
 
     def redo(self):
-        """重做上一个撤销的修改"""
         if not self.redo_stack:
             logging.debug("StitchModel: 重做栈为空，无操作")
             return
@@ -1724,63 +2300,86 @@ class StitchModel(GObject.Object):
         if self.redo_stack:
             logging.debug("StitchModel: 新修改导致重做栈被清空")
             self.redo_stack.clear()
-        GLib.idle_add(self.emit, 'modification-stack-changed')
         GLib.idle_add(self._regenerate_plans)
+        GLib.idle_add(self.emit, 'modification-stack-changed')
 
-    def add_entry(self, filepath: str, width: int, height: int, overlap_with_previous: int):
-        logging.debug(f"主线程: 收到添加请求: {filepath}, h={height}, overlap={overlap_with_previous}")
+    def add_entry(self, filepath: str, width: int, height: int, shift: int, cut_y: int, box_y: int, thumb_data, full_img_data):
+        logging.debug(f"StitchModel: 收到添加请求: {Path(filepath).name}, h={height}, shift={shift}, cut_y={cut_y}")
+        thumb_bundle = None
+        if thumb_data:
+            try:
+                t_array, t_w, t_h, t_stride = thumb_data
+                thumb_surface = cairo.ImageSurface.create_for_data(t_array, cairo.FORMAT_ARGB32, t_w, t_h, t_stride)
+                thumb_bundle = (thumb_surface, t_array)
+            except Exception as e:
+                logging.warning(f"创建缩略图失败: {e}")
+        preloaded_bundle = None
+        if full_img_data:
+            try:
+                f_array, f_w, f_h, f_stride = full_img_data
+                preloaded_surface = cairo.ImageSurface.create_for_data(f_array, cairo.FORMAT_ARGB32, f_w, f_h, f_stride)
+                preloaded_bundle = (preloaded_surface, f_array)
+            except Exception as e:
+                logging.warning(f"创建预加载全图失败: {e}")
         if not self.entries:
             self.image_width = width
-            self.entries.append({'filepath': filepath, 'height': height, 'overlap': 0})
+            self.entries.append({'filepath': filepath, 'height': height, 'crop_top': 0, 'crop_bottom': height, 'shift': 0, 'box_y': box_y, 'absolute_y_start': 0, 'thumb': thumb_bundle})
         else:
-            self.entries[-1]['overlap'] = overlap_with_previous
-            self.entries.append({'filepath': filepath, 'height': height, 'overlap': 0})
-        logging.info(f"添加第 {len(self.entries)} 张截图, 滚动距离: {height - overlap_with_previous}px")
+            prev_entry = self.entries[-1]
+            new_abs_start = prev_entry['absolute_y_start'] + prev_entry['height']
+            calculated_bottom = cut_y + shift
+            if calculated_bottom < prev_entry['crop_top']:
+                logging.debug(f"StitchModel: 修正负高度重叠，entry {len(self.entries)-1} 修正后高度为 0")
+                prev_entry['crop_bottom'] = prev_entry['crop_top']
+                cut_y = prev_entry['crop_bottom'] - shift
+            else:
+                prev_entry['crop_bottom'] = calculated_bottom
+            self.entries.append({'filepath': filepath, 'height': height, 'crop_top': cut_y, 'crop_bottom': height, 'shift': shift, 'box_y': box_y, 'absolute_y_start': new_abs_start, 'thumb': thumb_bundle})
+            logging.info(f"添加第 {len(self.entries)} 张截图. prev_bottom: {prev_entry['crop_bottom']}, curr_top: {cut_y}, shift: {shift}")
+        if preloaded_bundle:
+            self.surface_cache[filepath] = preloaded_bundle
+            self.surface_cache.move_to_end(filepath)
+            self._prune_cache()
         GLib.idle_add(self._regenerate_plans)
 
     def pop_entry(self):
         if not self.entries:
             return
-        logging.debug("主线程: 收到移除最后一个条目的请求")
+        logging.debug("StitchModel: 收到移除最后一个条目的请求")
         last_entry_index = len(self.entries) - 1
-        last_abs_piece = None
-        if self.absolute_plan and len(self.absolute_plan) > last_entry_index:
-            last_abs_piece = self.absolute_plan[last_entry_index]
-        elif self.absolute_plan:
-            logging.warning(f"pop_entry: absolute_plan (len {len(self.absolute_plan)}) 与 entries (len {len(self.entries)}) 不同步")
-        if last_abs_piece:
-            entry_abs_start = last_abs_piece['absolute_y_start']
-            entry_abs_end = last_abs_piece['absolute_y_start'] + last_abs_piece['height']
-            seam_index_to_remove = last_entry_index - 1
-            logging.debug(f"正在清理与截图 {last_entry_index} (AbsY: [{entry_abs_start}, {entry_abs_end}], SeamIdx: {seam_index_to_remove}) 相关的修改")
-            new_modifications = []
-            removed_count = 0
-            for mod in self.modifications:
-                mod_applies = False
-                if mod['type'] == 'delete':
-                    mod_start = mod['y_start_abs']
-                    mod_end = mod['y_end_abs']
-                    if max(entry_abs_start, mod_start) < min(entry_abs_end, mod_end):
-                        mod_applies = True
-                        logging.debug(f"删除操作 {mod} 与被删除截图重叠，将被移除")
-                elif mod['type'] == 'restore':
-                    if mod['seam_index'] == seam_index_to_remove:
-                         mod_applies = True
-                         logging.debug(f"恢复操作 {mod} 与被删除截图相关，将被移除")
-                if mod_applies:
-                    removed_count += 1
-                else:
-                    new_modifications.append(mod)
-            if removed_count > 0:
-                self.modifications = new_modifications
-                logging.debug(f"已移除 {removed_count} 个与被删除截图相关的修改")
-                if self.redo_stack:
-                    self.redo_stack.clear()
-                    logging.debug("由于删除了截图，重做栈已清空")
-                GLib.idle_add(self.emit, 'modification-stack-changed')
+        last_entry = self.entries[last_entry_index]
+        entry_abs_start = last_entry['absolute_y_start']
+        entry_abs_end = last_entry['absolute_y_start'] + last_entry['height']
+        seam_index_to_remove = last_entry_index - 1
+        logging.debug(f"正在清理与截图 {last_entry_index} (abs_y: [{entry_abs_start}, {entry_abs_end}], seam_idx: {seam_index_to_remove}) 相关的修改")
+        new_modifications = []
+        removed_count = 0
+        for mod in self.modifications:
+            mod_applies = False
+            if mod['type'] == 'delete':
+                mod_start = mod['y_start_abs']
+                mod_end = mod['y_end_abs']
+                if max(entry_abs_start, mod_start) < min(entry_abs_end, mod_end):
+                    mod_applies = True
+                    logging.debug(f"删除操作 {mod} 与被删除截图重叠，将被移除")
+            elif mod['type'] == 'restore':
+                if mod['seam_index'] == seam_index_to_remove:
+                    mod_applies = True
+                    logging.debug(f"恢复操作 {mod} 与被删除截图相关，将被移除")
+            if mod_applies:
+                removed_count += 1
+            else:
+                new_modifications.append(mod)
+        if removed_count > 0:
+            self.modifications = new_modifications
+            logging.debug(f"已移除 {removed_count} 个与被删除截图相关的修改")
+            if self.redo_stack:
+                self.redo_stack.clear()
+                logging.debug("由于删除了截图，重做栈已清空")
+            GLib.idle_add(self.emit, 'modification-stack-changed')
         popped_entry = self.entries.pop()
-        if popped_entry['filepath'] in self.pixbuf_cache:
-            del self.pixbuf_cache[popped_entry['filepath']]
+        if popped_entry['filepath'] in self.surface_cache:
+            del self.surface_cache[popped_entry['filepath']]
             logging.debug(f"从缓存中移除 {popped_entry['filepath']}")
         try:
             filepath_to_remove = Path(popped_entry['filepath'])
@@ -1790,105 +2389,308 @@ class StitchModel(GObject.Object):
         except OSError as e:
             logging.error(f"删除文件失败 {popped_entry['filepath']}: {e}")
         if self.entries:
-            self.entries[-1]['overlap'] = 0
+            self.entries[-1]['crop_bottom'] = self.entries[-1]['height']
             last_entry = self.entries[-1]
         else:
             self.image_width = 0
             logging.info("所有截图已移除")
         GLib.idle_add(self._regenerate_plans)
 
-class CaptureSession:
-    """管理一次滚动截图会话的数据和状态"""
-    def __init__(self):
-        self.is_horizontally_locked: bool = False
-        self.geometry: dict = {} # 逻辑px窗口坐标
-        self.detected_app_class: str = None
-        self.is_matching_enabled: bool = False
-        self.known_scroll_distances = [] # 缓冲区px
-
-    def update_geometry(self, new_geometry):
-        """更新捕获区域的几何信息，并确保所有值为整数"""
-        # new_geometry: 逻辑px窗口坐标
-        self.geometry = {key: int(value) for key, value in new_geometry.items()}
-
     def cleanup(self):
-        """清理临时文件和目录"""
-        if config.TMP_DIR.exists():
-            try:
-                shutil.rmtree(config.TMP_DIR)
-            except OSError as e:
-                logging.error(f"清理临时目录失败: {e}")
+        self._worker_running = False
+        with self._queue_lock:
+            self._worker_condition.notify_all()
+        if self._loader_thread.is_alive():
+            self._loader_thread.join(timeout=0.5)
+
+class CaptureMode(str, Enum):
+    FREE = "自由模式"
+    GRID = "整格模式"
+    AUTO = "自动模式"
+
+class Context(str, Enum):
+    BASE = "base"
+    SELECTING = "selecting"
+    DIALOG = "dialog"
+
+class CaptureSession(GObject.Object):
+    """管理会话的数据和状态"""
+    __gsignals__ = {
+        'state-changed': (GObject.SignalFlags.RUN_FIRST, None, (str, object)),
+        'context-changed': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'mode-changed': (GObject.SignalFlags.RUN_FIRST, None, (str,)),
+        'geometry-changed': (GObject.SignalFlags.RUN_FIRST, None, (object,)),
+        'static-bars-changed': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'grid-config-changed': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'screen-config-changed': (GObject.SignalFlags.RUN_FIRST, None, ()),
+    }
+    def __init__(self):
+        super().__init__()
+        self.current_mode = CaptureMode.FREE
+        self.scroll_stat_history = collections.defaultdict(lambda: collections.deque(maxlen=5))
+        self.scale = 1.0
+        # 逻辑px
+        self.geometry: dict = {} # 窗口坐标
+        self.screen_rect = None # 全局坐标
+        self.monitor_offset_x = 0
+        self.monitor_offset_y = 0
+        self.static_bars = (0, 0, 0, 0)
+        self.grid_app_class = None
+        self.grid_unit = 0 # 缓冲区px
+        self.grid_matching_enabled = False
+        self.is_horizontally_locked = False
+        self.is_selection_done = False
+        self.is_exiting = False
+        self.is_finished = False
+        self.context_stack = []
+        self.context_lock = threading.Lock()
+
+    def push_context(self, context: Context):
+        with self.context_lock:
+            self.context_stack.append(context)
+            logging.debug(f"上下文 {context.value} 入栈，当前栈: {[c.value for c in self.context_stack]}")
+        self.emit('context-changed')
+
+    def pop_context(self, context: Context = None):
+        with self.context_lock:
+            if not self.context_stack: return
+            if context and self.context_stack[-1] != context:
+                logging.warning(f"尝试弹出的上下文 {context.value} 与栈顶 {self.context_stack[-1].value} 不匹配，强制弹出栈顶")
+            popped = self.context_stack.pop()
+            logging.debug(f"上下文 {popped.value} 出栈，当前栈: {[c.value for c in self.context_stack]}")
+        self.emit('context-changed')
+
+    def clear_context(self):
+        with self.context_lock:
+            logging.debug(f"清空当前上下文栈: {[c.value for c in self.context_stack]}")
+            self.context_stack.clear()
+        self.emit('context-changed')
+
+    def get_current_context(self):
+        with self.context_lock:
+            return self.context_stack[-1] if self.context_stack else None
+
+    def set_geometry(self, new_geometry):
+        """更新捕获区域的几何信息"""
+        # new_geometry: 逻辑px窗口坐标
+        clean_geometry = {key: float(value) for key, value in new_geometry.items()}
+        if self.geometry != clean_geometry:
+            self.geometry = clean_geometry
+            self.emit('geometry-changed', self.geometry)
+
+    def set_selection_done(self, done: bool):
+        if self.is_selection_done != done:
+            self.is_selection_done = done
+            self.emit('state-changed', 'is_selection_done', done)
+
+    def set_exiting(self, exiting: bool):
+        if self.is_exiting != exiting:
+            self.is_exiting = exiting
+            self.emit('state-changed', 'is_exiting', exiting)
+
+    def set_finished(self, finished: bool):
+        if self.is_finished != finished:
+            self.is_finished = finished
+            self.emit('state-changed', 'is_finished', finished)
+
+    def set_mode(self, mode: CaptureMode):
+        if self.current_mode != mode:
+            self.current_mode = mode
+            self.emit('mode-changed', mode.value)
+
+    def set_grid_config(self, app_class: str, unit: int, matching_enabled: bool):
+        if self.grid_app_class != app_class or self.grid_unit != unit or self.grid_matching_enabled != matching_enabled:
+            self.grid_app_class = app_class
+            self.grid_unit = unit
+            self.grid_matching_enabled = matching_enabled
+            self.emit('grid-config-changed')
+
+    def set_screen_config(self, rect=None, scale=None, offset_x=None, offset_y=None):
+        changed = False
+        if rect is not None and self.screen_rect != rect:
+            self.screen_rect = rect
+            changed = True
+        if scale is not None and self.scale != scale:
+            self.scale = scale
+            changed = True
+        if offset_x is not None and self.monitor_offset_x != offset_x:
+            self.monitor_offset_x = offset_x
+            changed = True
+        if offset_y is not None and self.monitor_offset_y != offset_y:
+            self.monitor_offset_y = offset_y
+            changed = True
+        if changed:
+            self.emit('screen-config-changed')
+
+    def set_static_bars(self, header_buf, footer_buf, left_buf, right_buf):
+        s = self.scale
+        new_bars = (header_buf / s, footer_buf / s, left_buf / s, right_buf / s) # 缓冲区px -> 逻辑px
+        if self.static_bars != new_bars:
+            self.static_bars = new_bars
+            logging.debug(f"更新静态栏指示: T={header_buf}, B={footer_buf}, L={left_buf}, R={right_buf}")
+            self.emit('static-bars-changed')
 
 # 逻辑px {
-class AppClassInputDialog(Gtk.Dialog):
-    def __init__(self, parent):
-        super().__init__(title="输入应用标识符", transient_for=parent, flags=0)
-        self.add_buttons(
-            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-            Gtk.STOCK_OK, Gtk.ResponseType.OK
-        )
-        self.set_default_size(300, 120)
-        self.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
-        self.set_border_width(10)
-        box = self.get_content_area()
-        box.set_spacing(10)
-        label = Gtk.Label(label="无法自动检测底层应用\n请输入一个名称来保存/加载此应用的滚动配置：")
+class FeedbackWidget(EmbeddedWidget):
+    def __init__(self, parent_overlay, text, show_progress=False):
+        super().__init__(css_class="feedback-panel")
+        self.overlay = parent_overlay
+        self.show_progress = show_progress
+        self.set_size_request(config.FEEDBACK_WIDGET_WIDTH, -1)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(vbox)
+        top_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        top_hbox.set_margin_top(10)
+        top_hbox.set_margin_start(10)
+        top_hbox.set_margin_end(10)
+        top_hbox.set_margin_bottom(10)
+        self.spinner = Gtk.Spinner()
+        self.spinner.start()
+        self.spinner.get_style_context().add_class("feedback-spinner")
+        self.label = Gtk.Label()
+        self.label.set_justify(Gtk.Justification.CENTER)
+        self.label.set_line_wrap(True)
+        self.label.get_style_context().add_class("feedback-label")
+        self.set_text(text)
+        top_hbox.pack_start(self.spinner, False, False, 0)
+        top_hbox.pack_start(self.label, True, True, 0)
+        vbox.pack_start(top_hbox, True, True, 0)
+        self.progress_bar = None
+        if show_progress:
+            self.progress_bar = Gtk.ProgressBar()
+            self.progress_bar.get_style_context().add_class("feedback-progress")
+            self.progress_bar.set_fraction(0.0)
+            self.progress_bar.set_margin_start(10)
+            self.progress_bar.set_margin_end(10)
+            self.progress_bar.set_margin_bottom(15)
+            vbox.pack_start(self.progress_bar, False, False, 0)
+
+    def set_text(self, text):
+        self.label.set_text(text)
+
+    def set_progress(self, fraction):
+        if self.progress_bar:
+            self.progress_bar.set_fraction(fraction)
+
+class EmbeddedDialog(EmbeddedWidget):
+    __gsignals__ = {
+        'response': (GObject.SignalFlags.RUN_FIRST, None, (int,)),
+    }
+    def __init__(self, title, css_class="embedded-dialog"):
+        super().__init__(css_class=css_class)
+        self.set_can_focus(True)
+        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(self.main_box)
+        self.header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.header_box.get_style_context().add_class("dialog-header")
+        self.main_box.pack_start(self.header_box, False, False, 0)
+        self.lbl_title = Gtk.Label(label=title)
+        self.lbl_title.get_style_context().add_class("dialog-title")
+        self.header_box.pack_start(self.lbl_title, True, True, 0)
+        self.content_area = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        self.content_area.get_style_context().add_class("dialog-content-area")
+        self.main_box.pack_start(self.content_area, True, True, 0)
+        self.action_area = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=15)
+        self.action_area.set_halign(Gtk.Align.CENTER)
+        self.action_area.get_style_context().add_class("dialog-action-area")
+        self.main_box.pack_end(self.action_area, False, False, 0)
+
+    def add_button(self, text, response_id, css_class="dialog-btn"):
+        btn = Gtk.Button(label=text)
+        if css_class:
+            btn.get_style_context().add_class(css_class)
+        btn.connect("clicked", lambda w: self.emit("response", response_id))
+        self.action_area.pack_start(btn, False, False, 0)
+        return btn
+
+    def create_default_buttons(self):
+        confirm_key_name = config.HOTKEY_DIALOG_CONFIRM.to_string()
+        cancel_key_name = config.HOTKEY_DIALOG_CANCEL.to_string()
+        confirm_text = f"确定 ({confirm_key_name})"
+        cancel_text = f"取消 ({cancel_key_name})"
+        self.add_button(confirm_text, Gtk.ResponseType.OK)
+        self.add_button(cancel_text, Gtk.ResponseType.CANCEL)
+
+    def get_result(self):
+        return None
+
+class QuitDialog(EmbeddedDialog):
+    def __init__(self, capture_count):
+        title = "确认放弃截图？"
+        super().__init__(title)
+        msg = f"您已经截取了 {capture_count} 张图片\n确定要放弃它们吗？"
+        lbl_msg = Gtk.Label(label=msg)
+        lbl_msg.set_line_wrap(True)
+        lbl_msg.set_justify(Gtk.Justification.CENTER)
+        lbl_msg.set_xalign(0.5)
+        lbl_msg.get_style_context().add_class("dialog-message")
+        self.content_area.pack_start(lbl_msg, False, False, 0)
+        self.create_default_buttons()
+
+class AppConfigDialog(EmbeddedDialog):
+    """应用配置选择/输入对话框"""
+    def __init__(self, config_obj, allow_new_entry=False):
+        title = "请输入应用标识符" if allow_new_entry else "请选择应用配置"
+        super().__init__(title)
+        self.allow_new_entry = allow_new_entry
+        self.selected_app = None
+        label_text = "无法自动检测底层应用\n请输入名称以保存配置：" if allow_new_entry else "请选择一个已校准的配置："
+        label = Gtk.Label(label=label_text)
         label.set_line_wrap(True)
-        label.set_xalign(0)
-        box.pack_start(label, False, False, 0)
-        self.entry = Gtk.Entry()
-        self.entry.set_placeholder_text("例如: chrome, vscode, novel-reader...")
-        self.entry.connect("activate", lambda w: self.response(Gtk.ResponseType.OK))
-        box.pack_start(self.entry, False, False, 0)
-        self.show_all()
-
-    def get_text(self):
-        return self.entry.get_text().strip()
-
-class AppClassSelectionDialog(Gtk.Dialog):
-    def __init__(self, parent, config_obj):
-        super().__init__(title="选择应用配置", transient_for=parent, flags=0)
-        self.add_buttons(
-            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-            Gtk.STOCK_OK, Gtk.ResponseType.OK
-        )
-        self.set_default_size(300, 200)
-        self.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
-        self.set_border_width(10)
-        box = self.get_content_area()
-        box.set_spacing(5)
-        label = Gtk.Label(label="请选择一个已校准的配置：")
-        label.set_xalign(0)
-        box.pack_start(label, False, False, 5)
-        self.combo = Gtk.ComboBoxText()
-        has_items = False
-        if config_obj.parser.has_section('ApplicationScrollUnits'):
-            for key in config_obj.parser['ApplicationScrollUnits']:
-                self.combo.append(key, key)
-                has_items = True
-        if not has_items:
-            self.combo.append("none", "无已保存配置 (请先校准)")
-            self.combo.set_active_id("none")
-            self.combo.set_sensitive(False)
+        label.set_justify(Gtk.Justification.CENTER)
+        label.set_xalign(0.5)
+        label.get_style_context().add_class("dialog-message")
+        label.set_margin_bottom(5)
+        self.content_area.pack_start(label, False, False, 0)
+        self.entry = None
+        if allow_new_entry:
+            self.entry = Gtk.Entry()
+            self.entry.set_placeholder_text("例如: firefox, vscode...")
+            self.entry.connect("activate", lambda w: self.emit("response", Gtk.ResponseType.OK))
+            self.content_area.pack_start(self.entry, False, False, 0)
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_size_request(-1, 150)
+        self.listbox = Gtk.ListBox()
+        self.listbox.get_style_context().add_class("dialog-list-box")
+        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.connect("row-selected", self._on_row_selected)
+        scrolled.add(self.listbox)
+        self.content_area.pack_start(scrolled, True, True, 0)
+        items = config_obj.get_section_items('ApplicationScrollUnits')
+        if not items:
+            empty_lbl = Gtk.Label(label="无已保存的配置")
+            empty_lbl.get_style_context().add_class("dim-label")
+            empty_lbl.show()
+            self.listbox.set_placeholder(empty_lbl)
         else:
-            self.combo.set_active(0)
-        box.pack_start(self.combo, False, False, 0)
-        self.show_all()
+            for key, _ in items:
+                row = Gtk.ListBoxRow()
+                row.get_style_context().add_class("dialog-list-row")
+                lbl = Gtk.Label(label=key, xalign=0)
+                row.add(lbl)
+                row.app_key = key
+                self.listbox.add(row)
+        self.create_default_buttons()
 
-    def get_selected(self):
-        active_id = self.combo.get_active_id()
-        if active_id == "none": return None
-        return active_id
+    def _on_row_selected(self, box, row):
+        if row:
+            self.selected_app = row.app_key
+            if self.entry:
+                self.entry.set_text(self.selected_app)
+
+    def get_result(self):
+        if self.allow_new_entry and self.entry:
+            text = self.entry.get_text().strip().lower()
+            return text if text else None
+        return self.selected_app
 # 逻辑px }
 
 class GridModeController:
-    def __init__(self, config: Config, session: CaptureSession, view: 'CaptureOverlay'):
-        self.config = config
+    def __init__(self, config_obj: Config, session: CaptureSession, view: 'CaptureOverlay'):
+        self.config = config_obj
         self.session = session
         self.view = view
-        self.is_active = False
-        self.grid_unit = 0 # 缓冲区px
-        self._is_toggling = False
         self.calibration_state = None
         if not IS_WAYLAND:
             try:
@@ -1897,21 +2699,22 @@ class GridModeController:
                 self.x_display = None
                 logging.error(f"无法连接到 X Display，整格模式功能将不可用: {e}")
         else:
-            logging.info("检测到 Wayland，Xlib 窗口检测将不可用")
+            logging.info("Wayland 下 Xlib 窗口检测将不可用")
             self.x_display = None
 
-    def _get_window_at_coords(self, d, x: int, y: int):
-        """X11在不移动鼠标的情况下，获取指定全局坐标下的窗口ID和WM_CLASS"""
+    @property
+    def is_active(self):
+        return self.session.current_mode == CaptureMode.GRID
+
+    def _get_window_at_coords(self, d, x, y):
+        """X11 在不移动鼠标的情况下，获取指定全局坐标下的窗口 ID 和 WM_CLASS"""
         # x, y: 逻辑px全局坐标
-        if IS_WAYLAND:
-            logging.debug("_get_window_at_coords 在 Wayland 上不可用。")
+        if IS_WAYLAND or not d:
             return None, None
-        if not d:
-            return None, None
-        scale = self.view.scale
+        scale = self.session.scale
         # 逻辑px -> 缓冲区px
-        buf_x = int(x * scale)
-        buf_y = int(y * scale)
+        buf_x = round(x * scale)
+        buf_y = round(y * scale)
         try:
             root = d.screen().root
             stacking_atom = d.intern_atom('_NET_CLIENT_LIST_STACKING')
@@ -1954,196 +2757,121 @@ class GridModeController:
                     # 缓冲区px
                     win_w = geom.width + border_left + border_right
                     win_h = geom.height + border_top + border_bottom
-                    if not (abs_x <= buf_x < abs_x + win_w and 
+                    if not (abs_x <= buf_x < abs_x + win_w and
                             abs_y <= buf_y < abs_y + win_h):
                         continue
                     wm_class = win_obj.get_wm_class()
                     if wm_class and 'Scroll_stitch.py' not in wm_class[1]:
                         app_class = wm_class[1].lower()
                         logging.debug(
-                            f"定位成功! ID={win_obj.id}, Class={app_class}, Scale={scale}, "
-                            f"AbsGeom=({abs_x},{abs_y},{win_w},{win_h}), PhysPoint=({buf_x},{buf_y})"
+                            f"定位成功，id={win_obj.id}，class={app_class}，scale={scale:.3f}，"
+                            f"geom=({abs_x},{abs_y},{win_w},{win_h})，point=({buf_x},{buf_y})"
                         )
                         return win_obj.id, app_class
                 except Exception as e:
                     logging.error(f"错误： {e}")
         except Exception as e:
-            logging.error(f"使用 python-xlib 查找窗口时发生严重错误: {e}")
+            logging.error(f"使用 python-xlib 查找窗口时发生错误: {e}")
         return None, None
 
     def _get_app_class_at_center(self):
-        # 逻辑px窗口坐标
+        # 逻辑px
         if IS_WAYLAND:
-            logging.debug("Wayland 环境下无法通过 Xlib 检测应用类别")
             return None
-        shot_x = self.session.geometry['x']
-        shot_y = self.session.geometry['y']
-        center_x = int(shot_x + self.session.geometry['w'] / 2)
-        center_y = int(shot_y + self.session.geometry['h'] / 2)
-        g_center_x, g_center_y = self.view.window_to_global(center_x, center_y) # 窗口坐标 -> 全局坐标
+        center_x = self.session.geometry['x'] + self.session.geometry['w'] / 2 # 窗口坐标
+        center_y = self.session.geometry['y'] + self.session.geometry['h'] / 2
+        g_center_x, g_center_y = self.view.coord_manager.map_point(center_x, center_y, source=CoordSys.WINDOW, target=CoordSys.GLOBAL)
         _, app_class = self._get_window_at_coords(self.x_display, g_center_x, g_center_y)
         if app_class:
             logging.info(f"检测到底层应用: {app_class}")
         return app_class
 
-    def _prompt_for_app_class_input(self):
-        """弹窗让用户手动输入应用标识符 (用于校准)"""
-        global hotkey_listener
-        if hotkey_listener:
-            hotkey_listener.set_normal_keys_grabbed(False)
-        dialog = AppClassInputDialog(self.view if not IS_WAYLAND else None)
-        response = dialog.run()
-        result = None
-        if response == Gtk.ResponseType.OK:
-            result = dialog.get_text()
-        dialog.destroy()
-        if hotkey_listener and are_hotkeys_enabled:
-            hotkey_listener.set_normal_keys_grabbed(True)
-        return result
-
-    def _prompt_for_app_class_selection(self):
-        """弹窗让用户从已有列表中选择 (用于切换模式)"""
-        global hotkey_listener
-        if hotkey_listener:
-            hotkey_listener.set_normal_keys_grabbed(False)
-        dialog = AppClassSelectionDialog(self.view if not IS_WAYLAND else None, self.config)
-        response = dialog.run()
-        result = None
-        if response == Gtk.ResponseType.OK:
-            result = dialog.get_selected()
-        dialog.destroy()
-        if hotkey_listener and are_hotkeys_enabled:
-            hotkey_listener.set_normal_keys_grabbed(True)
-        return result
+    def _prompt_for_app_class(self, allow_new_entry):
+        dialog = AppConfigDialog(self.config, allow_new_entry=allow_new_entry)
+        response, result = self.view.overlay_manager.run_modal(
+            dialog, anchor='center', layer=OverlayManager.LAYER_HIGH, mask=False
+        )
+        if response == Gtk.ResponseType.OK and result:
+            return result
+        return None
 
     def toggle(self):
-        """切换整格模式的开关"""
+        """切换整格模式"""
         # 缓冲区px
-        if self._is_toggling:
-            logging.debug("GridModeController: toggle 正在进行中，忽略重复请求")
-            return
-        self._is_toggling = True
-        try:
-            if self.view.controller.is_auto_scrolling:
-                logging.debug("自动滚动模式下忽略切换整格模式请求")
-                return
-            if self.is_active:
-                self.is_active = False
-                self.grid_unit = 0
-                self.session.detected_app_class = None
-                self.session.is_matching_enabled = False
-                self.view.button_panel.set_grid_action_buttons_visible(False)
-                self.view.controller.set_current_mode("自由模式")
-                self.view.queue_draw()
-                logging.info("整格模式已关闭")
-                send_desktop_notification("整格模式已关闭", "边框拖动已恢复自由模式", level="normal")
-                return
-            # 尝试开启整格模式
-            app_class = self._get_app_class_at_center()
-            if not app_class:
-                app_class = self._prompt_for_app_class_selection()
-            if not app_class:
-                send_desktop_notification("模式切换失败", "无法检测到底层应用程序", level="warning")
-                return
-            grid_unit_from_config, matching_enabled = config.get_scroll_unit(app_class)
-            if grid_unit_from_config > 0:
-                self.is_active = True
-                self.grid_unit = grid_unit_from_config
-                self.session.detected_app_class = app_class
-                self.session.is_matching_enabled = matching_enabled
-                self.view.button_panel.set_grid_action_buttons_visible(True)
-                match_status = "启用" if matching_enabled else "禁用"
-                self.view.controller.set_current_mode("整格模式")
-                scale = self.view.scale
-                logging.info(f"为应用 '{app_class}' 启用整格模式，图片单位: {self.grid_unit}px, 模板匹配: {match_status}")
-                send_desktop_notification("整格模式已启用", f"应用: {app_class}, 滚动单位: {self.grid_unit}px, 误差修正: {match_status}", level="normal")
-                self._snap_current_height()
-            else:
-                logging.warning(f"应用 '{app_class}' 未在配置中找到滚动单位，无法启用整格模式")
-                send_desktop_notification("模式切换失败", f"'{app_class}' 的滚动单位未配置", level="warning")
-        finally:
-            self._is_toggling = False
-
-    def _snap_current_height(self):
-        """将当前选区的高度对齐到最近的整格单位"""
-        if not self.is_active or self.grid_unit == 0:
-            return
-        scale = self.view.scale
-        geo = self.session.geometry.copy() 
-        current_h = geo['h'] # 逻辑px
-        # 计算最接近的整数倍
-        current_h_phys = current_h * scale # 逻辑px -> 缓冲区px
-        ticks = round(current_h_phys / self.grid_unit)
-        if ticks < 1: ticks = 1
-        target_h_phys = ticks * self.grid_unit # 缓冲区px
-        snapped_h = int(math.ceil(target_h_phys / scale)) # 缓冲区px -> 逻辑px
-        if geo['h'] != snapped_h:
-            geo['h'] = snapped_h
-            self.session.update_geometry(geo)
-            self.view.update_layout()
-            self.view.queue_draw()
-            logging.debug(f"高度对齐: {target_h_phys} 缓冲区px, {snapped_h} 逻辑px (Scale={scale})")
-
-    def start_calibration(self):
-        """启动自动滚动单位校准流程"""
         if self.view.controller.is_auto_scrolling:
-            logging.debug("自动滚动模式下忽略配置滚动单位请求")
+            logging.debug("自动滚动模式下忽略切换整格模式请求")
             return
         if self.is_active:
-            send_desktop_notification("操作无效", "请先按 Shift 键退出整格模式再进行配置", level="normal")
+            self.session.set_grid_config(None, 0, False)
+            self.session.set_mode(CaptureMode.FREE)
+            logging.info("整格模式已关闭")
+            send_notification("整格模式已关闭", "已恢复自由模式", "normal")
             return
         app_class = self._get_app_class_at_center()
         if not app_class:
-            app_class = self._prompt_for_app_class_input()
+            app_class = self._prompt_for_app_class(allow_new_entry=False)
         if not app_class:
-            send_desktop_notification("配置失败", "无法检测到底层应用程序", level="warning")
+            send_notification("切换整格模式失败", "无法检测到底层应用程序", "warning")
+            return
+        val_str = self.config.get_raw_string('ApplicationScrollUnits', app_class)
+        grid_unit_from_config, matching_enabled = self.config.parse_string_to_value('ApplicationScrollUnits', app_class, val_str)
+        if grid_unit_from_config > 0:
+            self.session.set_grid_config(app_class, grid_unit_from_config, matching_enabled)
+            match_status = "启用" if matching_enabled else "禁用"
+            self.session.set_mode(CaptureMode.GRID)
+            scale = self.session.scale
+            logging.info(f"为应用 '{app_class}' 启用整格模式，滚动单位: {grid_unit_from_config}px, 模板匹配: {match_status}")
+            send_notification("整格模式已启用", f"应用: {app_class}, 滚动单位: {grid_unit_from_config}px, 误差修正: {match_status}", "normal")
+            if not matching_enabled:
+                self.snap_current_height()
+        else:
+            logging.warning(f"应用 '{app_class}' 未在配置中找到滚动单位，无法启用整格模式")
+            send_notification("切换整格模式失败", f"'{app_class}' 的滚动单位未配置", "warning")
+
+    def snap_current_height(self):
+        """将当前选区的高度对齐到最近的整数个滚动单位"""
+        if not self.is_active or self.session.grid_unit == 0:
+            return
+        scale = self.session.scale
+        geo = self.session.geometry.copy()
+        current_h = geo['h'] # 逻辑px
+        _, cap_y = self.view.coord_manager.map_point(geo['x'], geo['y'], source=CoordSys.WINDOW, target=self.view.frame_grabber.target_coords)
+        # 逻辑px -> 缓冲区px
+        y_buf = math.ceil(cap_y * scale)
+        current_h_buf = int((cap_y + current_h) * scale) - y_buf
+        ticks = round(current_h_buf / self.session.grid_unit)
+        if ticks < 1: ticks = 1
+        target_h_buf = ticks * self.session.grid_unit # 缓冲区px
+        snapped_h = (y_buf + target_h_buf + 0.01) / scale - cap_y # 缓冲区px -> 逻辑px
+        if abs(geo['h'] - snapped_h) > 1e-5:
+            geo['h'] = snapped_h
+            self.session.set_geometry(geo)
+            logging.debug(f"高度对齐: {target_h_buf} 缓冲区px, {snapped_h:.1f} 逻辑px (scale={scale:.3f})")
+
+    def start_calibration(self):
+        """启动滚动单位自动校准"""
+        if self.view.controller.is_auto_scrolling:
+            logging.debug("自动滚动模式下忽略配置滚动单位请求")
+            return
+        app_class = self._get_app_class_at_center()
+        if not app_class:
+            app_class = self._prompt_for_app_class(allow_new_entry=True)
+        if not app_class:
+            send_notification("配置失败", "无法检测到底层应用程序", "warning")
             return
         logging.info(f"为应用 '{app_class}' 启动自动校准...")
         # 逻辑px窗口坐标
-        panel_x = 20
-        panel_y = 20
         dialog_text = f"正在为 {app_class} 自动校准...\n请勿操作"
-        panel, _ = create_feedback_panel(text=dialog_text, show_progress_bar=False)
-        self.view.fixed_container.put(panel, panel_x, panel_y)
-        panel.show_all()
-        _, nat_size = panel.get_preferred_size()
-        panel_w, panel_h = nat_size.width, nat_size.height
-        panel_rect = {'x': panel_x, 'y': panel_y, 'w': panel_w, 'h': panel_h}
-        should_hide = False
-        def _rects_overlap(r1, r2):
-            return not (r1['x'] >= r2['x'] + r2['w'] or 
-                        r1['x'] + r1['w'] <= r2['x'] or 
-                        r1['y'] >= r2['y'] + r2['h'] or 
-                        r1['y'] + r1['h'] <= r2['y'])
-        if _rects_overlap(panel_rect, self.session.geometry):
-            should_hide = True
-            logging.debug("校准面板遮挡了截图选区，将自动隐藏")
-        if not should_hide and self.view.show_side_panel and self.view.side_panel.get_visible():
-            alloc = self.view.side_panel.get_allocation()
-            side_rect = {'x': self.view.side_panel.translate_coordinates(self.view, 0, 0)[0], 
-                         'y': self.view.side_panel.translate_coordinates(self.view, 0, 0)[1], 
-                         'w': alloc.width, 'h': alloc.height}
-            if _rects_overlap(panel_rect, side_rect):
-                should_hide = True
-        if not should_hide and self.view.show_button_panel and self.view.button_panel.get_visible():
-            alloc = self.view.button_panel.get_allocation()
-            btn_rect = {'x': self.view.button_panel.translate_coordinates(self.view, 0, 0)[0],
-                        'y': self.view.button_panel.translate_coordinates(self.view, 0, 0)[1],
-                        'w': alloc.width, 'h': alloc.height}
-            if _rects_overlap(panel_rect, btn_rect):
-                should_hide = True
-        if should_hide:
-            panel.hide()
-        scale = self.view.scale
+        panel = FeedbackWidget(self.view, text=dialog_text, show_progress=False)
+        self.view.overlay_manager.show(panel, anchor='top-left', layer=OverlayManager.LAYER_LOW, mask=False)
+        scale = self.session.scale
         self.calibration_state = {
             "app_class": app_class,
-            "num_samples": 4,
+            "num_samples": self.config.CALIBRATION_SAMPLES,
             "measured_units": [],
             "panel": panel,
             "ticks_to_scroll": max(1, int(int(self.session.geometry['h'] * scale) / self.config.MAX_SCROLL_PER_TICK)) # 逻辑px -> 缓冲区px
         }
-        self.view.queue_draw()
-        self.view._update_input_shape()
         thread = threading.Thread(target=self._calibration_thread_func, daemon=True)
         thread.start()
 
@@ -2155,17 +2883,18 @@ class GridModeController:
             w = self.session.geometry['w']
             shot_x = self.session.geometry['x']
             shot_y = self.session.geometry['y']
-            scale = self.view.scale
+            scale = self.session.scale
             buf_h = int(h * scale) # 逻辑px -> 缓冲区px
             ticks_to_scroll = state['ticks_to_scroll']
             num_samples = state['num_samples']
-            mon_x, mon_y = self.view.window_to_monitor(shot_x, shot_y) # 窗口坐标 -> 显示器坐标
+            cap_x, cap_y = self.view.coord_manager.map_point(shot_x, shot_y, source=CoordSys.WINDOW, target=self.view.frame_grabber.target_coords)
+            time.sleep(0.4)
             def safe_capture(path):
                 result = [False]
                 event = threading.Event()
                 def task():
                     try:
-                        result[0] = FRAME_GRABBER.capture(mon_x, mon_y, w, h, path, scale, include_cursor=False)
+                        result[0] = self.view.frame_grabber.capture(cap_x, cap_y, w, h, path, scale, include_cursor=False)
                     except Exception as e:
                         logging.error(f"校准截图异常: {e}")
                     finally:
@@ -2173,16 +2902,16 @@ class GridModeController:
                 GLib.idle_add(task)
                 event.wait()
                 return result[0]
-            logging.debug(f"校准参数: 截图区高度={h} 逻辑px, 约 {buf_h} 缓冲区px, 每次滚动格数={ticks_to_scroll}, 采样次数={num_samples}")
-            state["filepath_before"] = config.TMP_DIR / "cal_before.png"
+            logging.debug(f"校准参数: 截图区高度={h:.1f} 逻辑px, 约 {buf_h} 缓冲区px, 每次滚动格数={ticks_to_scroll}, 采样次数={num_samples}")
+            state["filepath_before"] = config.TEMP_DIRECTORY / "cal_before.png"
             if not safe_capture(state["filepath_before"]):
-                 logging.error("校准初始截图失败")
-                 GLib.idle_add(self._finalize_calibration, False)
-                 return
-            self.view.controller.scroll_manager.scroll_discrete(-ticks_to_scroll)
+                logging.error("校准初始截图失败")
+                GLib.idle_add(self._finalize_calibration, False)
+                return
+            self.view.controller.scroll_manager.scroll_discrete(ticks_to_scroll)
             time.sleep(0.4)
             for step in range(1, num_samples + 1):
-                filepath_after = config.TMP_DIR / "cal_after.png"
+                filepath_after = config.TEMP_DIRECTORY / "cal_after.png"
                 if not safe_capture(filepath_after):
                     logging.error(f"第 {step} 次采样截图失败，中止校准")
                     GLib.idle_add(self._finalize_calibration, False)
@@ -2193,22 +2922,21 @@ class GridModeController:
                 if img_top is not None and img_bottom is not None:
                     h_buf, _, _ = img_top.shape
                     min_scroll_buf = self.config.MIN_SCROLL_PER_TICK
-                    max_search_overlap = h_buf - (ticks_to_scroll * min_scroll_buf)
-                    found_overlap, score = _find_overlap_pyramid(img_top, img_bottom, max_search_overlap)
-                    if score > 0.95:
-                        scroll_dist_px = h_buf - found_overlap
+                    min_shift = ticks_to_scroll * min_scroll_buf
+                    max_shift = ticks_to_scroll * self.config.MAX_SCROLL_PER_TICK
+                    cal_bars = ImageMatcher.detect_static_bars(img_top, img_bottom)
+                    h_header, _, _, _ = cal_bars
+                    shift, cut_y, score = ImageMatcher.detect_visual_shift(img_top, img_bottom, cal_bars, 0, min_shift, max_shift)
+                    if score > ImageMatcher.THRES_SCORE and shift > 0:
+                        scroll_dist_px = shift
                         unit = scroll_dist_px / state['ticks_to_scroll']
-                        if unit < min_scroll_buf:
-                            logging.warning(f"检测到滚动距离过小({unit:.2f} 缓冲区px/格)，已到达页面末端。提前中止采样")
-                            GLib.idle_add(self._finalize_calibration, True)
-                            return
                         state["measured_units"].append(unit)
-                        logging.debug(f"采样 {step}: 成功，滚动单位 ≈ {unit:.2f} 缓冲区px/格，相似度 {score:.3f}")
+                        logging.debug(f"采样 {step} 成功，滚动单位 ≈ {unit:.2f} 缓冲区px/格")
                     else:
-                        logging.warning(f"采样 {step}: 匹配失败（相似度 {score:.3f}）")
-                        bottom_check_height = ticks_to_scroll * min_scroll_buf
-                        if ActionController._check_if_bottom_reached(img_top, img_bottom, bottom_check_height):
-                            logging.warning(f"校准：检测到底部（匹配失败后底部仍一致），提前中止采样")
+                        logging.warning(f"采样 {step} 匹配失败")
+                        score_check, _ = ImageMatcher.verify_region(img_top, img_bottom, 0, h_header, cal_bars)
+                        if score_check > ImageMatcher.THRES_SCORE:
+                            logging.warning(f"校准过程中检测到底部，提前中止采样")
                             GLib.idle_add(self._finalize_calibration, True)
                             return
                 else:
@@ -2219,89 +2947,165 @@ class GridModeController:
                     os.remove(state["filepath_before"])
                 os.rename(filepath_after, state["filepath_before"])
                 if step < num_samples:
-                    self.view.controller.scroll_manager.scroll_discrete(-state['ticks_to_scroll'])
+                    self.view.controller.scroll_manager.scroll_discrete(state['ticks_to_scroll'])
                     time.sleep(0.4)
             GLib.idle_add(self._finalize_calibration, True)
         except Exception as e:
             logging.error(f"校准线程发生错误: {e}")
             GLib.idle_add(self._finalize_calibration, False)
-    
+
     def _finalize_calibration(self, success):
-        """分析数据、通过聚类剔除离群值、保存结果并清理"""
         state = self.calibration_state
-        state["panel"].destroy()
-        self.view._update_input_shape()
+        self.view.overlay_manager.dismiss(state["panel"])
+        self.view.update_input_shape()
         if os.path.exists(state.get("filepath_before", "")):
             os.remove(state["filepath_before"])
-        MIN_VALID_SAMPLES = 2
+        MIN_VALID_SAMPLES = max(2, state["num_samples"] // 2)
         if not success or not state["measured_units"] or len(state["measured_units"]) < MIN_VALID_SAMPLES:
             msg = f"为 '{state['app_class']}' 校准失败\n有效采样数据不足，请在内容更丰富的区域操作或确保界面有足够的滚动空间"
-            send_desktop_notification("配置失败", msg, level="warning")
+            send_notification("配置失败", msg, "warning")
             logging.warning(msg.replace('\n', ' '))
             return
         units = sorted(state["measured_units"])
-        logging.debug(f"开始聚类分析，原始数据: {units}")
+        logging.debug(f"开始聚类分析，原始数据: {[round(u, 2) for u in units]}")
         if not units:
             self._finalize_calibration(success=False)
             return
         TOLERANCE = 5
         clusters = []
         for unit in units:
-            placed = False
             for cluster in clusters:
                 if abs(unit - np.mean(cluster)) < TOLERANCE:
                     cluster.append(unit)
-                    placed = True
                     break
-            if not placed:
+            else:
                 clusters.append([unit])
         if not clusters:
             self._finalize_calibration(success=False)
             return
         largest_cluster = max(clusters, key=len)
-        logging.debug(f"聚类结果: {clusters}。选择的最大集群: {largest_cluster}")
+        logging.debug(f"聚类结果: {[[round(u, 2) for u in c] for c in clusters]}。选择的最大集群: {[round(u, 2) for u in largest_cluster]}")
         if len(largest_cluster) < MIN_VALID_SAMPLES:
             msg = f"为 '{state['app_class']}' 校准失败。\n采样数据一致性过差，无法找到共识值"
-            send_desktop_notification("配置失败", msg, level="warning")
+            send_notification("配置失败", msg, "warning")
             logging.warning(msg.replace('\n', ' '))
             return
-        final_avg_unit = round(np.mean(largest_cluster))
+        raw_mean = float(np.mean(largest_cluster))
+        final_avg_unit = round(raw_mean)
         final_std_dev = np.std(largest_cluster)
-        matching_enabled = final_std_dev >= 0.05
-        logging.info(f"最终分析: 平均滚动单位={final_avg_unit} 缓冲区px, 标准差={final_std_dev:.3f}, 决策:开启误差修正={matching_enabled}")
-        if config.save_scroll_unit(state["app_class"], final_avg_unit, matching_enabled):
-            status_str = "启用" if matching_enabled else "禁用"
-            msg = f"已为 '{state['app_class']}' 保存滚动单位: {final_avg_unit}px (缓冲区px)\n误差修正已{status_str}"
-            send_desktop_notification("配置成功", msg, level="success", timeout=4)
-        else:
-            send_desktop_notification("配置失败", "写入配置文件时发生错误", level="warning")
+        matching_enabled = final_std_dev >= 0.05 or (abs(raw_mean - final_avg_unit) >= 0.1)
+        logging.info(f"最终分析: 原始平均值 {raw_mean:.2f} 取整后滚动单位= {final_avg_unit} 缓冲区px, 标准差={final_std_dev:.3f}, 开启误差修正={matching_enabled}")
+        value_to_save = f"{final_avg_unit}, {str(matching_enabled).lower()}"
+        config.set_value('ApplicationScrollUnits', state["app_class"], value_to_save)
+        if self.is_active:
+            self.session.set_grid_config(state["app_class"], final_avg_unit, matching_enabled)
+            if not matching_enabled:
+                self.snap_current_height()
+        status_str = "启用" if matching_enabled else "禁用"
+        msg = f"已为 '{state['app_class']}' 保存滚动单位: {final_avg_unit} 缓冲区px\n误差修正: {status_str}"
+        send_notification("配置成功", msg, level="success", timeout=4)
 
 class ScrollManager:
-    def __init__(self, config: Config, session: CaptureSession, view: 'CaptureOverlay'):
-        self.config = config
+    def __init__(self, config_obj: Config, session: CaptureSession, view: 'CaptureOverlay'):
+        self.config = config_obj
         self.session = session
         self.view = view
-        self.is_fine_scrolling = False
         self.gdk_display = Gdk.Display.get_default()
         self.gdk_seat = self.gdk_display.get_default_seat()
         self.gdk_pointer = self.gdk_seat.get_pointer()
         self.gdk_screen = self.gdk_display.get_default_screen()
         self.evdev_abs_mouse = None
+        self.evdev_wheel_scroller = None
+        self.invisible_scroller = None
 
-    def _get_pointer_position(self):
-        """使用 GDK 获取当前鼠标指针位置"""
-        # 逻辑px全局坐标
+    def _start_invisible_cursor_thread(self, screen_rect, scale):
+        g_min_x, g_min_y, g_max_x, g_max_y = self.view.coord_manager.get_all_monitors_geometry()
+        rect_w = screen_rect.width
+        rect_h = screen_rect.height
+        # 逻辑px -> 缓冲区px
+        g_min_x_buf = math.ceil(g_min_x * scale)
+        g_min_y_buf = math.ceil(g_min_y * scale)
+        g_max_x_buf = int(g_max_x * scale)
+        g_max_y_buf = int(g_max_y * scale)
+        # 计算停放位置
+        park_x, park_y = self.view.coord_manager.map_point(rect_w - 1, rect_h - 1, source=CoordSys.MONITOR, target=CoordSys.GLOBAL)
+        # 逻辑px -> 缓冲区px
+        park_x_buf = int(park_x * scale)
+        park_y_buf = int(park_y * scale)
+        try:
+            self.invisible_scroller = InvisibleCursorScroller(g_min_x_buf, g_min_y_buf, g_max_x_buf, g_max_y_buf, park_x_buf, park_y_buf, self.config)
+            threading.Thread(target=self.invisible_scroller.setup, daemon=True).start()
+            logging.info("正在后台初始化隐形光标设备...")
+        except Exception as e:
+            logging.error(f"初始化隐形光标失败: {e}")
+            self.invisible_scroller = None
+
+    def init_devices(self, screen_rect, scale):
+        can_evdev_simulate_input = EVDEV_AVAILABLE and UINPUT_AVAILABLE
+        if not can_evdev_simulate_input:
+            missing = []
+            if not EVDEV_AVAILABLE: missing.append("未安装 evdev 库")
+            if not UINPUT_AVAILABLE: missing.append("缺少 /dev/uinput 读写权限")
+            evdev_sim_err_msg = "、".join(missing)
+        try:
+            if IS_WAYLAND:
+                logging.info("Wayland 下 'invisible_cursor' 模式不可用")
+                self.invisible_scroller = None
+                if can_evdev_simulate_input:
+                    self.evdev_wheel_scroller = EvdevWheelScroller()
+                    if screen_rect.width > 0:
+                        g_min_x, g_min_y, g_max_x, g_max_y = self.view.coord_manager.get_all_monitors_geometry()
+                        # 逻辑px -> 缓冲区px
+                        self.evdev_abs_mouse = EvdevAbsoluteMouse(
+                            math.ceil(g_min_x * scale), math.ceil(g_min_y * scale),
+                            int(g_max_x * scale), int(g_max_y * scale)
+                        )
+                    else:
+                        logging.error("无法获取分辨率，Wayland 下鼠标移动功能将无法工作")
+                        self.evdev_abs_mouse = None
+                else:
+                    logging.error(f"{evdev_sim_err_msg}，Wayland 下鼠标移动及滚动功能将无法工作")
+                    self.evdev_wheel_scroller = None
+                    self.evdev_abs_mouse = None
+            else:
+                if can_evdev_simulate_input:
+                    if self.config.SCROLL_METHOD == 'invisible_cursor':
+                        self._start_invisible_cursor_thread(screen_rect, scale)
+                    else:
+                        self.evdev_wheel_scroller = EvdevWheelScroller()
+                else:
+                    logging.debug(f"{evdev_sim_err_msg}，X11 下默认使用 XTest 进行滚动")
+                    self.evdev_wheel_scroller = None
+                    self.invisible_scroller = None
+        except Exception as err:
+            logging.error(f"创建虚拟设备失败: {err}")
+            send_notification("设备错误", f"无法创建虚拟设备: {err}，基于 evdev 的滚动功能将不可用", "critical")
+            self.evdev_wheel_scroller = None
+            self.invisible_scroller = None
+            self.evdev_abs_mouse = None
+
+    def update_scroll_method(self):
+        if IS_WAYLAND: return
+        target_method = self.config.SCROLL_METHOD
+        if target_method == 'invisible_cursor':
+            if self.invisible_scroller: return
+            if self.session.screen_rect.width > 0:
+                self._start_invisible_cursor_thread(self.session.screen_rect, self.session.scale)
+
+    def get_pointer_position(self, target: CoordSys = CoordSys.GLOBAL):
+        """获取当前鼠标指针位置"""
+        # 逻辑px
         def _get_pos_impl():
             try:
                 if IS_WAYLAND:
                     win = self.view.get_window()
                     if win:
                         _, wx, wy, _ = win.get_device_position(self.gdk_pointer)
-                        return self.view.window_to_global(wx, wy) # 窗口坐标 -> 全局坐标
+                        return self.view.coord_manager.map_point(wx, wy, source=CoordSys.WINDOW, target=target)
                     return (0, 0)
                 else:
                     _, x, y = self.gdk_pointer.get_position()
-                    return (x, y)
+                    return self.view.coord_manager.map_point(x, y, source=CoordSys.GLOBAL, target=target)
             except Exception as e:
                 logging.error(f"获取鼠标位置失败: {e}")
                 return (0, 0)
@@ -2317,14 +3121,14 @@ class ScrollManager:
             event.wait()
             return result[0]
 
-    def _set_pointer_position(self, x, y):
+    def set_pointer_position(self, x, y):
         """设置鼠标指针位置"""
         # x, y: 逻辑px全局坐标
         def do_warp():
             try:
                 if IS_WAYLAND:
                     if self.evdev_abs_mouse:
-                        scale = self.view.scale
+                        scale = self.session.scale
                         # 逻辑px -> 缓冲区px
                         buf_x = round(x * scale)
                         buf_y = round(y * scale)
@@ -2332,7 +3136,7 @@ class ScrollManager:
                     else:
                         logging.warning("Wayland 下缺少 EvdevAbsoluteMouse，无法移动鼠标")
                 else:
-                    self.gdk_pointer.warp(self.gdk_screen, x, y)
+                    self.gdk_pointer.warp(self.gdk_screen, round(x), round(y))
                     self.gdk_display.flush()
             except Exception as e:
                 logging.error(f"设置鼠标位置失败: {e}")
@@ -2354,32 +3158,35 @@ class ScrollManager:
         # 逻辑px窗口坐标
         shot_x = self.session.geometry['x']
         shot_y = self.session.geometry['y']
-        center_x = int(shot_x + self.session.geometry['w'] / 2)
-        center_y = int(shot_y + self.session.geometry['h'] / 2)
-        g_center_x, g_center_y = self.view.window_to_global(center_x, center_y) # 窗口坐标 -> 全局坐标
-        if self.config.SCROLL_METHOD == 'invisible_cursor' and self.view.invisible_scroller:
+        center_x = shot_x + self.session.geometry['w'] / 2
+        center_y = shot_y + self.session.geometry['h'] / 2
+        g_center_x, g_center_y = self.view.coord_manager.map_point(center_x, center_y, source=CoordSys.WINDOW, target=CoordSys.GLOBAL)
+        if self.config.SCROLL_METHOD == 'invisible_cursor' and self.invisible_scroller:
             logging.debug(f"使用隐形光标执行离散滚动: {ticks} 格")
-            scroller = self.view.invisible_scroller
+            scale = self.session.scale
+            # 逻辑px -> 缓冲区px
+            g_center_x_buf = round(g_center_x * scale)
+            g_center_y_buf = round(g_center_y * scale)
+            scroller = self.invisible_scroller
             try:
-                scroller.move(g_center_x, g_center_y)
+                scroller.move(g_center_x_buf, g_center_y_buf)
                 time.sleep(0.05)
-                scroller.discrete_scroll(ticks)
+                scroller.scroll_discrete(ticks)
             finally:
                 time.sleep(0.05)
                 scroller.park()
         else:
-            logging.debug(f"使用用户光标执行离散滚动: {ticks} 格")
-            original_pos = self._get_pointer_position() # 逻辑px全局坐标
-            self._set_pointer_position(g_center_x + 1, g_center_y + 1) 
-            self._set_pointer_position(g_center_x, g_center_y)
+            original_pos = self.get_pointer_position(target=CoordSys.GLOBAL) # 逻辑px
+            self.set_pointer_position(g_center_x + 1, g_center_y + 1)
+            self.set_pointer_position(g_center_x, g_center_y)
             time.sleep(0.05)
             try:
                 scrolled_via_xtest = False
                 if not IS_WAYLAND:
+                    logging.debug(f"使用 XTest 执行离散滚动: {ticks} 格")
                     try:
-                        logging.debug(f"使用 XTest 执行离散滚动: {ticks} 格")
                         disp = display.Display()
-                        button_code = 4 if ticks > 0 else 5
+                        button_code = 5 if ticks > 0 else 4
                         num_clicks = abs(ticks)
                         for i in range(num_clicks):
                             xtest.fake_input(disp, X.ButtonPress, button_code)
@@ -2388,7 +3195,7 @@ class ScrollManager:
                             xtest.fake_input(disp, X.ButtonRelease, button_code)
                             disp.sync()
                             if i < num_clicks - 1:
-                                time.sleep(0.03)
+                                time.sleep(0.01)
                         disp.close()
                         scrolled_via_xtest = True
                     except Exception as e:
@@ -2396,119 +3203,93 @@ class ScrollManager:
                         try: disp.close()
                         except: pass
                 if not scrolled_via_xtest:
-                    if self.view.evdev_wheel_scroller:
-                        logging.debug(f"使用 Evdev 执行离散滚动: {ticks} 格")
+                    logging.debug(f"使用 Evdev 执行离散滚动: {ticks} 格")
+                    if self.evdev_wheel_scroller:
                         try:
-                            self.view.evdev_wheel_scroller.scroll_discrete(ticks)
+                            self.evdev_wheel_scroller.scroll_discrete(ticks)
                         except Exception as e:
                             logging.error(f"使用 Evdev 模拟滚动失败: {e}")
                     else:
                         logging.warning("滚动失败 Evdev 未配置")
-                        GLib.idle_add(
-                            send_desktop_notification,
-                            "自动滚动不可用",
-                            "滚动失败：XTest 无效且未检测到 Evdev 虚拟设备",
-                            "dialog-error", "warning"
-                        )
+                        GLib.idle_add(send_notification, "自动滚动不可用", "XTest 无效且未检测到 Evdev 虚拟设备", "warning", config.WARNING_SOUND)
             except Exception as e:
                 logging.error(f"模拟滚动失败: {e}")
+            time.sleep(0.05)
             if return_cursor:
-               time.sleep(0.05)
-               self._set_pointer_position(*original_pos) # 逻辑px全局坐标
+                self.set_pointer_position(*original_pos) # 逻辑px全局坐标
+
+    def cleanup(self):
+        if self.evdev_wheel_scroller:
+            self.evdev_wheel_scroller.close()
+            self.evdev_wheel_scroller = None
+        if self.evdev_abs_mouse:
+            self.evdev_abs_mouse.close()
+            self.evdev_abs_mouse = None
+        if self.invisible_scroller:
+            if self.config.REUSE_INVISIBLE_CURSOR and self.config.SCROLL_METHOD == 'invisible_cursor':
+                logging.info("跳过隐形光标资源清理（启用复用）")
+                if self.invisible_scroller.is_ready:
+                    self.invisible_scroller.park()
             else:
-                time.sleep(0.05)
+                self.invisible_scroller.cleanup()
+                self.invisible_scroller = None
 
 class ActionController:
-    """处理所有用户操作和业务逻辑"""
-    def __init__(self, session: CaptureSession, view: 'CaptureOverlay', config: Config):
+    def __init__(self, session: CaptureSession, view: 'CaptureOverlay', config_obj: Config, frame_grabber: FrameGrabber):
         self.session = session
         self.view = view
-        self.config = config
+        self.config = config_obj
+        self.frame_grabber = frame_grabber
+        ImageMatcher.configure(self.config)
         self.scroll_manager = ScrollManager(self.config, self.session, self.view)
         self.grid_mode_controller = GridModeController(self.config, self.session, self.view)
-        self._hotkey_actions = [
-            (config.HOTKEY_CAPTURE, self.take_capture),
-            (config.HOTKEY_FINALIZE, self.finalize_and_quit),
-            (config.HOTKEY_UNDO, self.delete_last_capture),
-            (config.HOTKEY_CANCEL, self.quit_and_cleanup),
-            (config.HOTKEY_GRID_BACKWARD, lambda: self.handle_movement_action('up', source='hotkey')),
-            (config.HOTKEY_GRID_FORWARD, lambda: self.handle_movement_action('down', source='hotkey')),
-            (config.HOTKEY_AUTO_SCROLL_START, self.start_auto_scroll),
-            (config.HOTKEY_AUTO_SCROLL_STOP, self.stop_auto_scroll),
-            (config.HOTKEY_CONFIGURE_SCROLL_UNIT, self.grid_mode_controller.start_calibration),
-            (config.HOTKEY_TOGGLE_GRID_MODE, self.grid_mode_controller.toggle),
-            (config.HOTKEY_TOGGLE_PREVIEW, self.view.toggle_preview_panel),
-            (config.HOTKEY_OPEN_CONFIG_EDITOR, self.view.toggle_config_panel),
-            (config.HOTKEY_TOGGLE_INSTRUCTION_PANEL, self.view.toggle_instruction_panel),
-            (config.HOTKEY_PREVIEW_ZOOM_IN, lambda: self.view.preview_panel._zoom_in() if self.view.preview_panel and self.view.preview_panel.get_visible() else None),
-            (config.HOTKEY_PREVIEW_ZOOM_OUT, lambda: self.view.preview_panel._zoom_out() if self.view.preview_panel and self.view.preview_panel.get_visible() else None),
-        ]
-        self.current_mode_str = "自由模式"
-        self.final_notification = None
-        self.is_exiting = False
-        self.is_dragging = False
         self.is_processing_movement = False
-        self.is_auto_scrolling = False
         self.auto_scroll_timer_id = None
-        self.is_first_auto_capture = False
-        self.auto_scroll_original_cursor_pos = None # 逻辑px全局坐标
-        self.auto_scroll_needs_capture = False
-        self.auto_scroll_return_cursor = False
-        self.auto_mode_context = None
-        self.SCROLL_TIME_MS = 200
-        self.CAPTURE_DELAY_MS = 150
-        self.AUTO_SCROLL_INTERVAL_MS = 300
-        self.AUTO_CAPTURE_DELAY_MS = 50
-        self.resize_edge = None
-        # 逻辑px窗口坐标
-        self.drag_start_geometry = {}
-        self.drag_start_x_rel = 0
-        self.drag_start_y_rel = 0
+        self.saved_cursor_pos = None # 逻辑px全局坐标
+        self.pending_capture = False
         self._capture_filename_counter = 0
         self.stitch_model = StitchModel()
         self.task_queue = queue.Queue()
         self.result_queue = queue.Queue()
+        self.scroll_listener = None
+        if not IS_WAYLAND:
+            self.scroll_listener = XlibScrollListener(self.view)
+            self.scroll_listener.start()
+        self.accumulated_scroll_ticks = 0
         self.stitch_worker = threading.Thread(
             target=self._stitch_worker_loop,
-            args=(self.task_queue, self.result_queue, session.known_scroll_distances),
+            args=(self.task_queue, self.result_queue, session.scroll_stat_history),
             daemon=True
         )
         self.stitch_worker_running = True
         self.stitch_worker.start()
         self.result_check_timer_id = GLib.timeout_add(100, self._check_result_queue)
         logging.info("StitchWorker 后台线程及结果检查器已启动")
+        self.config_handler_id = self.config.connect('setting-changed', self._on_config_changed)
         self.stitch_model.connect('model-updated', self._on_model_updated)
 
+    def _on_config_changed(self, config_obj, section, key, value):
+        if key == 'scroll_method':
+            logging.debug("检测到滚动方式变更，正在更新...")
+            self.scroll_manager.update_scroll_method()
+        elif key == 'preview_cache_size':
+            logging.debug(f"预览缓存大小更新为 {self.config.PREVIEW_CACHE_SIZE}")
+            self.stitch_model.update_cache_limit(self.config.PREVIEW_CACHE_SIZE)
+
+    @property
+    def is_auto_scrolling(self):
+        return self.session.current_mode == CaptureMode.AUTO
+
     def _on_model_updated(self, model_instance):
-        self.update_info_panel()
-        can_undo = self.stitch_model.capture_count > 0 and not self.is_auto_scrolling
-        if self.view.show_side_panel:
-            self.view.button_panel.set_undo_sensitive(can_undo)
-        self._check_horizontal_lock_state()
-
-    def set_current_mode(self, mode_str: str):
-        self.current_mode_str = mode_str
-        self.update_info_panel()
-
-    # 缓冲区px {
-    def update_info_panel(self):
-        if self.view.show_side_panel and self.view.side_panel:
-            self.view.side_panel.info_panel.update_info(
-                count=self.stitch_model.capture_count,
-                width=self.stitch_model.image_width,
-                height=self.stitch_model.total_virtual_height,
-                mode_str=self.current_mode_str
-            )
-
-    def _check_horizontal_lock_state(self):
         should_be_locked = self.stitch_model.capture_count > 0
         if should_be_locked and not self.session.is_horizontally_locked:
             self.session.is_horizontally_locked = True
-            logging.info("第一张截图已添加到模型，窗口水平位置和宽度已被锁定")
+            logging.info("第一张截图已添加到模型，边框水平位置和宽度已被锁定")
         elif not should_be_locked and self.session.is_horizontally_locked:
             self.session.is_horizontally_locked = False
-            logging.info("所有截图均已移除，已解锁窗口水平调整功能")
+            logging.info("所有截图均已移除，已解锁边框水平调整功能")
 
+    # 缓冲区px {
     def _check_result_queue(self):
         while not self.result_queue.empty():
             try:
@@ -2516,47 +3297,35 @@ class ActionController:
                 result_type = result[0]
                 payload = result[1]
                 if result_type == 'ADD_RESULT':
-                    filepath, width, height, overlap = payload
-                    logging.debug(f"主线程: 处理结果 {Path(filepath).name}, overlap={overlap}")
-                    self.stitch_model.add_entry(filepath, width, height, overlap)
+                    filepath, width, height, shift, cut_y, abs_y, thumb_data, full_img_data = payload
+                    self.stitch_model.add_entry(filepath, width, height, shift, cut_y, abs_y, thumb_data, full_img_data)
+                elif result_type == 'STATIC_BARS_DETECTED':
+                    h_header, h_footer, w_left, w_right = payload
+                    self.session.set_static_bars(h_header, h_footer, w_left, w_right)
                 elif result_type == 'LEARNED_SCROLL':
-                    s_new = payload
-                    if s_new not in self.session.known_scroll_distances:
-                        self.session.known_scroll_distances.append(s_new)
-                        logging.debug(f"主线程: 学习到新滚动距离: {s_new} 缓冲区px")
-                elif result_type == 'POP_REQUEST_RECEIVED':
-                    logging.debug("主线程: 收到 Worker 的 POP 确认，执行模型删除")
+                    ticks, dist_px = payload
+                    self.session.scroll_stat_history[ticks].append(dist_px)
+                    logging.debug(f"学习到滚动统计，滚动 {ticks} 格 -> {dist_px} px")
+                elif result_type == 'POP_ACK':
+                    logging.debug("收到 StitchWorker 的 POP 确认，执行模型删除")
                     self.stitch_model.pop_entry()
                 elif result_type == 'BOTTOM_REACHED':
-                    logging.debug("主线程: 收到 Worker 的 BOTTOM_REACHED 信号，停止自动滚动")
-                    if self.is_auto_scrolling:
-                        GLib.idle_add(self.stop_auto_scroll, "检测到页面已到达底部")
-                    else:
-                        logging.debug("收到 BOTTOM_REACHED 但当前并非自动滚动状态")
+                    logging.debug("收到 StitchWorker 的 BOTTOM_REACHED 信号，停止自动滚动")
+                    GLib.idle_add(self.stop_auto_scroll, "检测到页面已到达底部")
             except queue.Empty:
                 break
             except Exception as e:
-                logging.error(f"处理 Worker 结果时出错: {e}")
+                logging.error(f"处理 StitchWorker 结果时出错: {e}")
         return True
 
     @staticmethod
-    def _check_if_bottom_reached(img_top, img_bottom, search_height, threshold=0.95):
-        """检查 img_bottom 的底部是否与 img_top 的底部高度匹配"""
-        h_top, _, _ = img_top.shape
-        h_bottom, w_bottom, _ = img_bottom.shape
-        effective_search_height = min(search_height, h_top, h_bottom)
-        if effective_search_height <= 0:
-            return False
-        template_bottom = img_bottom[h_bottom - effective_search_height:, :]
-        region_top_bottom = img_top[h_top - effective_search_height:, :]
-        result = cv2.matchTemplate(region_top_bottom, template_bottom, cv2.TM_CCOEFF_NORMED)
-        score = result[0][0]
-        return score >= threshold
-
-    @staticmethod
-    def _stitch_worker_loop(task_queue: queue.Queue, result_queue: queue.Queue, known_scroll_distances: list):
-        """后台工作线程的主循环"""
+    def _stitch_worker_loop(task_queue: queue.Queue, result_queue: queue.Queue, scroll_history: object):
         logging.debug("StitchWorker 线程开始运行...")
+        pending_new_trend = []
+        last_action_was_pop = False
+        last_detected_bars = (-1, -1, -1, -1)
+        cached_prev_filepath = None
+        cached_prev_img = None
         while True:
             try:
                 task = task_queue.get(timeout=1)
@@ -2568,165 +3337,275 @@ class ActionController:
             if task.get('type') == 'ADD':
                 filepath_str = task.get('filepath')
                 prev_filepath_str = task.get('prev_filepath')
-                should_match = task.get('should_perform_matching', False)
-                auto_mode_context = task.get('auto_mode_context')
-                is_grid_mode = task.get('is_grid_mode', False)
-                grid_matching_enabled = task.get('grid_matching_enabled', False)
+                current_box_y = task.get('box_y_buf', 0)
+                prev_box_y = task.get('prev_box_y_buf', 0)
+                should_perform_matching = task.get('should_perform_matching', False)
+                is_auto_mode = task.get('is_auto_mode', False)
+                ticks_scrolled = abs(task.get('ticks_scrolled', 0))
                 filepath = Path(filepath_str)
                 logging.debug(f"StitchWorker: 处理 ADD 任务: {filepath.name}")
                 if not filepath.is_file():
                     logging.error(f"StitchWorker: 文件不存在 {filepath}")
                     task_queue.task_done()
                     continue
+                w_new, h_new = None, None
                 try:
-                    img_new_np = cv2.imread(filepath_str)
-                    if img_new_np is None: raise ValueError("cv2.imread 返回 None")
-                    h_new, w_new, _ = img_new_np.shape
-                    should_perform_matching = False
-                    max_overlap_to_use = 0
-                    if prev_filepath_str:
-                        ticks_scrolled = task.get('ticks_scrolled', 2)
-                        if auto_mode_context is not None:
-                            should_perform_matching = True
-                            max_overlap_to_use = h_new - ticks_scrolled * config.MIN_SCROLL_PER_TICK
-                        elif is_grid_mode:
-                            should_perform_matching = grid_matching_enabled
-                            max_overlap_to_use = config.GRID_MATCHING_MAX_OVERLAP
-                        else:
-                            should_perform_matching = config.ENABLE_FREE_SCROLL_MATCHING
-                            max_overlap_to_use = config.FREE_SCROLL_MATCHING_MAX_OVERLAP
-                    overlap = 0
+                    img_new = cv2.imread(filepath_str)
+                    if img_new is None: raise ValueError("cv2.imread 返回 None")
+                    h_new, w_new, _ = img_new.shape
+                    thumb_target_w = 32
+                    thumb_scale = thumb_target_w / w_new
+                    thumb_target_h = max(1, int(h_new * thumb_scale))
+                    img_full_bgra = cv2.cvtColor(img_new, cv2.COLOR_BGR2BGRA)
+                    img_thumb_bgra = cv2.resize(img_full_bgra, (thumb_target_w, thumb_target_h), interpolation=cv2.INTER_AREA)
+                    thumb_data = (img_thumb_bgra, thumb_target_w, thumb_target_h, img_thumb_bgra.strides[0])
+                    full_img_data = (img_full_bgra, w_new, h_new, img_full_bgra.strides[0])
+                    shift = h_new
+                    cut_y = 0
+                    success = True
+                    box_shift_y = current_box_y - prev_box_y
+                    if ticks_scrolled > 0:
+                        min_shift = ticks_scrolled * config.MIN_SCROLL_PER_TICK + box_shift_y
+                        max_shift = ticks_scrolled * config.MAX_SCROLL_PER_TICK + box_shift_y
+                    else:
+                        min_shift = box_shift_y
+                        max_shift = h_new
                     if prev_filepath_str:
                         logging.debug(f"StitchWorker: 计算 {filepath.name} 与 {Path(prev_filepath_str).name} 的重叠")
-                        img_top_np = cv2.imread(prev_filepath_str)
-                        score = 0.0
-                        if img_top_np is None: raise ValueError(f"无法加载上一张图片 {prev_filepath_str}")
-                        h_top, _, _ = img_top_np.shape
-                        predicted_overlap = -1
-                        if known_scroll_distances:
-                            valid_candidates = []
-                            for s_known in known_scroll_distances:
-                                potential_overlap = h_new - s_known
-                                if 1 <= potential_overlap < min(h_top, h_new):
-                                    _, score = _find_overlap_brute_force(img_top_np, img_new_np, potential_overlap, potential_overlap)
-                                    PREDICTION_THRESHOLD = 0.95
-                                    if score > PREDICTION_THRESHOLD:
-                                        valid_candidates.append((potential_overlap, score))
-                            if valid_candidates:
-                                valid_candidates.sort(key=lambda x: x[0], reverse=True)
-                                best_candidate = valid_candidates[0]
-                                predicted_overlap = best_candidate[0]
-                                logging.debug(f"StitchWorker: 预测选中最佳 overlap={predicted_overlap} (score={best_candidate[1]:.3f})，候选数: {len(valid_candidates)}")
-                        if predicted_overlap != -1:
-                            overlap = predicted_overlap
+                        if prev_filepath_str == cached_prev_filepath and cached_prev_img is not None:
+                            img_top = cached_prev_img
                         else:
-                            if should_perform_matching:
-                                search_range = min(max_overlap_to_use, h_top - 1, h_new - 1)
-                                if search_range > 0:
-                                    logging.debug(f"StitchWorker: 预测失败，执行全范围搜索 (max={search_range}px)...")
-                                    found_overlap, score = _find_overlap_pyramid(img_top_np, img_new_np, search_range)
-                                    s_new = h_new - found_overlap
-                                    QUALITY_THRESHOLD = 0.95
-                                    bottom_check_height = config.MIN_SCROLL_PER_TICK
-                                    if score >= QUALITY_THRESHOLD and s_new >= ticks_scrolled*config.MIN_SCROLL_PER_TICK:
-                                        overlap = found_overlap
-                                        logging.debug(f"StitchWorker: 计算重叠成功: 滚动距离{s_new}px, score={score:.3f}")
-                                        is_stuck = False
-                                        KNOWN_SCROLL_DEVIATION_LOW = 0.5
-                                        KNOWN_SCROLL_DEVIATION_HIGH = 1.5
-                                        if auto_mode_context is not None and known_scroll_distances:
-                                            stable_distance = np.median(known_scroll_distances[-5:])
-                                            if stable_distance > 0 and (s_new < (stable_distance * KNOWN_SCROLL_DEVIATION_LOW) or s_new > (stable_distance * KNOWN_SCROLL_DEVIATION_HIGH)):
-                                                logging.warning(f"StitchWorker: 检测到滚动距离异常。当前: {s_new}px, 稳定值: {stable_distance:.1f}px")
-                                                is_stuck = True
-                                        if is_stuck:
-                                            if ActionController._check_if_bottom_reached(img_top_np, img_new_np, bottom_check_height):
-                                                logging.debug("StitchWorker: 滚动距离异常且检测到底部，发送 BOTTOM_REACHED 信号")
-                                                result_queue.put(('BOTTOM_REACHED', None))
-                                                continue
-                                            else:
-                                                logging.warning("StitchWorker: 滚动距离异常，但底部检测未通过。将接受此帧")
-                                        if s_new > 0 and s_new not in known_scroll_distances:
-                                            result_queue.put(('LEARNED_SCROLL', s_new))
+                            img_top = cv2.imread(prev_filepath_str)
+                            if img_top is None: raise ValueError(f"无法加载上一张图片 {prev_filepath_str}")
+                        h_top, _, _ = img_top.shape
+                        if should_perform_matching:
+                            success = False
+                            final_best_candidate = None
+                            all_candidates = []
+                            detected_bars = ImageMatcher.detect_static_bars(
+                                img_top, img_new, prev_y=prev_box_y, curr_y=current_box_y
+                            )
+                            h_header, h_footer, _, _ = detected_bars
+                            if detected_bars != last_detected_bars:
+                                last_detected_bars = detected_bars
+                                result_queue.put(('STATIC_BARS_DETECTED', detected_bars))
+                            if not last_action_was_pop:
+                                predicted_candidates = []
+                                if ticks_scrolled > 0:
+                                    exact_history = scroll_history.get(ticks_scrolled, [])
+                                    if exact_history:
+                                        common_dists = [dist for dist, count in Counter(exact_history).most_common()]
+                                        predicted_candidates.extend(common_dists)
+                                        logging.debug(f"StitchWorker: 历史精确匹配候选 (ticks={ticks_scrolled}): {common_dists}")
+                                    all_dists = [d for sublist in scroll_history.values() for d in sublist]
+                                    all_ticks_sum = sum([t * len(sublist) for t, sublist in scroll_history.items()])
+                                    all_units = [d / t for t, sublist in scroll_history.items() for d in sublist if t > 0]
+                                    if all_ticks_sum > 0:
+                                        avg_px_per_tick = sum(all_dists) / all_ticks_sum
+                                        std_dev = np.std(all_units)
+                                        if std_dev * ticks_scrolled <= 2.0:
+                                            inferred_dist = round(avg_px_per_tick * ticks_scrolled)
+                                            is_duplicate = any(abs(inferred_dist - c) < 1 for c in predicted_candidates)
+                                            if not is_duplicate:
+                                                predicted_candidates.append(inferred_dist)
+                                                logging.debug(f"StitchWorker: 均值推断候选 {inferred_dist}px (均值 {avg_px_per_tick:.2f}px/格, std={std_dev:.2f})")
+                                elif box_shift_y != 0:
+                                    predicted_candidates.append(0)
+                                for cand_scroll_px in predicted_candidates:
+                                    pred_shift = cand_scroll_px + box_shift_y
+                                    if pred_shift >= h_top - h_footer: continue
+                                    score_pred, pred_cut_y = ImageMatcher.verify_region(img_top, img_new, pred_shift, h_header, detected_bars, box_shift_y)
+                                    cand = {'shift': pred_shift, 'cut_y': pred_cut_y, 'score': score_pred, 'source': 'prediction'}
+                                    if score_pred > ImageMatcher.THRES_SCORE:
+                                        final_best_candidate = cand
+                                        logging.debug(f"StitchWorker: 预测命中 (score={score_pred:.1f})! 滚动距离 {cand_scroll_px}px")
+                                        break
                                     else:
-                                        logging.warning(f"StitchWorker: 计算重叠失败 (score={score:.3f}, s_new={s_new}px). 阈值未满足 (score>={QUALITY_THRESHOLD} and s_new>={ticks_scrolled*config.MIN_SCROLL_PER_TICK})")
-                                        if auto_mode_context is not None:
-                                            if ActionController._check_if_bottom_reached(img_top_np, img_new_np, bottom_check_height):
-                                                logging.debug("StitchWorker: 检测到底部，发送 BOTTOM_REACHED 信号")
-                                                result_queue.put(('BOTTOM_REACHED', None))
-                                                continue
-                                            else:
-                                                logging.debug("StitchWorker: 重叠匹配失败，底部检测也未通过")
+                                        all_candidates.append(cand)
+                            if not final_best_candidate:
+                                logging.debug("StitchWorker: 预测未达标，执行搜索")
+                                s_shift, s_cut, s_score = ImageMatcher.detect_visual_shift(img_top, img_new, detected_bars, box_shift_y, min_shift, max_shift)
+                                cand = {'shift': s_shift, 'cut_y': s_cut, 'score': s_score, 'source': 'search'}
+                                if s_score > ImageMatcher.THRES_SCORE:
+                                    final_best_candidate = cand
+                                    logging.debug(f"StitchWorker: 搜索命中 (score={s_score:.1f}), shift={s_shift}")
                                 else:
-                                    logging.warning("StitchWorker: 有效搜索范围为0，跳过重叠计算")
+                                    all_candidates.append(cand)
+                            if not final_best_candidate:
+                                fb_shift, fb_cut, fb_score = ImageMatcher.detect_visual_shift(img_top, img_new, detected_bars, box_shift_y, 0, min_shift)
+                                cand = {'shift': fb_shift, 'cut_y': fb_cut, 'score': fb_score, 'source': 'fallback'}
+                                if fb_score > ImageMatcher.THRES_SCORE:
+                                    final_best_candidate = cand
+                                    logging.debug(f"StitchWorker: 回退搜索命中 (score={fb_score:.1f})")
+                                else:
+                                    all_candidates.append(cand)
+                            if not final_best_candidate and all_candidates:
+                                valid_candidates = [c for c in all_candidates if c['score'] >= 0]
+                                if valid_candidates:
+                                    final_best_candidate = max(valid_candidates, key=lambda c: (c['score'], 1 if c['source'] == 'prediction' else 0, c['shift']))
+                                    logging.debug(f"StitchWorker: 无确信匹配，选出最佳候选：{final_best_candidate['source']} (score={final_best_candidate['score']:.1f})")
+                            if final_best_candidate:
+                                shift = final_best_candidate['shift']
+                                cut_y = final_best_candidate['cut_y']
+                                success = True
+                                if is_auto_mode and shift == 0 and final_best_candidate['score'] > ImageMatcher.THRES_SCORE:
+                                    logging.info("StitchWorker: 自动模式下检测到 shift=0，判定到达底部")
+                                    result_queue.put(('STATIC_BARS_DETECTED', (0, 0, 0, 0)))
+                                    result_queue.put(('BOTTOM_REACHED', None))
+                                    continue
                             else:
-                                logging.debug("StitchWorker: 无需进行匹配，设置 overlap=0")
-                                overlap = 0
-                    result_queue.put(('ADD_RESULT', (filepath_str, w_new, h_new, overlap)))
+                                y_start_scan = h_header if box_shift_y == 0 else 0
+                                y_end_scan = h_new - h_footer
+                                search_h_bot = y_end_scan - y_start_scan
+                                num_rows = max(1, round(search_h_bot ** 0.5 / 3.5))
+                                row_h = search_h_bot // num_rows
+                                fallback_res = ImageMatcher.detect_micro_overlap(img_top, img_new, detected_bars, row_h, box_shift_y)
+                                if fallback_res is not None:
+                                    fallback_shift, fallback_cut_y = fallback_res
+                                    logging.debug(f"StitchWorker: 微小重叠兜底成功，shift={fallback_shift}，cut_y={fallback_cut_y}")
+                                    shift = fallback_shift
+                                    cut_y = fallback_cut_y
+                                    success = True
+                                else:
+                                    logging.debug(f"StitchWorker: 检测微小重叠失败，row_h={row_h}")
+                                    success = False
+                        else:
+                            logging.debug("StitchWorker: 匹配已禁用，执行直接拼接")
+                            shift = h_top
+                            cut_y = 0
+                            success = True
+                        if not success:
+                            logging.warning(f"StitchWorker: 图像匹配失败，回退到直接拼接")
+                            shift = h_top
+                            cut_y = 0
+                            if is_auto_mode:
+                                score_static, _ = ImageMatcher.verify_region(img_top, img_new, 0, h_header, detected_bars, box_shift_y)
+                                if score_static > ImageMatcher.THRES_SCORE:
+                                    logging.info("StitchWorker: 检测到底部")
+                                    result_queue.put(('BOTTOM_REACHED', None))
+                    if success and prev_filepath_str and should_perform_matching:
+                        actual_scroll_px = shift - box_shift_y
+                        is_anomaly = False
+                        if ticks_scrolled > 0 and not last_action_was_pop and actual_scroll_px > 0:
+                            current_unit = actual_scroll_px / ticks_scrolled
+                            if scroll_history:
+                                all_dists = [d for sublist in scroll_history.values() for d in sublist]
+                                all_ticks = [t * len(sublist) for t, sublist in scroll_history.items()]
+                                total_ticks_sum = sum(all_ticks)
+                                if total_ticks_sum > 0:
+                                    avg_unit = sum(all_dists) / total_ticks_sum
+                                    if not (0.85 * avg_unit <= current_unit <= 1.15 * avg_unit):
+                                        logging.warning(f"StitchWorker: 滚动单位异常，当前: {current_unit:.2f}px/格, 历史均值: {avg_unit:.2f}px/格")
+                                        is_anomaly = True
+                                    else:
+                                        if pending_new_trend:
+                                            pending_new_trend.clear()
+                            else:
+                                is_anomaly = True
+                        if is_anomaly:
+                            should_accept_trend = False
+                            if not pending_new_trend:
+                                pending_new_trend.append((ticks_scrolled, actual_scroll_px))
+                            else:
+                                prev_ticks, prev_dist = pending_new_trend[-1]
+                                prev_unit = prev_dist / prev_ticks
+                                if 0.85 * prev_unit <= current_unit <= 1.15 * prev_unit:
+                                    pending_new_trend.append((ticks_scrolled, actual_scroll_px))
+                                    if len(pending_new_trend) >= 3:
+                                        should_accept_trend = True
+                                else:
+                                    pending_new_trend = [(ticks_scrolled, actual_scroll_px)]
+                            if should_accept_trend:
+                                logging.info(f"StitchWorker: 检测到稳定的新滚动速度 ({current_unit:.2f}px/格)，更新历史统计")
+                                is_anomaly = False
+                                for t, d in pending_new_trend:
+                                    result_queue.put(('LEARNED_SCROLL', (t, d)))
+                                pending_new_trend.clear()
+                        if not is_anomaly and not last_action_was_pop and ticks_scrolled > 0 and actual_scroll_px > 0:
+                            logging.debug(f"StitchWorker: 学习数据 -> {ticks_scrolled}格 = {actual_scroll_px}px")
+                            result_queue.put(('LEARNED_SCROLL', (ticks_scrolled, actual_scroll_px)))
+                    result_queue.put(('ADD_RESULT', (filepath_str, w_new, h_new, shift, cut_y, current_box_y, thumb_data, full_img_data)))
+                    cached_prev_filepath = filepath_str
+                    cached_prev_img = img_new
                 except Exception as e:
                     logging.error(f"StitchWorker: 处理 ADD 任务时出错 ({filepath.name}): {e}")
-                    GLib.idle_add(
-                        send_desktop_notification,
-                        "图片处理错误",
-                        f"无法处理截图 {Path(filepath_str).name}: {e}\n该帧已被跳过，长图可能不完整",
-                        "dialog-warning", "warning"
-                    )
+                    GLib.idle_add(send_notification, "图片处理错误", f"无法处理截图 {Path(filepath_str).name}: {e}", "warning", config.WARNING_SOUND)
                     try:
-                        if 'w_new' not in locals() or 'h_new' not in locals():
-                            with Image.open(filepath) as img: w_new, h_new = img.size
-                        result_queue.put(('ADD_RESULT', (filepath_str, w_new, h_new, 0)))
+                        if w_new is None or h_new is None:
+                            file_info, w_fallback, h_fallback = GdkPixbuf.Pixbuf.get_file_info(str(filepath))
+                            if file_info: w_new, h_new = w_fallback, h_fallback
+                            else: w_new, h_new = 0, 0
+                        result_queue.put(('ADD_RESULT', (filepath_str, w_new, h_new, h_new, 0, current_box_y, None, None)))
                     except Exception as fallback_e:
                         logging.error(f"StitchWorker: 获取图片尺寸失败: {fallback_e}")
                 finally:
+                    last_action_was_pop = False
                     task_queue.task_done()
             elif task.get('type') == 'POP':
-                logging.debug("StitchWorker: 收到 POP 任务，发送确认回主线程")
-                result_queue.put(('POP_REQUEST_RECEIVED', None))
+                logging.debug("StitchWorker: 收到 POP 任务，发送确认")
+                last_action_was_pop = True
+                cached_prev_filepath = None
+                cached_prev_img = None
+                result_queue.put(('POP_ACK', None))
                 task_queue.task_done()
-            else:
-                logging.warning(f"StitchWorker: 收到未知任务类型: {task.get('type')}")
-                task_queue.task_done()
-        logging.debug("StitchWorker 线程已结束。")
+        logging.debug("StitchWorker 线程已结束")
     # 缓冲区px }
 
     def handle_movement_action(self, direction: str, source: str = 'hotkey'):
-        """根据配置文件处理前进/后退动作 (滚动, 截图, 删除). """
-        if self.is_exiting:
-            return
+        """处理前进/后退动作 (滚动, 截图, 删除). """
         if self.is_processing_movement:
             logging.debug("正在处理上一个移动动作，忽略新的请求")
             return
         if not self.grid_mode_controller.is_active:
             logging.warning("非整格模式下，前进/后退动作无效")
-            send_desktop_notification("操作无效", "前进/后退操作仅在整格模式下可用", level="normal")
+            send_notification("操作无效", "前进/后退操作仅在整格模式下可用", "normal")
             return
         self.is_processing_movement = True
-        grid_unit_buf = self.grid_mode_controller.grid_unit # 缓冲区px
-        scale = self.view.scale
+        grid_unit_buf = self.session.grid_unit # 缓冲区px
+        scale = self.session.scale
         if grid_unit_buf <= 0:
-            logging.error("整格模式滚动单位无效，无法执行操作")
+            logging.warning("整格模式滚动单位无效，无法执行操作")
             self.is_processing_movement = False
             return
         action_str = config.FORWARD_ACTION if direction == 'down' else config.BACKWARD_ACTION
         actions = action_str.lower().replace(" ", "").split('_')
         def do_scroll_action(callback):
-            region_height = self.session.geometry['h'] # 逻辑px
-            num_ticks = int(int(region_height * scale) / grid_unit_buf) # 逻辑px -> 缓冲区px
-            direction_sign = 1 if direction == 'up' else -1
+            ticks_floor = int(int(self.session.geometry['h'] * scale) / grid_unit_buf) # 逻辑px -> 缓冲区px
+            if self.session.grid_matching_enabled:
+                formula = self.config.GRID_SCROLL_TICKS_FORMULA
+                def eval_formula(f_str):
+                    expr = f_str.replace('{ticks}', str(ticks_floor))
+                    if not re.match(r'^[\d\s+\-*/().,maxminint]+$', expr):
+                        raise ValueError("公式包含非法字符")
+                    return int(eval(expr, {"__builtins__": None, "max": max, "min": min, "int": int}))
+                try:
+                    num_ticks = eval_formula(formula)
+                    logging.debug(f"应用公式 '{formula}' (ticks={ticks_floor}) -> 滚动 {num_ticks} 格")
+                except Exception as e:
+                    default_formula = self.config.get_default_string('Behavior', 'grid_scroll_ticks_formula')
+                    logging.warning(f"滚动公式 '{formula}' 解析失败: {e}，回退到默认公式 '{default_formula}'")
+                    try:
+                        num_ticks = eval_formula(default_formula)
+                    except Exception as e_def:
+                        logging.error(f"默认公式解析也失败: {e_def}，回退到 ({ticks_floor}-1)")
+                        num_ticks = max(1, ticks_floor - 1)
+            else:
+                num_ticks = ticks_floor
+            direction_sign = 1 if direction == 'down' else -1
             total_ticks = num_ticks * direction_sign
-            should_return = (source == 'button')
-            self.scroll_manager.scroll_discrete(total_ticks, return_cursor=should_return)
-            GLib.timeout_add(self.SCROLL_TIME_MS, callback)
+            self.accumulated_scroll_ticks += total_ticks
+            self.scroll_manager.scroll_discrete(total_ticks, return_cursor=(source == 'button'))
+            GLib.timeout_add(self.config.GRID_SCROLL_INTERVAL_MS, callback)
             return False
         def do_capture_action(callback):
             logging.debug("执行截图...")
             self.take_capture()
-            GLib.timeout_add(self.CAPTURE_DELAY_MS, callback)
+            GLib.timeout_add(50, callback)
             return False
         def do_delete_action(callback):
             logging.debug("执行删除...")
             self.delete_last_capture()
-            GLib.timeout_add(self.CAPTURE_DELAY_MS, callback)
+            GLib.timeout_add(50, callback)
             return False
         action_map = {
             'scroll': do_scroll_action,
@@ -2746,203 +3625,171 @@ class ActionController:
             return False
         GLib.idle_add(execute_next_in_queue, 0)
 
-    def _release_movement_lock(self):
-         if self.is_processing_movement:
-             self.is_processing_movement = False
-         return False
+    def _get_and_reset_scroll_delta(self):
+        delta = 0
+        global hotkey_manager
+        if hotkey_manager and hotkey_manager.listener and hasattr(hotkey_manager.listener, 'get_scroll_delta'):
+            delta = hotkey_manager.listener.get_scroll_delta(reset=True)
+        elif self.scroll_listener:
+            delta = self.scroll_listener.get_scroll_delta(reset=True)
+        if delta == 0 and self.accumulated_scroll_ticks != 0:
+            delta = self.accumulated_scroll_ticks
+        self.accumulated_scroll_ticks = 0
+        return delta
 
-    def take_capture(self, widget=None, auto_mode=False):
-        """执行截图的核心逻辑"""
-        if self.is_exiting:
-            return False
-        grabbed_seat = None
+    def _release_movement_lock(self):
+        if self.is_processing_movement:
+            self.is_processing_movement = False
+        return False
+
+    def take_capture(self, widget=None, automated=False):
         filepath = None
-        self.auto_mode_context = None
-        if not auto_mode and self.is_auto_scrolling:
+        if not automated and self.is_auto_scrolling:
             logging.debug("自动滚动模式下忽略手动截图请求")
             return False
         try:
             # 逻辑px窗口坐标
             shot_x = self.session.geometry['x']
             shot_y = self.session.geometry['y']
-            shot_w = self.session.geometry['w']
-            shot_h = self.session.geometry['h']
+            w = self.session.geometry['w']
+            h = self.session.geometry['h']
             is_grid = self.grid_mode_controller.is_active
-            is_auto = self.is_auto_scrolling or auto_mode
-            should_include_cursor = self.config.CAPTURE_WITH_CURSOR and not is_grid and not is_auto
-            if auto_mode:
-                if self.is_first_auto_capture:
-                    logging.debug("自动模式：截取首次完整高度")
-                    cap_x, cap_y, cap_w, cap_h = shot_x, shot_y, shot_w, shot_h
-                    self.auto_mode_context = {'initial_full': True}
-                    self.is_first_auto_capture = False
-                else:
-                    ticks_to_scroll = self.config.AUTO_SCROLL_TICKS_PER_STEP
-                    capture_height_per_tick_buf = self.config.MAX_SCROLL_PER_TICK # 缓冲区px
-                    total_capture_height = capture_height_per_tick_buf * ticks_to_scroll
-                    scale = self.view.scale
-                    cap_h_logical = min(int(total_capture_height / scale), shot_h) # 缓冲区px -> 逻辑px
-                    cap_h = cap_h_logical
-                    cap_y = shot_y + shot_h - cap_h
-                    cap_x, cap_w = shot_x, shot_w
-                    self.auto_mode_context = {'initial_full': False}
-            else:
-                cap_x, cap_y, cap_w, cap_h = shot_x, shot_y, shot_w, shot_h
-                self.auto_mode_context = None
-            mon_x, mon_y = self.view.window_to_monitor(cap_x, cap_y) # 窗口坐标 -> 显示器坐标
-            self._move_cursor_out_if_needed(mon_x, mon_y, cap_w, cap_h, should_include_cursor)
+            should_include_cursor = self.config.CAPTURE_WITH_CURSOR and not is_grid and not automated
+            real_ticks = self._get_and_reset_scroll_delta()
+            logging.debug(f"ActionController: 捕获时检测到累计滚动 {real_ticks} 格")
+            self._move_cursor_out_if_needed(shot_x, shot_y, w, h, should_include_cursor)
             if IS_WAYLAND and not should_include_cursor:
                 time.sleep(0.1)
-            if cap_w <= 0.5 or cap_h <= 0.5:
-                logging.warning(f"捕获区域过小，跳过截图。尺寸: {cap_w}x{cap_h}")
+            if w <= 0.5 or h <= 0.5:
+                logging.warning(f"捕获区域过小，跳过截图。尺寸: {w}x{h}")
                 return False
-            filepath = config.TMP_DIR / f"{self._capture_filename_counter:04d}_capture.png"
+            filepath = config.TEMP_DIRECTORY / f"{self._capture_filename_counter:04d}_capture.png"
             self._capture_filename_counter += 1
-            if FRAME_GRABBER.capture(mon_x, mon_y, cap_w, cap_h, filepath, self.view.scale, include_cursor=should_include_cursor):
+            cap_x, cap_y = self.view.coord_manager.map_point(shot_x, shot_y, source=CoordSys.WINDOW, target=self.frame_grabber.target_coords)
+            if self.frame_grabber.capture(cap_x, cap_y, w, h, filepath, self.session.scale, include_cursor=should_include_cursor):
                 logging.info(f"已捕获截图: {filepath}")
-                if not auto_mode:
-                    play_sound(config.CAPTURE_SOUND)
-                prev_filepath = self.stitch_model.entries[-1]['filepath'] if self.stitch_model.entries else None
+                if not automated:
+                    SystemInteraction.play_sound(config.CAPTURE_SOUND)
+                prev_entry = self.stitch_model.entries[-1] if self.stitch_model.entries else None
+                prev_filepath = prev_entry['filepath'] if prev_entry else None
+                prev_box_y_buf = prev_entry.get('box_y', 0) if prev_entry else 0
+                box_y_buf = round(cap_y * self.session.scale)
+                if self.is_auto_scrolling:
+                    should_match = True
+                elif is_grid:
+                    should_match = self.session.grid_matching_enabled
+                else:
+                    should_match = self.config.ENABLE_FREE_SCROLL_MATCHING
                 task = {
                     'type': 'ADD',
                     'filepath': str(filepath),
                     'prev_filepath': prev_filepath,
-                    'is_grid_mode': self.grid_mode_controller.is_active,
-                    'grid_matching_enabled': self.session.is_matching_enabled,
-                    'auto_mode_context': self.auto_mode_context,
-                    'ticks_scrolled': self.config.AUTO_SCROLL_TICKS_PER_STEP if auto_mode and not self.auto_mode_context.get('initial_full', False) else 2
+                    'box_y_buf': box_y_buf,
+                    'prev_box_y_buf': prev_box_y_buf,
+                    'should_perform_matching': should_match,
+                    'is_auto_mode': self.is_auto_scrolling,
+                    'ticks_scrolled': real_ticks
                 }
                 self.task_queue.put(task)
                 return True
             else:
-                 logging.error(f"截图失败: {filepath}")
-                 filepath = None
-                 send_desktop_notification("截图失败", "无法从屏幕获取图像，请检查日志", "dialog-error", level="warning")
-                 return False
+                logging.error(f"截图失败: {filepath}")
+                filepath = None
+                send_notification("截图失败", "无法从屏幕获取图像，请检查日志", "warning", config.WARNING_SOUND,)
+                return False
         except Exception as e:
             logging.error(f"执行截图失败: {e}")
-            send_desktop_notification("截图失败", f"无法执行截图命令: {e}", "dialog-warning", level="warning")
+            send_notification("截图失败", f"无法截图: {e}", "warning", config.WARNING_SOUND)
             filepath = None
             return False
 
-    def _move_cursor_out_if_needed(self, mon_x, mon_y, w, h, should_include_cursor):
+    def _move_cursor_out_if_needed(self, win_x, win_y, w, h, should_include_cursor):
         """Wayland 在自动模式和整格模式下如果配置为截取鼠标指针，则将其移动到截图区域之外"""
-        # mon_x, mon_y, w, h: 逻辑px; mon_x, mon_y: 显示器坐标
-        if not IS_WAYLAND:
+        # win_x, win_y, w, h: 逻辑px; win_x, win_y: 窗口坐标
+        if not IS_WAYLAND or not config.CAPTURE_WITH_CURSOR or should_include_cursor:
             return
-        if not config.CAPTURE_WITH_CURSOR:
-            return
-        if should_include_cursor:
-            return
-        monitor_offset_x = self.view.screen_rect.x if self.view.screen_rect else 0
-        monitor_offset_y = self.view.screen_rect.y if self.view.screen_rect else 0
-        # 显示器坐标 -> 全局坐标
-        g_x_logic = mon_x + monitor_offset_x
-        g_y_logic = mon_y + monitor_offset_y
+        g_x_logic, g_y_logic = self.view.coord_manager.map_point(win_x, win_y, source=CoordSys.WINDOW, target=CoordSys.GLOBAL)
         target_x_logic = g_x_logic + w + 40
         target_y_logic = g_y_logic + (h // 2)
-        scale = self.view.scale
+        scale = self.session.scale
         # 逻辑px -> 缓冲区px
         target_x_buf = round(target_x_logic * scale)
         target_y_buf = round(target_y_logic * scale)
         abs_mouse = self.scroll_manager.evdev_abs_mouse
         if abs_mouse:
-            target_x_buf = min(target_x_buf, abs_mouse.max_x)
-            target_y_buf = min(target_y_buf, abs_mouse.max_y)
             logging.debug(f"移动鼠标至区域外 ({target_x_buf}, {target_y_buf}) 以避开截图")
             abs_mouse.move(target_x_buf, target_y_buf)
 
     def delete_last_capture(self, widget=None):
-        if self.is_exiting:
-            return
         logging.info("请求删除最后一张截图...")
         if self.is_auto_scrolling:
             logging.warning("自动滚动模式下忽略撤销请求")
             return
-        play_sound(config.UNDO_SOUND)
+        SystemInteraction.play_sound(config.UNDO_SOUND)
         task = {'type': 'POP'}
         self.task_queue.put(task)
 
     def start_auto_scroll(self, widget=None, source='hotkey'):
-        if self.is_exiting:
-            return
         if self.is_auto_scrolling:
             logging.warning("自动滚动已在运行中")
             return
-        self.is_auto_scrolling = True
-        global hotkey_listener
-        if hotkey_listener:
-            hotkey_listener.enable_mouse_click_stop(True)
-        self.set_current_mode("自动模式")
-        self.auto_scroll_return_cursor = (source == 'button')
-        if self.auto_scroll_return_cursor and self.config.SCROLL_METHOD == 'move_user_cursor':
-            self.auto_scroll_original_cursor_pos = self.scroll_manager._get_pointer_position()
-            logging.debug(f"自动模式：记录原始光标位置 {self.auto_scroll_original_cursor_pos}")
-        self.auto_scroll_needs_capture = False
+        self.session.set_mode(CaptureMode.AUTO)
+        global hotkey_manager
+        if hotkey_manager:
+            hotkey_manager.enable_mouse_click_monitor(True, lambda: GLib.idle_add(self.stop_auto_scroll, "用户点击鼠标左键停止"))
+        if source == 'button' and self.config.SCROLL_METHOD == 'move_user_cursor':
+            self.saved_cursor_pos = self.scroll_manager.get_pointer_position(target=CoordSys.GLOBAL)
+            logging.debug(f"自动模式：记录原始光标位置 {self.saved_cursor_pos}")
+        self.pending_capture = False
         if self.stitch_model.capture_count == 0:
-            logging.info("自动模式：首次启动，先进行一次完整截图")
-            self.is_first_auto_capture = True
-            if not self.take_capture(auto_mode=True):
-                self.stop_auto_scroll("启动失败：无法捕获初始截图", level="warning")
-                return
-            self.auto_scroll_timer_id = GLib.timeout_add(self.AUTO_CAPTURE_DELAY_MS, self._auto_scroll_step)
+            logging.info("自动模式：首次启动，先进行截图")
+            self._auto_capture_step()
         else:
             logging.info("自动模式：继续添加截图，直接开始滚动")
-            self.is_first_auto_capture = False
             self._auto_scroll_step()
-        send_desktop_notification("自动模式已启动", f"按 {config.str_auto_scroll_stop.upper()} 或点击鼠标左键停止", level="normal")
-        btn_panel = self.view.button_panel
-        btn_panel.btn_capture.set_sensitive(False)
-        btn_panel.btn_undo.set_sensitive(False)
-        btn_panel.btn_auto_start.set_sensitive(False)
+        send_notification("自动模式已启动", f"按 {config.HOTKEY_AUTO_SCROLL_STOP.to_string()} 或点击鼠标左键停止", "normal")
 
     def stop_auto_scroll(self, reason_message=None, level="normal"):
         if not self.is_auto_scrolling:
             return
         logging.info("正在停止自动滚动...")
-        self.is_auto_scrolling = False
-        global hotkey_listener
-        if hotkey_listener:
-            hotkey_listener.enable_mouse_click_stop(False)
-        should_restore = self.auto_scroll_return_cursor and self.auto_scroll_original_cursor_pos
+        global hotkey_manager
+        if hotkey_manager:
+            hotkey_manager.enable_mouse_click_monitor(False)
+        should_restore = self.saved_cursor_pos is not None
+        notif_msg = reason_message if reason_message else "用户按快捷键停止"
+        notification_info = ("自动模式已停止", notif_msg, level)
+        if not self.auto_scroll_timer_id and not self.pending_capture:
+            send_notification(*notification_info)
         if self.auto_scroll_timer_id:
             GLib.source_remove(self.auto_scroll_timer_id)
             self.auto_scroll_timer_id = None
             logging.debug("自动滚动定时器已移除")
-            if self.auto_scroll_needs_capture:
-                delay_ms = 300
-                GLib.timeout_add(delay_ms, self._perform_delayed_final_capture, should_restore)
+            if self.pending_capture:
+                GLib.timeout_add(300, self._perform_delayed_final_capture, should_restore, notification_info)
                 should_restore = False
         self._release_movement_lock()
         if should_restore:
-            logging.debug(f"自动模式结束：恢复原始光标位置到 {self.auto_scroll_original_cursor_pos}")
-            self.scroll_manager._set_pointer_position(*self.auto_scroll_original_cursor_pos)
-            self.auto_scroll_original_cursor_pos = None
-        if reason_message:
-            send_desktop_notification("自动滚动已停止", reason_message, level="normal")
+            logging.debug(f"自动模式结束：恢复原始光标位置到 {self.saved_cursor_pos}")
+            self.scroll_manager.set_pointer_position(*self.saved_cursor_pos)
+            self.saved_cursor_pos = None
+        if self.session.grid_app_class is not None:
+            self.session.set_mode(CaptureMode.GRID)
         else:
-            send_desktop_notification("自动模式已停止", "用户按快捷键停止", level=level)
-        if self.grid_mode_controller.is_active:
-            self.set_current_mode("整格模式")
-        else:
-            self.set_current_mode("自由模式")
-        btn_panel = self.view.button_panel
-        btn_panel.btn_capture.set_sensitive(True)
-        btn_panel.set_undo_sensitive(self.stitch_model.capture_count > 0)
-        btn_panel.btn_grid_forward.set_sensitive(True)
-        btn_panel.btn_grid_backward.set_sensitive(True)
-        btn_panel.btn_auto_start.set_sensitive(True)
+            self.session.set_mode(CaptureMode.FREE)
 
-    def _perform_delayed_final_capture(self, should_restore_cursor=False):
-        if self.is_exiting:
+    def _perform_delayed_final_capture(self, should_restore_cursor=False, notification_info=None):
+        if self.session.is_exiting or not self.stitch_worker_running or self.session.is_finished:
             return False
         logging.debug("自动模式：执行延迟后的最终截图")
-        self.take_capture(auto_mode=True)
-        self.auto_scroll_needs_capture = False
-        if should_restore_cursor and self.auto_scroll_original_cursor_pos:
-            logging.debug(f"延迟恢复原始光标位置到 {self.auto_scroll_original_cursor_pos}")
-            self.scroll_manager._set_pointer_position(*self.auto_scroll_original_cursor_pos)
-            self.auto_scroll_original_cursor_pos = None
+        self.take_capture(automated=True)
+        self.pending_capture = False
+        if should_restore_cursor and self.saved_cursor_pos:
+            logging.debug(f"延迟恢复原始光标位置到 {self.saved_cursor_pos}")
+            self.scroll_manager.set_pointer_position(*self.saved_cursor_pos)
+            self.saved_cursor_pos = None
+        if notification_info:
+            send_notification(*notification_info)
         return False
 
     def _auto_scroll_step(self):
@@ -2950,135 +3797,98 @@ class ActionController:
             self._release_movement_lock()
             return False
         if self.is_processing_movement:
-            logging.debug("自动滚动：正在处理上一动作，等待100ms")
+            logging.debug("自动滚动：正在处理上一动作，等待 100 ms")
             self.auto_scroll_timer_id = GLib.timeout_add(100, self._auto_scroll_step)
             return False
         ticks_to_scroll = self.config.AUTO_SCROLL_TICKS_PER_STEP
-        base_interval_ms = self.AUTO_SCROLL_INTERVAL_MS
-        dynamic_interval_ms = int(base_interval_ms * (1 + 0.6 * (ticks_to_scroll - 1)))
-        dynamic_interval_ms = min(dynamic_interval_ms, 2000)
-        logging.debug(f"自动滚动: 滚动 {ticks_to_scroll} 格, 等待 {dynamic_interval_ms}ms 后截图")
-        self.scroll_manager.scroll_discrete(-ticks_to_scroll, return_cursor=False)
-        self.auto_scroll_needs_capture = True
+        self.scroll_manager.scroll_discrete(ticks_to_scroll, return_cursor=False)
+        logging.debug(f"自动滚动: 滚动 {ticks_to_scroll} 格, 等待 {self.config.AUTO_SCROLL_INTERVAL_MS} ms 后截图")
+        self.accumulated_scroll_ticks += ticks_to_scroll
+        self.pending_capture = True
         self.is_processing_movement = True
-        self.auto_scroll_timer_id = GLib.timeout_add(
-            dynamic_interval_ms,
-            self._auto_capture_step
-        )
+        self.auto_scroll_timer_id = GLib.timeout_add(self.config.AUTO_SCROLL_INTERVAL_MS, self._auto_capture_step)
         return False
 
     def _auto_capture_step(self):
         if not self.is_auto_scrolling:
             self._release_movement_lock()
             return False
-        if not self.take_capture(auto_mode=True):
+        if not self.take_capture(automated=True):
             self.stop_auto_scroll("截图失败", level="warning")
             return False
         self.is_processing_movement = False
-        self.auto_scroll_needs_capture = False
-        self.auto_scroll_timer_id = GLib.timeout_add(
-            self.AUTO_CAPTURE_DELAY_MS, 
-            self._auto_scroll_step
-        )
+        self.pending_capture = False
+        self.auto_scroll_timer_id = GLib.timeout_add(50, self._auto_scroll_step)
         return False
 
     def finalize_and_quit(self, widget=None):
-        """执行完成拼接并退出的逻辑"""
         # 缓冲区px
         if not self.config.SAVE_DIRECTORY:
             logging.warning("保存目录未配置，中止完成流程")
-            send_desktop_notification(
-                title="配置缺失",
-                message="请先设置图片保存目录，设置完成后配置即生效",
-                sound_name="dialog-warning",
-                level="warning"
-            )
+            send_notification("配置缺失", "请先设置图片保存目录", "warning", config.WARNING_SOUND)
             if not self.view.config_panel.get_visible():
                 self.view.toggle_config_panel()
             self.view.config_panel.switch_to_page("output")
             self.view.config_panel.set_advanced_mode(True)
-            self.view.config_panel.save_dir_entry.grab_focus()
-            return
-        if self.is_exiting:
-            logging.debug("正在退出中，忽略完成请求")
             return
         if self.is_auto_scrolling:
             self.stop_auto_scroll()
         if self.stitch_model.capture_count == 0:
             logging.info("未进行任何截图。正在退出")
-            self.quit_and_cleanup()
+            self.perform_cleanup()
             return
-        if hotkey_listener and hotkey_listener.is_alive():
-            hotkey_listener.stop()
-        self.is_exiting = True
+        JPEG_MAX_DIMENSION = 65500
+        if self.config.SAVE_FORMAT == 'JPEG' and (self.stitch_model.image_width > JPEG_MAX_DIMENSION or self.stitch_model.total_virtual_height > JPEG_MAX_DIMENSION):
+            logging.warning(f"长图尺寸 ({self.stitch_model.image_width}x{self.stitch_model.total_virtual_height}) 超过 JPEG 上限，中止完成流程")
+            msg = f"当前尺寸已超出 JPEG 上限\n请切换为 PNG 格式或确保图片宽高不超过 {JPEG_MAX_DIMENSION} 像素"
+            send_notification("长图尺寸过大", msg, "warning", config.WARNING_SOUND, 5)
+            if not self.view.config_panel.get_visible():
+                self.view.toggle_config_panel()
+            self.view.config_panel.switch_to_page("output")
+            return
+        global hotkey_manager
+        if hotkey_manager:
+            hotkey_manager.set_paused(True)
         logging.debug("请求停止 StitchWorker 并等待...")
         self.task_queue.put({'type': 'EXIT'})
         self.stitch_worker.join(timeout=2.0)
         self.stitch_worker_running = False
         self._check_result_queue()
         logging.debug("StitchWorker 已停止且结果队列已清空")
-        processing_panel, progress_bar = self.view._show_processing_panel()
+        processing_dialog = FeedbackWidget(self.view, text="正在处理...", show_progress=True)
+        self.view.overlay_manager.show(processing_dialog, anchor='center', layer=OverlayManager.LAYER_HIGH, mask=True)
         if self.view.preview_panel and self.view.preview_panel.get_visible():
-             logging.debug("检测到预览面板已打开，正在隐藏它...")
-             GLib.idle_add(self.view.preview_panel.hide)
+            GLib.idle_add(self.view.preview_panel.hide)
         if self.view.config_panel and self.view.config_panel.get_visible():
-             logging.debug("检测到配置面板已打开，正在隐藏它...")
-             GLib.idle_add(self.view.config_panel.hide)
+            GLib.idle_add(self.view.config_panel.hide)
         render_plan_snapshot = list(self.stitch_model.render_plan)
         image_width_snapshot = self.stitch_model.image_width
-        if render_plan_snapshot:
-            last_piece = render_plan_snapshot[-1]
-            total_height_snapshot = last_piece['render_y_start'] + last_piece['height']
-        else:
-            total_height_snapshot = 0
+        total_height_snapshot = self.stitch_model.total_virtual_height
         thread = threading.Thread(
             target=self._perform_final_stitch_and_save,
-            args=(processing_panel, progress_bar, render_plan_snapshot, image_width_snapshot, total_height_snapshot),
+            args=(processing_dialog, render_plan_snapshot, image_width_snapshot, total_height_snapshot),
             daemon=True
         )
         thread.start()
 
     def _release_heavy_resources(self):
-        """在保持窗口显示通知的同时，释放线程等重资源"""
         logging.debug("正在释放重资源...")
-        if FRAME_GRABBER:
-            FRAME_GRABBER.cleanup()
-        if self.view.invisible_scroller:
-            self.view.invisible_scroller.cleanup()
-            self.view.invisible_scroller = None
+        if self.frame_grabber:
+            self.frame_grabber.cleanup()
+            self.frame_grabber = None
 
-    def _ensure_cleanup(self):
-        if self.final_notification is not None:
-            logging.warning("通知关闭回调超时，强制执行清理")
-            self.final_notification = None
-            self._perform_cleanup()
-        return GLib.SOURCE_REMOVE
-
-    def _perform_final_stitch_and_save(self, processing_panel, progress_bar, render_plan, image_width, total_height):
+    def _perform_final_stitch_and_save(self, feedback_widget, render_plan, image_width, total_height):
         """在后台线程中执行拼接和保存"""
         # 缓冲区px
         finalize_start_time = time.perf_counter()
-        label_widget = None
-        try:
-            vbox = processing_panel.get_children()[0]
-            top_hbox = vbox.get_children()[0]
-            label_widget = top_hbox.get_children()[1]
-        except Exception as e:
-            logging.warning(f"无法找到处理窗口中的Label控件: {e}")
         def update_progress(fraction):
-            GLib.idle_add(progress_bar.set_fraction, fraction)
-            return GLib.SOURCE_REMOVE
+            GLib.idle_add(feedback_widget.set_progress, fraction)
         def update_label_text(text):
-            if label_widget:
-                markup = f"<span color='white' font_weight='bold'>{GLib.markup_escape_text(text)}</span>"
-                GLib.idle_add(label_widget.set_markup, markup)
-            return GLib.SOURCE_REMOVE
-        def _schedule_clipboard_task(path_to_copy):
-            copy_to_clipboard(path_to_copy)
-            return GLib.SOURCE_REMOVE
+            GLib.idle_add(feedback_widget.set_text, text)
         try:
             if not render_plan:
                 logging.warning("传入的截图列表为空，退出处理")
+                GLib.idle_add(self.perform_cleanup)
                 return
             now = datetime.now()
             timestamp_str = now.strftime(config.FILENAME_TIMESTAMP_FORMAT)
@@ -3089,276 +3899,115 @@ class ActionController:
             output_file.parent.mkdir(parents=True, exist_ok=True)
             stitch_start_time = time.perf_counter()
             stitched_image = stitch_images_in_memory_from_model(
-                 render_plan=render_plan,
-                 image_width=image_width,
-                 total_height=total_height,
-                 progress_callback=update_progress
+                render_plan=render_plan,
+                image_width=image_width,
+                total_height=total_height,
+                progress_callback=update_progress
             )
             stitch_duration = time.perf_counter() - stitch_start_time
             logging.info(f"图片拼接总耗时: {stitch_duration:.3f} 秒")
-            if stitched_image:
+            if stitched_image is not None:
                 update_label_text("正在保存...")
-                GLib.idle_add(progress_bar.set_fraction, 1.0)
+                update_progress(1.0)
                 save_start_time = time.perf_counter()
                 if config.SAVE_FORMAT == 'JPEG':
                     logging.debug(f"以 JPEG 格式保存，质量为 {config.JPEG_QUALITY}")
-                    if stitched_image.mode == 'RGBA':
-                        stitched_image = stitched_image.convert('RGB')
-                    stitched_image.save(str(output_file), 'JPEG', quality=config.JPEG_QUALITY)
+                    success = cv2.imwrite(str(output_file), stitched_image, [int(cv2.IMWRITE_JPEG_QUALITY), config.JPEG_QUALITY])
                 else:
                     logging.debug("以 PNG 格式保存")
-                    stitched_image.save(str(output_file), 'PNG')
+                    success = cv2.imwrite(str(output_file), stitched_image, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                if not success:
+                    raise RuntimeError(f"无法将长图 {output_file} 写入磁盘")
                 save_duration = time.perf_counter() - save_start_time
-                logging.info(f"图片成功使用 Pillow 拼接并保存到: {output_file}，保存耗时: {save_duration:.3f} 秒")
-                message = f"已保存到: {output_file}"
-                if config.COPY_TO_CLIPBOARD:
-                    update_label_text("复制到剪贴板...")
-                    logging.debug("开始复制到剪贴板")
-                    GLib.idle_add(_schedule_clipboard_task, output_file)
-                    message += "\n并已复制到剪贴板"
+                logging.info(f"图片成功拼接并保存到: {output_file}，保存耗时: {save_duration:.3f} 秒")
                 total_finalize_duration = time.perf_counter() - finalize_start_time
                 logging.info(f"完成最终处理总耗时: {total_finalize_duration:.3f} 秒")
-                GLib.idle_add(
-                    lambda: send_desktop_notification(
-                        title="长截图制作成功",
+                def _on_save_success():
+                    clipboard_msg = ""
+                    if config.COPY_TO_CLIPBOARD_ON_FINISH:
+                        update_label_text("复制到剪贴板...")
+                        logging.debug("开始复制到剪贴板")
+                        _, cb_msg = SystemInteraction.copy_to_clipboard(output_file)
+                        clipboard_msg = f"\n{cb_msg}"
+                    message = f"已保存到: {output_file}{clipboard_msg}"
+                    send_notification(
+                        title="长截图拼接成功",
                         message=message,
-                        sound_name=config.FINALIZE_SOUND,
                         level="success",
+                        sound_name=config.FINALIZE_SOUND,
                         timeout=8,
-                        action_config={
-                            'path': output_file,
-                            'controller': self,
-                            'width': image_width,
-                            'height': total_height
-                        }
+                        action_config={'path': output_file, 'width': image_width, 'height': total_height}
                     )
-                )
-                self._release_heavy_resources()
-                GLib.idle_add(self.view.enter_notification_mode)
+                    self._release_heavy_resources()
+                    self.session.set_finished(True)
+                GLib.idle_add(_on_save_success)
         except Exception as e:
             logging.error(f"最终处理时发生错误: {e}")
-            GLib.idle_add(
-                lambda: send_desktop_notification(
-                    title="长截图制作失败",
-                    message=f"发生错误: {e}",
-                    sound_name="dialog-error",
-                    level="warning",
-                )
-            )
-            GLib.idle_add(self._perform_cleanup)
+            GLib.idle_add(self.perform_cleanup)
         finally:
-            GLib.idle_add(processing_panel.destroy)
+            GLib.idle_add(self.view.overlay_manager.dismiss, feedback_widget)
 
     def quit_and_cleanup(self, widget=None):
         """处理带确认的退出逻辑"""
-        if self.is_exiting:
-            logging.debug("正在退出中，忽略重复退出请求")
-            return
         if self.is_auto_scrolling:
             self.stop_auto_scroll()
         if self.stitch_model.capture_count == 0:
             logging.info("没有截图，直接退出")
-            self._perform_cleanup()
+            self.perform_cleanup()
             return
-        response = self.view.show_quit_confirmation_dialog()
-        if self.is_exiting: return
-        if response == Gtk.ResponseType.YES:
+        dialog = QuitDialog(self.stitch_model.capture_count)
+        response, _ = self.view.overlay_manager.run_modal(dialog, anchor='center', layer=OverlayManager.LAYER_HIGH, mask=True)
+        if response == Gtk.ResponseType.OK:
             logging.info("用户确认放弃截图")
-            self._perform_cleanup()
+            self.perform_cleanup()
         else:
             logging.info("用户取消了放弃操作")
 
-    def _perform_cleanup(self):
+    def perform_cleanup(self):
         """执行最终的清理工作"""
-        self.is_exiting = True
+        self.session.set_exiting(True)
+        self.config.flush_save()
         logging.info("正在执行清理和退出操作")
-        global hotkey_listener
-        if hotkey_listener and hotkey_listener.is_alive():
-            hotkey_listener.stop()
+        global hotkey_manager
+        if hotkey_manager:
+            hotkey_manager.stop()
+        if self.config_handler_id:
+            self.config.disconnect(self.config_handler_id)
         if self.result_check_timer_id:
-             GLib.source_remove(self.result_check_timer_id)
-             self.result_check_timer_id = None
-             logging.debug("结果检查定时器已移除")
+            GLib.source_remove(self.result_check_timer_id)
+            self.result_check_timer_id = None
+            logging.debug("结果检查定时器已移除")
         if self.stitch_worker_running:
-             logging.debug("检测到 StitchWorker 仍在运行，尝试最后停止...")
-             self.task_queue.put({'type': 'EXIT'})
-             self.stitch_worker.join(timeout=0.5)
-             self.stitch_worker_running = False
-        if self.view.invisible_scroller:
-            cleanup_thread = threading.Thread(target=self.view.invisible_scroller.cleanup)
-            cleanup_thread.start()
-            logging.debug("InvisibleCursorScroller.cleanup() 正在后台线程中执行")
-        if self.view.evdev_wheel_scroller:
-            self.view.evdev_wheel_scroller.close()
-            logging.debug("EvdevWheelScroller 已关闭")
-        if self.scroll_manager.evdev_abs_mouse:
-            self.scroll_manager.evdev_abs_mouse.close()
-            logging.debug("EvdevAbsoluteMouse 已关闭")
-        if FRAME_GRABBER:
-            FRAME_GRABBER.cleanup()
+            logging.debug("检测到 StitchWorker 仍在运行，尝试最后停止...")
+            self.task_queue.put({'type': 'EXIT'})
+            self.stitch_worker.join(timeout=0.5)
+            self.stitch_worker_running = False
+        if self.scroll_listener:
+            self.scroll_listener.stop()
+        known_files = [entry['filepath'] for entry in self.stitch_model.entries]
+        self.stitch_model.cleanup()
+        if self.frame_grabber:
+            self.frame_grabber.cleanup()
             logging.debug("FrameGrabber 已清理")
-        self.session.cleanup()
+        self.view.overlay_manager.cleanup()
+        SystemInteraction.cleanup_temp_dirs(self.config, is_exiting=True, known_files=known_files)
+        self.scroll_manager.cleanup()
         Gtk.main_quit()
-
-    def handle_key_press(self, event):
-        """处理来自视图的按键事件"""
-        global are_hotkeys_enabled
-        global hotkey_listener
-        if hotkey_listener and hotkey_listener.running and are_hotkeys_enabled:
-            return False
-        if not are_hotkeys_enabled and not self.view.is_dialog_open:
-            logging.debug("CaptureOverlay 热键被禁用，忽略按键。")
-            return True
-        if self.view.is_dialog_open:
-            return True
-        keyval = event.keyval
-        state = event.state & config.GTK_MODIFIER_MASK
-        def is_match(hotkey_config):
-            return keyval in hotkey_config['gtk_keys'] and state == hotkey_config['gtk_mask']
-        for hotkey_config, action in self._hotkey_actions:
-            if is_match(hotkey_config):
-                action()
-                return True
-        return False
-
-    def handle_button_press(self, event):
-        """处理来自视图的鼠标按下事件"""
-        # 逻辑px窗口坐标
-        self.resize_edge = self.view.get_cursor_edge(event.x, event.y)
-        if self.resize_edge:
-            self.is_dragging = True
-            self.drag_start_x_rel, self.drag_start_y_rel = event.x, event.y
-            self.drag_start_geometry = self.session.geometry.copy()
-
-    def handle_button_release(self, event):
-        """处理来自视图的鼠标释放事件"""
-        self.is_dragging = False
-        self.resize_edge = None
-
-    def handle_motion(self, event):
-        """处理来自视图的鼠标移动事件（仅在拖拽时）"""
-        if not self.is_dragging or not self.resize_edge:
-            return
-        # 逻辑px窗口坐标
-        x_rel, y_rel = event.x, event.y
-        delta_x = x_rel - self.drag_start_x_rel
-        delta_y = y_rel - self.drag_start_y_rel
-        new_geo = self.drag_start_geometry.copy()
-        scale = self.view.scale
-        if self.grid_mode_controller.is_active:
-            if 'top' in self.resize_edge:
-                new_geo['y'] = self.drag_start_geometry['y'] + delta_y
-            elif 'bottom' in self.resize_edge:
-                # 逻辑px -> 缓冲区px
-                delta_y_buf = delta_y * scale
-                start_h_buf = self.drag_start_geometry['h'] * scale
-                units_dragged = int(delta_y_buf / self.grid_mode_controller.grid_unit)
-                target_h_buf = start_h_buf + (units_dragged * self.grid_mode_controller.grid_unit) # 缓冲区px
-                snapped_h_logical = math.ceil(target_h_buf / scale) # 缓冲区px -> 逻辑px
-                new_geo['h'] = max(math.ceil(self.grid_mode_controller.grid_unit / scale), snapped_h_logical)
-            if not self.session.is_horizontally_locked:
-                if 'left' in self.resize_edge:
-                    new_geo['x'] = self.drag_start_geometry['x'] + delta_x
-                elif 'right' in self.resize_edge:
-                    new_geo['w'] = self.drag_start_geometry['w'] + delta_x
-        else:
-            if 'top' in self.resize_edge:
-                new_geo['y'] = self.drag_start_geometry['y'] + delta_y
-            elif 'bottom' in self.resize_edge:
-                new_geo['h'] = self.drag_start_geometry['h'] + delta_y
-            if not self.session.is_horizontally_locked:
-                if 'left' in self.resize_edge:
-                    new_geo['x'] = self.drag_start_geometry['x'] + delta_x
-                elif 'right' in self.resize_edge:
-                    new_geo['w'] = self.drag_start_geometry['w'] + delta_x
-        if self.grid_mode_controller.is_active:
-            min_h = math.ceil(self.grid_mode_controller.grid_unit / scale) # 缓冲区px -> 逻辑px
-        else:
-            min_h = 2 * config.HANDLE_HEIGHT
-        min_w = 2 * config.HANDLE_HEIGHT
-        if new_geo['h'] < min_h:
-            if 'top' in self.resize_edge: new_geo['y'] -= (min_h - new_geo['h'])
-            new_geo['h'] = min_h
-        if new_geo['w'] < min_w:
-            if 'left' in self.resize_edge: new_geo['x'] -= (min_w - new_geo['w'])
-            new_geo['w'] = min_w
-        rect = self.view.screen_rect
-        win_w = rect.width if rect else self.view.get_allocated_width()
-        win_h = rect.height if rect else self.view.get_allocated_height()
-        x_min, y_min = 0, 0 # 逻辑px窗口坐标
-        # 显示器坐标 -> 窗口坐标
-        x_max = win_w - self.view.monitor_offset_x
-        y_max = win_h - self.view.monitor_offset_y
-        grid_unit_buf = self.grid_mode_controller.grid_unit if self.grid_mode_controller.is_active else 0 # 缓冲区px
-        is_dragging_left = 'left' in self.resize_edge
-        is_dragging_top = 'top' in self.resize_edge
-        is_dragging_bottom = 'bottom' in self.resize_edge
-        # 逻辑px
-        original_h_from_logic = new_geo['h']
-        original_y_from_logic = new_geo['y']
-        if not self.session.is_horizontally_locked:
-            if is_dragging_left:
-                if new_geo['x'] < x_min: 
-                    new_geo['w'] = new_geo['w'] + (new_geo['x'] - x_min)
-                    new_geo['x'] = x_min
-                if new_geo['x'] + new_geo['w'] > x_max: 
-                    new_geo['w'] = x_max - new_geo['x']
-            elif 'right' in self.resize_edge:
-                if new_geo['x'] + new_geo['w'] > x_max: 
-                    new_geo['w'] = x_max - new_geo['x']
-            if new_geo['w'] < min_w:
-                if is_dragging_left: new_geo['x'] = new_geo['x'] + new_geo['w'] - min_w
-                new_geo['w'] = min_w
-        if new_geo['y'] < y_min:
-            if is_dragging_top: 
-                new_geo['h'] = new_geo['h'] + (new_geo['y'] - y_min)
-            new_geo['y'] = y_min
-        if new_geo['y'] + new_geo['h'] > y_max:
-            if is_dragging_top: 
-                new_geo['h'] = y_max - new_geo['y']
-            elif is_dragging_bottom: 
-                new_geo['h'] = y_max - new_geo['y']
-        if new_geo['h'] < min_h:
-            if is_dragging_top: new_geo['y'] = new_geo['y'] + new_geo['h'] - min_h
-            new_geo['h'] = min_h
-        height_was_compressed_by_boundary = (new_geo['h'] != original_h_from_logic)
-        if grid_unit_buf > 0 and height_was_compressed_by_boundary:
-            start_h = self.drag_start_geometry['h']
-            delta_h = new_geo['h'] - start_h
-            # 逻辑px -> 缓冲区px
-            start_h_buf = start_h * scale
-            delta_h_buf = delta_h * scale
-            units_changed = int(delta_h_buf / grid_unit_buf)
-            # 逻辑px
-            snapped_h_buf = start_h_buf + (units_changed * grid_unit_buf)
-            snapped_h_buf = max(grid_unit_buf, snapped_h_buf)
-            snapped_h_logical = math.ceil(snapped_h_buf / scale) # 缓冲区px -> 逻辑px
-            if is_dragging_top:
-                # 逻辑px
-                y_adjustment = new_geo['h'] - snapped_h_logical
-                new_geo['y'] = new_geo['y'] + y_adjustment
-                if new_geo['y'] < y_min:
-                    new_geo['y'] = y_min
-                    new_geo['h'] = max(math.ceil(grid_unit_buf / scale), (new_geo['h'] * scale // grid_unit_buf) * grid_unit_buf)
-            new_geo['h'] = snapped_h_logical
-        self.session.update_geometry(new_geo)
-        self.view.update_layout()
-        self.view.queue_draw()
 
 class ButtonPanel(Gtk.Box):
     # 逻辑px
     __gsignals__ = {
+        'grid-forward-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'grid-backward-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'auto-scroll-start-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'auto-scroll-stop-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
         'capture-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
         'undo-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
         'finalize-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
         'cancel-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
-        'grid-backward-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
-        'grid-forward-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
-        'auto-scroll-start-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
-        'auto-scroll-stop-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
     def __init__(self):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=config.BUTTON_SPACING)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         buttons_data = [
             ('btn_grid_forward', '前进', 'grid-forward-clicked'),
             ('btn_grid_backward', '后退', 'grid-backward-clicked'),
@@ -3374,24 +4023,8 @@ class ButtonPanel(Gtk.Box):
             btn.connect("clicked", lambda w, s=signal_name: self.emit(s))
             btn.set_can_focus(False)
             btn.show()
-            btn.get_style_context().add_class("force-active-style")
+            btn.get_style_context().add_class("overlay-button")
             setattr(self, attr_name, btn)
-        if config.ENABLE_GRID_ACTION_BUTTONS:
-            self.btn_grid_backward.set_visible(False)
-            self.btn_grid_forward.set_visible(False)
-        else:
-            self.btn_grid_backward.set_no_show_all(True)
-            self.btn_grid_forward.set_no_show_all(True)
-            self.btn_grid_backward.hide()
-            self.btn_grid_forward.hide()
-        if config.ENABLE_AUTO_SCROLL_BUTTONS:
-            self.btn_auto_start.set_visible(True)
-            self.btn_auto_stop.set_visible(True)
-        else:
-            self.btn_auto_start.set_no_show_all(True)
-            self.btn_auto_stop.set_no_show_all(True)
-            self.btn_auto_start.hide()
-            self.btn_auto_stop.hide()
         self.btn_undo.set_sensitive(False)
         self.pack_start(self.btn_grid_forward, True, True, 0)
         self.pack_start(self.btn_grid_backward, True, True, 0)
@@ -3407,43 +4040,37 @@ class ButtonPanel(Gtk.Box):
         self.pack_start(self.btn_cancel, True, True, 0)
         self.set_size_request(config.BUTTON_PANEL_WIDTH, -1)
         self.show()
-        self.btn_grid_backward.set_visible(False)
-        self.btn_grid_forward.set_visible(False)
-        self.separator_grid_auto.set_visible(False)
-        self.btn_auto_start.set_visible(config.ENABLE_AUTO_SCROLL_BUTTONS)
-        self.btn_auto_stop.set_visible(config.ENABLE_AUTO_SCROLL_BUTTONS)
-        self.separator_auto_main.set_visible(config.ENABLE_AUTO_SCROLL_BUTTONS)
-        _, self._button_natural_h_normal = self.get_preferred_height()
-        logging.debug(f"缓存的 ButtonPanel 普通模式自然高度: {self._button_natural_h_normal} 逻辑px")
-        self.btn_grid_backward.set_visible(config.ENABLE_GRID_ACTION_BUTTONS)
-        self.btn_grid_forward.set_visible(config.ENABLE_GRID_ACTION_BUTTONS)
-        self.separator_grid_auto.set_visible(config.ENABLE_GRID_ACTION_BUTTONS)
-        self.btn_auto_start.set_visible(False)
-        self.btn_auto_stop.set_visible(False)
-        self.separator_auto_main.set_visible(False)
-        _, self._button_natural_h_grid = self.get_preferred_height()
-        logging.debug(f"缓存的 ButtonPanel 整格模式自然高度: {self._button_natural_h_grid} 逻辑px")
-        self.set_grid_action_buttons_visible(False)
+        self.update_button_state(CaptureMode.FREE)
 
-    def set_grid_action_buttons_visible(self, visible: bool):
-        is_grid_mode = visible
-        grid_buttons_show = is_grid_mode and config.ENABLE_GRID_ACTION_BUTTONS
-        self.btn_grid_backward.set_visible(grid_buttons_show)
-        self.btn_grid_forward.set_visible(grid_buttons_show)
-        auto_buttons_show = (not is_grid_mode) and config.ENABLE_AUTO_SCROLL_BUTTONS
-        self.btn_auto_start.set_visible(auto_buttons_show)
-        self.btn_auto_stop.set_visible(auto_buttons_show)
-        self.separator_grid_auto.set_visible(grid_buttons_show)
-        self.separator_auto_main.set_visible(auto_buttons_show)
+    def update_button_state(self, mode: CaptureMode):
+        is_grid = (mode == CaptureMode.GRID)
+        is_auto = (mode == CaptureMode.AUTO)
+        show_grid_btns = is_grid and config.ENABLE_GRID_ACTION_BUTTONS
+        show_auto_btns = (not is_grid) and config.ENABLE_AUTO_SCROLL_BUTTONS
+        self.btn_grid_forward.set_visible(show_grid_btns)
+        self.btn_grid_backward.set_visible(show_grid_btns)
+        self.separator_grid_auto.set_visible(show_grid_btns)
+        self.btn_auto_start.set_visible(show_auto_btns)
+        self.btn_auto_stop.set_visible(show_auto_btns)
+        self.separator_auto_main.set_visible(show_auto_btns)
+        sensitive = not is_auto
+        self.btn_capture.set_sensitive(sensitive)
+        self.btn_auto_start.set_sensitive(sensitive)
+        self.btn_grid_forward.set_sensitive(sensitive)
+        self.btn_grid_backward.set_sensitive(sensitive)
+        if is_auto:
+            self.btn_undo.set_sensitive(False)
 
     def set_undo_sensitive(self, sensitive: bool):
         self.btn_undo.set_sensitive(sensitive)
 
-    def update_visibility_by_height(self, available_height: int, is_grid_mode: bool):
+    def update_visibility_by_height(self, available_height, mode: CaptureMode):
         should_show_buttons_base = config.ENABLE_BUTTONS
         if not should_show_buttons_base:
             return False
-        required_h = self._button_natural_h_grid if is_grid_mode else self._button_natural_h_normal
+        self.update_button_state(mode)
+        self.show()
+        _, required_h = self.get_preferred_height()
         return available_height >= required_h
 
 class InfoPanel(Gtk.Box):
@@ -3467,58 +4094,61 @@ class InfoPanel(Gtk.Box):
             label.set_justify(Gtk.Justification.CENTER)
             label.set_xalign(0.5)
             self.pack_start(label, False, False, 0)
-        self.update_info(0, 0, 0, "自由模式")
+        self.update_info(0, 0, 0, CaptureMode.FREE.value)
 
     def update_info(self, count: int, width: int, height: int, mode_str: str):
         # width, height: 缓冲区px
         if config.SHOW_CAPTURE_COUNT:
-            self.label_count.set_text(config.STR_CAPTURE_COUNT_FORMAT.format(count=count))
+            self.label_count.set_text(f"截图: {count}")
             self.label_count.show()
         else:
             self.label_count.hide()
         if config.SHOW_TOTAL_DIMENSIONS:
             pango_attrs = "line_height='0.8'"
             if count > 0:
-                width_int = int(round(width))
-                height_int = int(round(height))
-                dim_markup = f"<span {pango_attrs}>{width_int}\nx\n{height_int}</span>"
+                dim_markup = f"<span {pango_attrs}>{width}\nx\n{height}</span>"
             else:
                 dim_markup = f"<span {pango_attrs}>宽\nx\n高</span>"
             self.label_dimensions.set_markup(dim_markup)
             self.label_dimensions.show()
         else:
             self.label_dimensions.hide()
-        self.label_mode.set_text(mode_str)
+        self.label_mode.set_markup(mode_str)
         if config.SHOW_CURRENT_MODE:
             self.label_mode.show()
         else:
             self.label_mode.hide()
 
 class FunctionPanel(Gtk.Box):
-   __gsignals__ = {
-       'toggle-grid-mode-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
-       'toggle-preview-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
-       'open-config-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
-       'toggle-hotkeys-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
-   }
-   def __init__(self):
-       super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=config.BUTTON_SPACING) # 逻辑px
-       self.set_valign(Gtk.Align.START)
-       self.btn_toggle_grid = Gtk.Button(label=f"整格模式")
-       self.btn_toggle_grid.connect("clicked", lambda w: self.emit('toggle-grid-mode-clicked'))
-       self.btn_toggle_preview = Gtk.Button(label=f"预览面板")
-       self.btn_toggle_preview.connect("clicked", lambda w: self.emit('toggle-preview-clicked'))
-       self.btn_open_config = Gtk.Button(label=f"配置面板")
-       self.btn_open_config.connect("clicked", lambda w: self.emit('open-config-clicked'))
-       self.btn_toggle_hotkeys = Gtk.Button(label=f"热键开关")
-       self.btn_toggle_hotkeys.connect("clicked", lambda w: self.emit('toggle-hotkeys-clicked'))
-       buttons = [self.btn_toggle_grid, self.btn_toggle_preview, self.btn_open_config, self.btn_toggle_hotkeys]
-       for btn in buttons:
-           btn.set_can_focus(False)
-           btn.get_style_context().add_class("force-active-style")
-           self.pack_start(btn, False, False, 0)
-           btn.show()
-       self.show()
+    __gsignals__ = {
+        'toggle-grid-mode-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'toggle-preview-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'open-config-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'toggle-hotkeys-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
+    }
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=5) # 逻辑px
+        self.set_valign(Gtk.Align.START)
+        self.btn_toggle_grid = Gtk.Button(label=f"整格模式")
+        self.btn_toggle_grid.connect("clicked", lambda w: self.emit('toggle-grid-mode-clicked'))
+        self.btn_toggle_preview = Gtk.Button(label=f"预览面板")
+        self.btn_toggle_preview.connect("clicked", lambda w: self.emit('toggle-preview-clicked'))
+        self.btn_open_config = Gtk.Button(label=f"配置面板")
+        self.btn_open_config.connect("clicked", lambda w: self.emit('open-config-clicked'))
+        self.btn_toggle_hotkeys = Gtk.Button(label=f"热键开关")
+        self.btn_toggle_hotkeys.connect("clicked", lambda w: self.emit('toggle-hotkeys-clicked'))
+        buttons = [self.btn_toggle_grid, self.btn_toggle_preview, self.btn_open_config, self.btn_toggle_hotkeys]
+        for btn in buttons:
+            btn.set_can_focus(False)
+            btn.get_style_context().add_class("overlay-button")
+            self.pack_start(btn, False, False, 0)
+            btn.show()
+        self.show()
+        self.update_button_state(CaptureMode.FREE)
+
+    def update_button_state(self, mode: CaptureMode):
+        is_auto = (mode == CaptureMode.AUTO)
+        self.btn_toggle_grid.set_sensitive(not is_auto)
 
 class SidePanel(Gtk.Box):
     # 逻辑px
@@ -3529,7 +4159,7 @@ class SidePanel(Gtk.Box):
         'toggle-hotkeys-clicked': (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
     def __init__(self):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=config.BUTTON_SPACING)
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         self.info_panel = InfoPanel()
         self.info_panel.set_size_request(config.SIDE_PANEL_WIDTH, -1)
         self.pack_start(self.info_panel, False, False, 0)
@@ -3542,22 +4172,22 @@ class SidePanel(Gtk.Box):
         self.function_panel.connect("toggle-hotkeys-clicked", lambda w: self.emit('toggle-hotkeys-clicked'))
         self.info_panel.show()
         self.function_panel.show()
-        _, self._info_natural_h = self.info_panel.get_preferred_height()
-        logging.debug(f"缓存的 InfoPanel 自然高度: {self._info_natural_h} 逻辑px")
-        _, self._func_natural_h = self.function_panel.get_preferred_height()
-        logging.debug(f"缓存的 FunctionPanel 自然高度: {self._func_natural_h} 逻辑px")
 
-    def update_visibility_by_height(self, available_height: int, is_grid_mode: bool):
+    def update_visibility_by_height(self, available_height):
         should_show_info_base = config.ENABLE_SIDE_PANEL and (config.SHOW_CAPTURE_COUNT or config.SHOW_TOTAL_DIMENSIONS or config.SHOW_CURRENT_MODE)
         should_show_func_base = config.ENABLE_SIDE_PANEL
-        if not should_show_info_base:
-            self.info_panel.hide()
-        required_h_for_info = self._info_natural_h if should_show_info_base else 0
-        required_h_for_func = self._func_natural_h if should_show_func_base else 0
-        threshold_for_info_only = required_h_for_info
-        threshold_for_both = required_h_for_info + required_h_for_func
-        can_show_info_panel = available_height >= threshold_for_info_only
-        can_show_func_panel = available_height >= threshold_for_both
+        if should_show_info_base:
+            self.info_panel.show()
+            _, info_nat_h = self.info_panel.get_preferred_height()
+        else:
+            info_nat_h = 0
+        if should_show_func_base:
+            self.function_panel.show()
+            _, func_nat_h = self.function_panel.get_preferred_height()
+        else:
+            func_nat_h = 0
+        can_show_info_panel = available_height >= info_nat_h
+        can_show_func_panel = available_height >= info_nat_h + func_nat_h
         if should_show_info_base and can_show_info_panel:
             self.info_panel.show()
         else:
@@ -3566,65 +4196,60 @@ class SidePanel(Gtk.Box):
             self.function_panel.show()
         else:
             self.function_panel.hide()
+        return self.info_panel.get_visible() or self.function_panel.get_visible()
 
 class InstructionPanel(Gtk.Box):
-    # 逻辑px
+    INSTRUCTIONS = [
+        ("toggle_instruction_panel", "显隐此面板"),
+        ("capture", "截图"),
+        ("finalize", "完成"),
+        ("undo", "撤销"),
+        ("cancel", "取消"),
+        ("auto_scroll_start", "启用自动模式"),
+        ("auto_scroll_stop", "停止自动模式"),
+        ("grid_forward", "整格前进"),
+        ("grid_backward", "整格后退"),
+        ("configure_scroll_unit", "配置滚动单位"),
+        ("toggle_grid_mode", "切换整格模式"),
+        ("toggle_config_panel", "显隐配置面板"),
+        ("toggle_hotkeys_enabled", "开关热键"),
+        ("toggle_preview", "显隐预览面板"),
+        ("preview_zoom_in", "放大预览图"),
+        ("preview_zoom_out", "缩小预览图"),
+    ]
+
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.get_style_context().add_class("instruction-panel")
-        grid = Gtk.Grid()
-        grid.set_column_spacing(10)
-        grid.set_row_spacing(4)
-        self.pack_start(grid, True, True, 0)
-        instructions = [
-            (config.str_toggle_instruction_panel.upper(), "显隐此面板"),
-            (config.str_capture.upper(), "截图"),
-            (config.str_finalize.upper(), "完成"),
-            (config.str_undo.upper(), "撤销"),
-            (config.str_cancel.upper(), "取消"),
-            (config.str_auto_scroll_start.upper(), "开始自动模式"),
-            (config.str_auto_scroll_stop.upper(), "停止自动模式"),
-            (config.str_toggle_grid_mode.upper(), "切换整格模式"),
-            (config.str_grid_forward.upper(), "整格前进"),
-            (config.str_grid_backward.upper(), "整格后退"),
-            (config.str_configure_scroll_unit.upper(), "配置滚动单位"),
-            (config.str_toggle_preview.upper(), "显隐预览面板"),
-            (config.str_open_config_editor.upper(), "显隐配置面板"),
-            (config.str_toggle_hotkeys_enabled.upper(), "开关热键"),
-            (config.str_preview_zoom_out.upper(), "放大预览面板"),
-            (config.str_preview_zoom_in.upper(), "缩小预览面板"),
-        ]
-        for i, (key, desc) in enumerate(instructions):
-            lbl_key = Gtk.Label(label=key)
-            lbl_key.set_halign(Gtk.Align.START)
-            lbl_key.get_style_context().add_class("key-label")
-            lbl_desc = Gtk.Label(label=desc)
-            lbl_desc.set_halign(Gtk.Align.START)
-            lbl_desc.get_style_context().add_class("desc-label")
-            grid.attach(lbl_key, 0, i, 1, 1)
-            grid.attach(lbl_desc, 1, i, 1, 1)
+        self.grid = Gtk.Grid()
+        # 逻辑px
+        self.grid.set_column_spacing(10)
+        self.grid.set_row_spacing(4)
+        self.pack_start(self.grid, True, True, 0)
+        self.reload_keys()
         self.show_all()
 
-class QueueHandler(logging.Handler):
-    def __init__(self, log_queue):
-        super().__init__()
-        self.log_queue = log_queue
-
-    def emit(self, record):
-        self.log_queue.put(record)
-
-class StreamToLoggerRedirector:
-    def __init__(self, logger, level):
-        self.logger = logger
-        self.level = level
-        self.linebuf = ''
-
-    def write(self, buf):
-        for line in buf.rstrip().splitlines():
-            self.logger.log(self.level, line.rstrip())
-
-    def flush(self):
-        pass
+    def reload_keys(self):
+        for child in self.grid.get_children():
+            self.grid.remove(child)
+        global hotkey_manager
+        active_keys = hotkey_manager.active_keys if hotkey_manager else set()
+        for i, (action_name, desc) in enumerate(self.INSTRUCTIONS):
+            hotkey_def = getattr(config, f"HOTKEY_{action_name.upper()}")
+            key_str = hotkey_def.to_string()
+            lbl_key = Gtk.Label(label=key_str)
+            lbl_key.set_halign(Gtk.Align.START)
+            lbl_desc = Gtk.Label(label=desc)
+            lbl_desc.set_halign(Gtk.Align.START)
+            if action_name in active_keys:
+                lbl_key.get_style_context().add_class("key-label")
+                lbl_desc.get_style_context().add_class("desc-label")
+            else:
+                lbl_key.get_style_context().add_class("key-label-inactive")
+                lbl_desc.get_style_context().add_class("desc-label-inactive")
+            self.grid.attach(lbl_key, 0, i, 1, 1)
+            self.grid.attach(lbl_desc, 1, i, 1, 1)
+        self.grid.show_all()
 
 class SimulatedWindow(Gtk.EventBox):
     """模拟窗口行为的基础组件，提供标题栏拖动、边缘调整大小、最大化和关闭功能"""
@@ -3632,19 +4257,18 @@ class SimulatedWindow(Gtk.EventBox):
     def __init__(self, parent_overlay, title="Window", css_class="simulated-window", resizable=True):
         super().__init__()
         self.parent_overlay = parent_overlay
+        self.cursors = parent_overlay.cursors
         self.is_maximized = False
         self.resizable = resizable
         # 窗口坐标
         self.restore_geometry = None
         self.RESIZE_BORDER = 6
-        self._dragging_panel = False
-        self._resizing_panel = False
         self._resize_edge = None
         self._drag_anchor_mouse = None
         self._drag_anchor_panel_pos = None
         self._resize_start_rect = None
-        self._resize_limit_w = 100
-        self._resize_limit_h = 50
+        self._resize_limit_w = 200
+        self._resize_limit_h = 300
         self.user_has_moved = False
         self.get_style_context().add_class(css_class)
         self.main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -3679,9 +4303,19 @@ class SimulatedWindow(Gtk.EventBox):
         self.connect("button-press-event", self._on_panel_press)
         self.connect("button-release-event", self._on_panel_release)
         self.connect("motion-notify-event", self._on_panel_motion)
+        self.connect("realize", lambda w: w.get_window().set_cursor(self.cursors['default']))
 
     def add_content(self, widget, expand=True, fill=True, padding=0):
         self.main_vbox.pack_start(widget, expand, fill, padding)
+
+    def hide(self):
+        self._resize_edge = None
+        self._drag_anchor_mouse = None
+        self._drag_anchor_panel_pos = None
+        self._resize_start_rect = None
+        if self.get_window():
+            self.get_window().set_cursor(self.cursors.get('default'))
+        super().hide()
 
     def on_close_clicked(self, btn):
         if self.is_maximized:
@@ -3696,52 +4330,45 @@ class SimulatedWindow(Gtk.EventBox):
             self._maximize_panel()
 
     def _maximize_panel(self):
-        curr_x = self.parent_overlay.fixed_container.child_get_property(self, "x")
-        curr_y = self.parent_overlay.fixed_container.child_get_property(self, "y")
+        curr_x, curr_y = self.parent_overlay.overlay_manager.get_widget_position(self)
         alloc = self.get_allocation()
         self.restore_geometry = (curr_x, curr_y, alloc.width, alloc.height)
-        rect = self.parent_overlay.screen_rect
-        screen_w = rect.width if rect else self.parent_overlay.get_allocated_width()
-        screen_h = rect.height if rect else self.parent_overlay.get_allocated_height()
-        # 显示器坐标 -> 窗口坐标
-        valid_screen_w = screen_w - self.parent_overlay.monitor_offset_x
-        valid_screen_h = screen_h - self.parent_overlay.monitor_offset_y
+        valid_screen_w, valid_screen_h = self.parent_overlay.coord_manager.get_valid_screen_size()
         self.set_size_request(valid_screen_w, valid_screen_h)
-        self.parent_overlay.fixed_container.move(self, 0, 0)
+        self.parent_overlay.overlay_manager.move_widget(self, 0, 0)
         self.is_maximized = True
         image = Gtk.Image.new_from_icon_name("window-restore-symbolic", Gtk.IconSize.MENU)
         self.maximize_btn.set_image(image)
         self.maximize_btn.set_tooltip_text("还原")
-        self.parent_overlay._update_input_shape()
+        self.parent_overlay.overlay_manager.bring_to_front(self)
+        self.parent_overlay.update_input_shape()
 
     def _restore_panel(self):
         if not self.restore_geometry:
             return
         x, y, w, h = self.restore_geometry
         self.set_size_request(w, h)
-        self.parent_overlay.fixed_container.move(self, x, y)
+        self.parent_overlay.overlay_manager.move_widget(self, x, y)
         self.is_maximized = False
         image = Gtk.Image.new_from_icon_name("window-maximize-symbolic", Gtk.IconSize.MENU)
         self.maximize_btn.set_image(image)
         self.maximize_btn.set_tooltip_text("最大化")
-        self.parent_overlay._update_input_shape()
+        self.parent_overlay.update_input_shape()
 
     def _get_panel_edge(self, x, y):
         if not self.resizable:
             return None
-        w = self.get_allocated_width()
-        h = self.get_allocated_height()
         border = self.RESIZE_BORDER
-        on_top = y < border
-        on_bottom = y > h - border
-        on_left = x < border
-        on_right = x > w - border
-        edge = ''
-        if on_top: edge = 'top'
-        elif on_bottom: edge = 'bottom'
-        if on_left: edge += '-left' if edge else 'left'
-        elif on_right: edge += '-right' if edge else 'right'
-        return edge if edge else None
+        edges = []
+        if y < border:
+            edges.append('top')
+        elif y > self.get_allocated_height() - border:
+            edges.append('bottom')
+        if x < border:
+            edges.append('left')
+        elif x > self.get_allocated_width() - border:
+            edges.append('right')
+        return '-'.join(edges) if edges else None
 
     def _is_on_header(self, x, y):
         if not self.header_box.get_visible(): return False
@@ -3766,25 +4393,19 @@ class SimulatedWindow(Gtk.EventBox):
     def _on_panel_press(self, widget, event):
         if event.button == 1:
             target_widget = Gtk.get_event_widget(event)
-            is_clicking_input = False
             current_check = target_widget
             while current_check and current_check != widget:
-                if isinstance(current_check, (Gtk.Entry, Gtk.TextView, Gtk.SpinButton, Gtk.SearchEntry)):
-                    is_clicking_input = True
-                    break
+                if isinstance(current_check, (Gtk.Editable, Gtk.TextView)):
+                    return False
                 current_check = current_check.get_parent()
-            if not is_clicking_input:
-                toplevel = self.get_toplevel()
-                if toplevel and isinstance(toplevel, Gtk.Window):
-                    if toplevel.get_focus():
-                        toplevel.set_focus(None)
+            toplevel = self.get_toplevel()
+            if toplevel and isinstance(toplevel, Gtk.Window):
+                if toplevel.get_focus():
+                    toplevel.set_focus(None)
             edge = self._get_panel_edge(event.x, event.y)
-            win_x, win_y = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
-            self._drag_anchor_mouse = (win_x, win_y)
-            curr_x = self.parent_overlay.fixed_container.child_get_property(self, "x")
-            curr_y = self.parent_overlay.fixed_container.child_get_property(self, "y")
+            self._drag_anchor_mouse = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
+            curr_x, curr_y = self.parent_overlay.overlay_manager.get_widget_position(self)
             if edge:
-                self._resizing_panel = True
                 self._resize_edge = edge
                 alloc = self.get_allocation()
                 self._resize_start_rect = (curr_x, curr_y, alloc.width, alloc.height)
@@ -3792,29 +4413,27 @@ class SimulatedWindow(Gtk.EventBox):
                 self._resize_limit_w = min_req.width + 2 * self.RESIZE_BORDER
                 self._resize_limit_h = min_req.height + 2 * self.RESIZE_BORDER
                 self.user_has_moved = True
-                return True
             elif self._is_on_header(event.x, event.y):
-                self._dragging_panel = True
                 self._drag_anchor_panel_pos = (curr_x, curr_y)
-                self.get_window().set_cursor(self.parent_overlay.cursors.get('grabbing'))
+                self.get_window().set_cursor(self.cursors.get('grabbing'))
                 self.user_has_moved = True
-                return True
+            return True
         return False
 
     def _on_panel_release(self, widget, event):
         if event.button == 1:
-            if self._dragging_panel or self._resizing_panel:
-                self._dragging_panel = False
-                self._resizing_panel = False
+            if self._drag_anchor_panel_pos is not None or self._resize_edge is not None:
                 self._resize_edge = None
-                self.get_window().set_cursor(None)
-                self.parent_overlay._update_input_shape()
+                self._resize_start_rect = None
+                self._drag_anchor_panel_pos = None
+                self._drag_anchor_mouse = None
+                self.parent_overlay.update_input_shape()
                 self._on_panel_motion(widget, event)
-                return True
+            return True
         return False
 
     def _on_panel_motion(self, widget, event):
-        if self._dragging_panel:
+        if self._drag_anchor_panel_pos is not None:
             curr_win_x, curr_win_y = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
             if self.is_maximized:
                 max_width = self.get_allocated_width()
@@ -3826,15 +4445,15 @@ class SimulatedWindow(Gtk.EventBox):
                 new_panel_y = max(0, int(curr_win_y - 15))
                 self._drag_anchor_panel_pos = (new_panel_x, new_panel_y)
                 self._drag_anchor_mouse = (curr_win_x, curr_win_y)
-                self.parent_overlay.fixed_container.move(self, new_panel_x, new_panel_y)
+                self.parent_overlay.overlay_manager.move_widget(self, new_panel_x, new_panel_y)
                 return True
             total_dx = curr_win_x - self._drag_anchor_mouse[0]
             total_dy = curr_win_y - self._drag_anchor_mouse[1]
             new_x = self._drag_anchor_panel_pos[0] + total_dx
             new_y = max(0, self._drag_anchor_panel_pos[1] + total_dy)
-            self.parent_overlay.fixed_container.move(self, new_x, new_y)
+            self.parent_overlay.overlay_manager.move_widget(self, new_x, new_y)
             return True
-        if self._resizing_panel:
+        if self._resize_edge is not None:
             if self.is_maximized:
                 self.is_maximized = False
                 image = Gtk.Image.new_from_icon_name("window-maximize-symbolic", Gtk.IconSize.MENU)
@@ -3862,10 +4481,15 @@ class SimulatedWindow(Gtk.EventBox):
                 proposed_height = start_h - dy
                 current_new_h = max(proposed_height, min_h)
                 current_new_y = fixed_bottom - current_new_h
+                if current_new_y < 0:
+                    current_new_y = 0
+                    current_new_h = max(min_h, fixed_bottom)
             self.set_size_request(int(current_new_w), int(current_new_h))
-            if current_new_x != start_x or current_new_y != start_y:
-                self.parent_overlay.fixed_container.move(self, int(current_new_x), int(current_new_y))
+            self.parent_overlay.overlay_manager.move_widget(self, int(current_new_x), int(current_new_y))
             return True
+        if event.window != widget.get_window():
+            self.get_window().set_cursor(self.cursors.get('default'))
+            return False
         edge = self._get_panel_edge(event.x, event.y)
         if edge:
             cursor_name = {
@@ -3874,17 +4498,18 @@ class SimulatedWindow(Gtk.EventBox):
                 'top-left': 'nw-resize', 'top-right': 'ne-resize',
                 'bottom-left': 'sw-resize', 'bottom-right': 'se-resize'
             }.get(edge, 'default')
-            self.get_window().set_cursor(self.parent_overlay.cursors.get(cursor_name))
-        elif self._is_on_header(event.x, event.y):
-            if self._is_over_header_buttons(event.x, event.y):
-                self.get_window().set_cursor(None)
-            else:
-                self.get_window().set_cursor(self.parent_overlay.cursors.get('grab'))
+            self.get_window().set_cursor(self.cursors.get(cursor_name))
+        elif self._is_on_header(event.x, event.y) and not self._is_over_header_buttons(event.x, event.y):
+            self.get_window().set_cursor(self.cursors.get('grab'))
         else:
-            self.get_window().set_cursor(None)
+            self.get_window().set_cursor(self.cursors.get('default'))
+        return False
 
 class CustomColorButton(Gtk.Button):
-    def __init__(self, color_str="0,0,0,1"):
+    __gsignals__ = {
+        'color-changed': (GObject.SignalFlags.RUN_FIRST, None, ()),
+    }
+    def __init__(self):
         super().__init__()
         self.rgba = Gdk.RGBA(0, 0, 0, 1)
         self.set_halign(Gtk.Align.FILL)
@@ -3895,22 +4520,13 @@ class CustomColorButton(Gtk.Button):
         self.drawing_area.set_halign(Gtk.Align.FILL)
         self.drawing_area.set_valign(Gtk.Align.FILL)
         self.drawing_area.connect("draw", self._on_draw)
+        self.set_size_request(60, 40)
         self.add(self.drawing_area)
-        self.parse_and_set(color_str)
-
-    def parse_and_set(self, color_str):
-        try:
-            parts = [float(c.strip()) for c in color_str.split(',')]
-            if len(parts) == 4:
-                r, g, b, a = parts
-                self.rgba = Gdk.RGBA(r, g, b, a)
-            self.drawing_area.queue_draw()
-        except:
-            pass
 
     def set_rgba(self, rgba):
         self.rgba = rgba
         self.drawing_area.queue_draw()
+        self.emit('color-changed')
 
     def get_rgba(self):
         return self.rgba
@@ -3924,12 +4540,12 @@ class CustomColorButton(Gtk.Button):
         cr.stroke()
         return False
 
-class EmbeddedFileChooser(SimulatedWindow):
-    def __init__(self, parent_overlay):
-        super().__init__(parent_overlay, title="选择目录", css_class="simulated-window", resizable=True)
-        self.target_entry = None
+class FileChooserPanel(SimulatedWindow):
+    def __init__(self, parent_overlay, config_obj, title="选择目录", action=Gtk.FileChooserAction.SELECT_FOLDER):
+        super().__init__(parent_overlay, title=title, css_class="simulated-window", resizable=True)
+        self.config = config_obj
         self.on_selected_callback = None
-        self.chooser = Gtk.FileChooserWidget(action=Gtk.FileChooserAction.SELECT_FOLDER)
+        self.chooser = Gtk.FileChooserWidget(action=action)
         self.add_content(self.chooser, expand=True, fill=True)
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         btn_box.set_halign(Gtk.Align.END)
@@ -3946,30 +4562,21 @@ class EmbeddedFileChooser(SimulatedWindow):
         self.add_content(btn_box, expand=False, fill=False)
         self.show_all()
         _, nat_size = self.get_preferred_size()
-        self.set_size_request(nat_size.width, 800)
+        self.set_size_request(nat_size.width, self.config.FILE_CHOOSER_HEIGHT)
         self.hide()
 
-    def open_for(self, entry_widget, callback=None):
-        self.target_entry = entry_widget
+    def open(self, callback, initial_path=None):
         self.on_selected_callback = callback
-        current_path = entry_widget.get_text()
-        if current_path and os.path.isdir(current_path):
-            self.chooser.set_current_folder(current_path)
-        self.show_all()
-        self.get_window().raise_()
+        if initial_path and os.path.isdir(initial_path):
+            self.chooser.set_current_folder(initial_path)
 
     def _on_select_clicked(self, widget):
         filename = self.chooser.get_filename()
-        if filename and self.target_entry:
-            context = self.target_entry.get_style_context()
-            if context.has_class("dir-not-set"):
-                context.remove_class("dir-not-set")
-            self.target_entry.set_text(filename)
-            if self.on_selected_callback:
-                self.on_selected_callback(filename)
+        if filename and self.on_selected_callback:
+            self.on_selected_callback(filename)
         self.hide()
 
-class EmbeddedColorChooser(SimulatedWindow):
+class ColorChooserPanel(SimulatedWindow):
     def __init__(self, parent_overlay):
         super().__init__(parent_overlay, title="选择颜色", css_class="simulated-window", resizable=False)
         self.target_button = None
@@ -4002,8 +4609,6 @@ class EmbeddedColorChooser(SimulatedWindow):
         self.chooser.set_rgba(custom_color_btn.get_rgba())
         self.chooser_container.pack_start(self.chooser, True, True, 0)
         self.chooser.show()
-        self.show_all()
-        self.get_window().raise_()
 
     def _on_select_clicked(self, widget):
         rgba = self.chooser.get_rgba()
@@ -4014,81 +4619,60 @@ class EmbeddedColorChooser(SimulatedWindow):
         self.hide()
 
 class ConfigPanel(SimulatedWindow):
-    """配置面板，提供所有设置项的图形化编辑界面"""
+    """配置面板，提供部分设置项的图形化编辑界面"""
     # 逻辑px
-    def __init__(self, config_obj, parent_overlay):
+    def __init__(self, config_obj, parent_overlay, log_queue):
         super().__init__(parent_overlay, title="拼长图配置", css_class="simulated-window", resizable=True)
         self.config = config_obj
         self.show_advanced = False
-        self.input_has_focus = False
-        self.DIR_PLACEHOLDER = "目录未设置 (请点击浏览按钮选择)"
+        self._is_batch_restoring = False
+        self.widget_map = {}
+        self.advanced_containers = []
         self.managed_settings = [
-            ('Output', 'save_directory'), ('Output', 'save_format'),
-            ('Output', 'jpeg_quality'), ('Output', 'filename_template'),
-            ('Output', 'filename_timestamp_format'),
-            ('Interface.Components', 'enable_buttons'),
-            ('Interface.Components', 'enable_grid_action_buttons'), ('Interface.Components', 'enable_auto_scroll_buttons'),
-            ('Interface.Components', 'enable_side_panel'),
-            ('Interface.Components', 'show_preview_on_start'),
+            ('Output', 'save_directory'), ('Output', 'save_format'), ('Output', 'jpeg_quality'),
+            ('Output', 'filename_template'), ('Output', 'filename_timestamp_format'),
+            ('Interface.Components', 'enable_buttons'), ('Interface.Components', 'enable_side_panel'),
+            ('Interface.Components', 'show_preview_on_start'), ('Interface.Components', 'show_instruction_panel_on_start'),
+            ('Interface.Components', 'enable_auto_scroll_buttons'), ('Interface.Components', 'enable_grid_action_buttons'),
             ('Interface.Components', 'show_capture_count'), ('Interface.Components', 'show_total_dimensions'), ('Interface.Components', 'show_current_mode'),
-            ('Interface.Components', 'show_instruction_panel_on_start'),
-            ('Behavior', 'enable_free_scroll_matching'), ('Behavior', 'capture_with_cursor'), ('Behavior', 'scroll_method'), ('Behavior', 'reuse_invisible_cursor'),
-            ('Behavior', 'forward_action'), ('Behavior', 'backward_action'),
-            ('Interface.Theme', 'border_color'), ('Interface.Theme', 'matching_indicator_color'),
-            ('Interface.Layout', 'border_width'),
-            ('Interface.Layout', 'handle_height'), ('Interface.Layout', 'button_panel_width'),
-            ('Interface.Layout', 'side_panel_width'), ('Interface.Layout', 'button_spacing'),
-            ('Interface.Layout', 'processing_dialog_width'), ('Interface.Layout', 'processing_dialog_height'),
-            ('Interface.Layout', 'processing_dialog_spacing'), ('Interface.Layout', 'processing_dialog_border_width'),
-            ('Interface.Theme', 'processing_dialog_css'),
-            ('Interface.Theme', 'info_panel_css'),
-            ('Interface.Theme', 'simulated_window_css'),
+            ('Interface.Layout', 'border_width'), ('Interface.Layout', 'button_panel_width'), ('Interface.Layout', 'side_panel_width'),
+            ('Behavior', 'copy_to_clipboard_on_finish'), ('Behavior', 'capture_with_cursor'), ('Behavior', 'enable_free_scroll_matching'),
+            ('Behavior', 'auto_scroll_ticks_per_step'), ('Behavior', 'auto_scroll_interval_ms'),
+            ('Behavior', 'scroll_method'), ('Behavior', 'reuse_invisible_cursor'),
+            ('Behavior', 'grid_scroll_interval_ms'), ('Behavior', 'forward_action'), ('Behavior', 'backward_action'), ('Behavior', 'grid_scroll_ticks_formula'),
+            ('Interface.Theme', 'border_color'), ('Interface.Theme', 'static_bar_color'),
+            ('Interface.Theme', 'info_panel_css'), ('Interface.Theme', 'button_css'), ('Interface.Theme', 'instruction_panel_css'),
+            ('Interface.Theme', 'simulated_window_css'), ('Interface.Theme', 'preview_panel_css'), ('Interface.Theme', 'config_panel_css'),
             ('Interface.Theme', 'notification_css'),
-            ('Interface.Theme', 'dialog_css'),
-            ('Interface.Theme', 'mask_css'),
-            ('Interface.Theme', 'instruction_panel_css'),
-            ('System', 'copy_to_clipboard_on_finish'), ('System', 'notification_click_action'),
-            ('System', 'large_image_opener'), ('System', 'sound_theme'),
-            ('System', 'capture_sound'), ('System', 'undo_sound'), ('System', 'finalize_sound'),
-            ('Performance', 'grid_matching_max_overlap'), ('Performance', 'free_scroll_matching_max_overlap'),
-            ('Performance', 'auto_scroll_ticks_per_step'), ('Performance', 'max_scroll_per_tick'), ('Performance', 'min_scroll_per_tick'),
-            ('Performance', 'max_viewer_dimension'), ('Performance', 'preview_drag_sensitivity'),
-            ('System', 'log_file'), ('System', 'temp_directory_base'),
+            ('Interface.Theme', 'mask_css'), ('Interface.Theme', 'dialog_css'), ('Interface.Theme', 'feedback_widget_css'),
+            ('System', 'max_viewer_dimension'), ('System', 'large_image_opener'),
+            ('Performance', 'max_scroll_per_tick'), ('Performance', 'min_scroll_per_tick'), ('Preview', 'preview_cache_size'),
+            ('System', 'sound_theme'), ('System', 'capture_sound'), ('System', 'undo_sound'), ('System', 'finalize_sound'), ('System', 'warning_sound'),
+            ('System', 'log_file')
         ]
-        self.sound_data = self._discover_sound_themes()
+        self.SOUND_KEYS = ['capture_sound', 'undo_sound', 'finalize_sound', 'warning_sound']
+        self.sound_themes = SystemInteraction.get_sound_themes()
         self.capturing_hotkey_button = None
-        self.connect("destroy", self._on_destroy)
-        self.is_destroyed = False
         self.log_queue = log_queue
         self.log_text_buffer = None
-        self.log_timer_id = None
         self.all_log_records = []
         self.log_tags = {}
         self.filter_checkboxes = {}
-        self.log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        self.log_formatter = logging.Formatter('%(asctime)s - %(levelname)-7s - %(message)s')
         self._sub_panels_state = {}
         self._setup_ui()
-        self._create_log_tags()
+        self.create_log_tags()
         self._load_config_values()
-        self.file_chooser_panel = EmbeddedFileChooser(parent_overlay)
-        self.color_chooser_panel = EmbeddedColorChooser(parent_overlay)
+        self.file_chooser_panel = FileChooserPanel(parent_overlay, self.config, title="选择目录", action=Gtk.FileChooserAction.SELECT_FOLDER)
+        self.color_chooser_panel = ColorChooserPanel(parent_overlay)
         self.show_all()
         _, nat_size = self.get_preferred_size()
-        self.set_size_request(nat_size.width, 800)
+        self.set_size_request(nat_size.width, self.config.CONFIG_PANEL_HEIGHT)
         self.hide()
-        self._setup_default_parser()
+        self._bind_all_widgets()
+        self.config.connect('setting-changed', self._on_config_changed_signal)
         self._update_advanced_visibility()
-        self.log_timer_id = GLib.timeout_add(150, self._check_log_queue)
-
-    def show(self):
-        super().show()
-        print(self._sub_panels_state)
-        if self._sub_panels_state.get('file_chooser', False):
-            if hasattr(self, 'file_chooser_panel') and self.file_chooser_panel:
-                self.file_chooser_panel.show()
-        if self._sub_panels_state.get('color_chooser', False):
-            if hasattr(self, 'color_chooser_panel') and self.color_chooser_panel:
-                self.color_chooser_panel.show()
+        GLib.timeout_add(150, self._check_log_queue)
 
     def hide(self):
         if hasattr(self, 'file_chooser_panel') and self.file_chooser_panel:
@@ -4099,71 +4683,35 @@ class ConfigPanel(SimulatedWindow):
             self.color_chooser_panel.hide()
         super().hide()
 
+    def show_all(self):
+        super().show_all()
+        self._update_advanced_visibility()
+        if self._sub_panels_state.get('file_chooser', False):
+            if hasattr(self, 'file_chooser_panel') and self.file_chooser_panel:
+                self.parent_overlay.overlay_manager.show(self.file_chooser_panel, anchor=None, layer=OverlayManager.LAYER_MEDIUM_UP)
+        if self._sub_panels_state.get('color_chooser', False):
+            if hasattr(self, 'color_chooser_panel') and self.color_chooser_panel:
+                self.parent_overlay.overlay_manager.show(self.color_chooser_panel, anchor=None, layer=OverlayManager.LAYER_MEDIUM_UP)
+
     def on_close_clicked(self, btn):
-        """窗口关闭时保存所有配置"""
-        if self.capturing_hotkey_button:
-            key = self.capturing_hotkey_button.get_name()
-            prev_text = self.config.parser.get('Hotkeys', key, fallback="")
-            self.capturing_hotkey_button.set_label(prev_text)
-            self.capturing_hotkey_button = None
-        self._save_all_configs()
-        global hotkey_listener
-        if hotkey_listener and are_hotkeys_enabled:
-            hotkey_listener.set_normal_keys_grabbed(True)
-            logging.debug("配置面板隐藏，全局热键已恢复")
-        if self.is_maximized:
-            self._restore_panel()
-        self.user_has_moved = False
-        self.hide()
+        self._cancel_hotkey_capture()
+        super().on_close_clicked(btn)
         self._sub_panels_state = {}
 
-    def _on_destroy(self, widget):
-        """面板销毁时的清理操作"""
-        if self.is_destroyed:
-            return
-        self.is_destroyed = True
-        if self.log_timer_id:
-            GLib.source_remove(self.log_timer_id)
-            self.log_timer_id = None
-            logging.debug("配置面板的日志更新定时器已成功移除")
-        self._save_all_configs()
-
-    def ensure_z_order(self):
-        if self.get_window():
-            self.get_window().raise_()
-        if self.file_chooser_panel and self.file_chooser_panel.get_visible():
-            if self.file_chooser_panel.get_window():
-                self.file_chooser_panel.get_window().raise_()
-        if self.color_chooser_panel and self.color_chooser_panel.get_visible():
-            if self.color_chooser_panel.get_window():
-                self.color_chooser_panel.get_window().raise_()
-
     def _check_log_queue(self):
-        """定时器回调，检查队列中是否有新日志"""
         while not self.log_queue.empty():
             try:
                 record = self.log_queue.get_nowait()
-                self._process_log_record(record) 
+                self.all_log_records.append(record)
+                cb = self.filter_checkboxes.get(record.levelname)
+                if cb and cb.get_active():
+                    self._insert_record_into_buffer(record)
             except queue.Empty:
                 break
         return True
 
-    def _process_log_record(self, record):
-        self.all_log_records.append(record)
-        if self.filter_checkboxes.get(record.levelname) and self.filter_checkboxes[record.levelname].get_active():
-            self._insert_record_into_buffer(record)
-
     def _insert_record_into_buffer(self, record):
         if not self.log_text_buffer: return
-        should_scroll = False
-        if self.log_autoscroll_checkbutton.get_active():
-            has_focus = self.log_textview.is_focus()
-            adj = self.log_scrolled_window.get_vadjustment()
-            current_pos = adj.get_value()
-            max_pos = adj.get_upper() - adj.get_page_size()
-            is_at_bottom = (max_pos - current_pos) < 20
-            if not has_focus and is_at_bottom:
-                should_scroll = True
         message = self.log_formatter.format(record)
         tag = self.log_tags.get(record.levelname)
         end_iter = self.log_text_buffer.get_end_iter()
@@ -4171,13 +4719,14 @@ class ConfigPanel(SimulatedWindow):
             self.log_text_buffer.insert_with_tags(end_iter, message + '\n', tag)
         else:
             self.log_text_buffer.insert(end_iter, message + '\n')
-        if should_scroll:
-            GLib.idle_add(self._scroll_to_end_of_log)
+        if self.log_autoscroll_checkbutton.get_active() and not self.log_textview.is_focus():
+            def do_scroll():
+                if self.log_text_buffer:
+                    self.log_textview.scroll_to_iter(self.log_text_buffer.get_end_iter(), 0.0, True, 0.0, 1.0)
+                return False
+            GLib.idle_add(do_scroll)
 
-    def _on_filter_changed(self, widget):
-        self._redisplay_logs()
-
-    def _redisplay_logs(self):
+    def redisplay_logs(self):
         if not self.log_text_buffer: return
         self.log_text_buffer.set_text("")
         active_levels = {level for level, cb in self.filter_checkboxes.items() if cb.get_active()}
@@ -4185,36 +4734,33 @@ class ConfigPanel(SimulatedWindow):
             if record.levelname in active_levels:
                 self._insert_record_into_buffer(record)
 
-    def _scroll_to_end_of_log(self):
-        """将日志视图滚动到末尾"""
-        if self.is_destroyed:
-            logging.debug("_scroll_to_end_of_log: 窗口已销毁，放弃滚动")
-            return False
-        if self.log_text_buffer:
-            end_iter = self.log_text_buffer.get_end_iter()
-            self.log_textview.scroll_to_iter(end_iter, 0.0, True, 0.0, 1.0)
-        return False
+    def _get_theme_color(self, color_name):
+        context = self.get_style_context()
+        success, color = context.lookup_color(color_name)
+        if success:
+            return color.to_string()
+        return self.config.get_default_css_color('config_panel', color_name, "#000000")
 
-    def _create_log_tags(self):
+    def create_log_tags(self):
         """为不同的日志级别创建并配置 TextTag"""
         if not self.log_text_buffer:
             return
         tag_table = self.log_text_buffer.get_tag_table()
-        self.log_tags['DEBUG'] = Gtk.TextTag(name="debug")
-        self.log_tags['DEBUG'].set_property("foreground", "#708090")
-        tag_table.add(self.log_tags['DEBUG'])
-        self.log_tags['INFO'] = Gtk.TextTag(name="info")
-        self.log_tags['INFO'].set_property("foreground", "#2b2b2b")
-        tag_table.add(self.log_tags['INFO'])
-        self.log_tags['WARNING'] = Gtk.TextTag(name="warning")
-        self.log_tags['WARNING'].set_property("foreground", "#FF8C00")
-        tag_table.add(self.log_tags['WARNING'])
-        self.log_tags['ERROR'] = Gtk.TextTag(name="error")
-        self.log_tags['ERROR'].set_property("foreground", "#DC143C")
-        tag_table.add(self.log_tags['ERROR'])
+        def setup_tag(level_name, color_key):
+            tag_name = level_name.lower()
+            tag = tag_table.lookup(tag_name)
+            if not tag:
+                tag = Gtk.TextTag(name=tag_name)
+                tag_table.add(tag)
+            color_val = self._get_theme_color(color_key)
+            tag.set_property("foreground", color_val)
+            self.log_tags[level_name] = tag
+        setup_tag('DEBUG', 'log_debug')
+        setup_tag('INFO', 'log_info')
+        setup_tag('WARNING', 'log_warning')
+        setup_tag('ERROR', 'log_error')
 
     def _on_copy_log_clicked(self, button):
-        """复制日志按钮的回调"""
         if not self.all_log_records:
             return
         clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
@@ -4222,182 +4768,117 @@ class ConfigPanel(SimulatedWindow):
         clipboard.set_text(full_log_text, -1)
         original_label = button.get_label()
         button.set_sensitive(False)
-        button.set_label("已复制!")
+        button.set_label("日志已复制")
         def restore_button_state():
             button.set_label(original_label)
             button.set_sensitive(True)
             return False
         GLib.timeout_add(1500, restore_button_state)
 
-    def _setup_default_parser(self):
-        self.default_parser = configparser.ConfigParser(interpolation=None)
-        default_string = Config.get_default_config_string()
-        self.default_parser.read_string(default_string)
-
-    def _key_event_to_string(self, event):
-        mods = []
-        state = event.state
-        keyval = event.keyval
-        if state & Gdk.ModifierType.CONTROL_MASK:
-            mods.append('<ctrl>')
-        if state & Gdk.ModifierType.MOD1_MASK:
-            mods.append('<alt>')
-        if state & Gdk.ModifierType.SHIFT_MASK:
-            mods.append('<shift>')
-        if state & Gdk.ModifierType.SUPER_MASK:
-            mods.append('<super>')
-        key_name_lower = Gdk.keyval_name(keyval).lower()
-        is_modifier_only_release = key_name_lower in (
-            'shift_l', 'shift_r', 'control_l', 'control_r', 'alt_l', 'alt_r', 'super_l', 'super_r'
-        )
-        if is_modifier_only_release:
-             if 'shift' in key_name_lower and '<ctrl>' not in mods and '<alt>' not in mods and '<super>' not in mods:
-                 return '<shift>'
-             if 'control' in key_name_lower and '<shift>' not in mods and '<alt>' not in mods and '<super>' not in mods:
-                 return '<ctrl>'
-             if 'alt' in key_name_lower and '<shift>' not in mods and '<ctrl>' not in mods and '<super>' not in mods:
-                 return '<alt>'
-        effective_keyval = keyval
-        if (state & Gdk.ModifierType.SHIFT_MASK) and not is_modifier_only_release:
-            keymap = Gdk.Keymap.get_default()
-            success_val, entries = keymap.get_entries_for_keyval(keyval)
-            if success_val and entries:
-                keycode = entries[0].keycode
-                success, key_entries, keyvals = keymap.get_entries_for_keycode(keycode)
-                if success and key_entries and keyvals:
-                    for i, entry in enumerate(key_entries):
-                        if entry.level == 0 and entry.group == 0:
-                            effective_keyval = keyvals[i]
-                            break
-        rev_map = {v: k for k, v in self.config._key_map_gtk_special.items()}
-        main_key_str = ""
-        if effective_keyval in rev_map:
-            main_key_str = rev_map[effective_keyval]
-        else:
-            codepoint = Gdk.keyval_to_unicode(effective_keyval)
-            if codepoint != 0:
-                char = chr(codepoint)
-                if char.isprintable():
-                    main_key_str = char.lower()
-            if not main_key_str:
-                effective_name = Gdk.keyval_name(effective_keyval)
-                if effective_name:
-                    main_key_str = effective_name.lower()
-                elif not is_modifier_only_release:
-                     main_key_str = key_name_lower
-        if not main_key_str:
-            return "无效组合"
-        if not mods:
-            return main_key_str
-        else:
-            return '+'.join(mods) + '+' + main_key_str
-
     def _on_hotkey_button_clicked(self, button):
-        if self.capturing_hotkey_button and self.capturing_hotkey_button != button:
-            key_for_prev_button = self.capturing_hotkey_button.get_name()
-            prev_text = self.config.parser.get('Hotkeys', key_for_prev_button)
-            self.capturing_hotkey_button.set_label(prev_text)
+        if self.capturing_hotkey_button == button:
+            self._cancel_hotkey_capture()
+            return
+        if self.capturing_hotkey_button:
+            self._cancel_hotkey_capture()
         button.original_label = button.get_label()
         self.capturing_hotkey_button = button
-        button.set_label("请按下快捷键…")
-        global hotkey_listener
-        if hotkey_listener:
-            hotkey_listener.set_normal_keys_grabbed(False)
+        button.set_label("取消")
+        self.status_label.set_text("请按下快捷键...")
+        global hotkey_manager
+        if hotkey_manager:
+            hotkey_manager.set_paused(True)
             logging.debug("开始捕获快捷键，全局热键暂停")
+        self.parent_overlay.overlay_manager.set_blocking(self, True)
 
-    def handle_key_press(self, widget, event):
+    def on_key_press(self, widget, event):
         if self.capturing_hotkey_button:
-            return True 
+            return True
         return False
+
+    def _cancel_hotkey_capture(self):
+        if self.capturing_hotkey_button:
+            logging.debug("取消录制快捷键")
+            self.capturing_hotkey_button.set_label(self.capturing_hotkey_button.original_label)
+            self.capturing_hotkey_button = None
+            self.status_label.set_text("快捷键录制已取消")
+            self.parent_overlay.on_global_focus_changed(self.parent_overlay, self.parent_overlay.get_focus())
+            self.parent_overlay.overlay_manager.set_blocking(self, False)
 
     def handle_key_release(self, widget, event):
         if not self.capturing_hotkey_button:
             return False
-        hotkey_str = self._key_event_to_string(event)
+        incoming_hotkey = HotkeyDefinition.from_gdk_event(event)
+        hotkey_str = incoming_hotkey.to_string()
         current_key = self.capturing_hotkey_button.get_name()
         original_label = self.capturing_hotkey_button.original_label
-        global hotkey_listener
-        if hotkey_str == "无效组合":
-            logging.warning(f"捕获到无效的按键释放 {event.keyval} (state={event.state})，取消本次捕获")
-            self.capturing_hotkey_button.set_label(original_label)
-            self.capturing_hotkey_button = None
-            if hotkey_listener and not self.input_has_focus and are_hotkeys_enabled:
-                hotkey_listener.set_normal_keys_grabbed(True)
-                logging.debug("无效捕获，全局热键恢复")
+        global hotkey_manager
+        if not incoming_hotkey.is_valid():
+            error_msg = "组合无效"
+            if incoming_hotkey.main_key is None:
+                if incoming_hotkey.modifiers != HotkeyModifiers.NONE:
+                    error_msg = f"{hotkey_str} 缺少主键"
+                else:
+                    error_msg = f"无法识别按键（keyval: {event.keyval}）"
+            else:
+                error_msg = f"暂不支持按键: {incoming_hotkey.main_key}"
+            logging.warning(f"热键录制失败，{error_msg}")
+            send_notification("设置失败", f"{error_msg}\n请尝试使用其他按键组合", "warning", config.WARNING_SOUND, 2)
+            self._cancel_hotkey_capture()
             return True
-        dialog_scope = ['dialog_confirm', 'dialog_cancel']
-        is_dialog_key = current_key in dialog_scope
-        conflict_found = False
-        conflicting_key = None
-        for key, button in self.hotkey_buttons.items():
-            if key == current_key:
-                continue
-            is_other_key_dialog = key in dialog_scope
-            if is_dialog_key != is_other_key_dialog:
-                continue
-            if button.get_label() == hotkey_str and hotkey_str:
-                conflict_found = True
-                conflicting_key_desc = next(c[1] for c in self.hotkey_configs if c[0] == key)
-                break
-        if conflict_found:
+        conflicting_keys = hotkey_manager.get_hotkey_conflicts(current_key, incoming_hotkey) if hotkey_manager else []
+        if conflicting_keys:
+            conflict_descs = [next((c[1] for c in self.hotkey_configs if c[0] == k), k) for k in conflicting_keys]
+            conflicting_key_desc = ", ".join(conflict_descs)
             message = f"快捷键 '{hotkey_str}' 已被分配给 '{conflicting_key_desc}'\n请设置一个不同的快捷键"
-            send_desktop_notification(
-                title="快捷键冲突",
-                message=message,
-                sound_name="dialog-error",
-                level="warning"
-            )
+            send_notification("快捷键冲突", message, "warning", config.WARNING_SOUND, 2)
+            self.status_label.set_text("")
             self.capturing_hotkey_button.set_label(original_label)
         else:
+            self.config.set_value('Hotkeys', current_key, hotkey_str)
+            self.status_label.set_text(f"快捷键已设置为: {hotkey_str}")
             self.capturing_hotkey_button.set_label(hotkey_str)
         self.capturing_hotkey_button = None
-        if hotkey_listener and not self.input_has_focus and are_hotkeys_enabled:
-            hotkey_listener.set_normal_keys_grabbed(True)
-            logging.debug("快捷键捕获结束，全局热键恢复")
+        self.parent_overlay.on_global_focus_changed(self.parent_overlay, self.parent_overlay.get_focus())
+        self.parent_overlay.overlay_manager.set_blocking(self, False)
         return True
 
     def _setup_ui(self):
         """设置主界面布局"""
         main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add_content(main_vbox)
-        # 创建水平分割的主内容区
         main_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         main_vbox.pack_start(main_hbox, True, True, 0)
         # 左侧边栏
         sidebar_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        sidebar_container.get_style_context().add_class("config-sidebar")
         main_hbox.pack_start(sidebar_container, False, False, 0)
         sidebar_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        sidebar_header.set_margin_start(12)
-        sidebar_header.set_margin_end(12)
-        sidebar_header.set_margin_top(8)
-        sidebar_header.set_margin_bottom(8)
+        sidebar_header.get_style_context().add_class("config-section")
         icon = Gtk.Image.new_from_icon_name("preferences-system", Gtk.IconSize.MENU)
         title_label = Gtk.Label(label="配置选项")
-        title_label.set_markup("<b>配置选项</b>")
         sidebar_header.pack_start(icon, False, False, 0)
         sidebar_header.pack_start(title_label, False, False, 0)
         sidebar_container.pack_start(sidebar_header, False, False, 0)
         separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         sidebar_container.pack_start(separator, False, False, 0)
         self.sidebar = Gtk.StackSidebar()
-        self.sidebar.set_size_request(220, -1)
-        self.sidebar.set_margin_start(6)
-        self.sidebar.set_margin_end(6)
         sidebar_container.pack_start(self.sidebar, True, True, 0)
         # 右侧堆栈容器
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         self.stack.set_transition_duration(200)
+        self.stack.connect("notify::visible-child", lambda w, p: self._cancel_hotkey_capture())
         self.sidebar.set_stack(self.stack)
         main_hbox.pack_start(self.stack, True, True, 0)
         # 创建各个配置页面
         self._create_output_page()
-        self._create_hotkeys_page() 
-        self._create_interface_page()
-        self._create_theme_layout_page()
+        self._create_hotkeys_page()
+        self._create_components_layout_page()
+        self._create_behavior_page()
+        self._create_theme_appearance_page()
         self._create_system_performance_page()
         self._create_grid_calibration_page()
-        self._create_interface_strings_page()
         self._create_log_viewer_page()
         # 底部全局操作区
         self._create_bottom_panel(main_vbox)
@@ -4410,19 +4891,15 @@ class ConfigPanel(SimulatedWindow):
             self.advanced_switch.set_active(enabled)
 
     def _create_log_viewer_page(self):
-        """创建日志查看器页面"""
         page_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        page_vbox.set_margin_start(10)
-        page_vbox.set_margin_end(10)
-        page_vbox.set_margin_top(10)
-        page_vbox.set_margin_bottom(10)
+        page_vbox.get_style_context().add_class("config-container")
         # 顶部工具栏
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         page_vbox.pack_start(toolbar, False, False, 0)
         copy_button = Gtk.Button(label="复制全部日志")
         copy_button.connect("clicked", self._on_copy_log_clicked)
         toolbar.pack_start(copy_button, False, False, 0)
-        filter_label = Gtk.Label(label=" | 过滤:")
+        filter_label = Gtk.Label(label="过滤:")
         toolbar.pack_start(filter_label, False, False, 10)
         log_levels_config = [
             ("DEBUG", False),
@@ -4433,7 +4910,7 @@ class ConfigPanel(SimulatedWindow):
         for level, default_active in log_levels_config:
             checkbox = Gtk.CheckButton(label=level)
             checkbox.set_active(default_active)
-            checkbox.connect("toggled", self._on_filter_changed)
+            checkbox.connect("toggled", lambda w: self.redisplay_logs())
             toolbar.pack_start(checkbox, False, False, 0)
             self.filter_checkboxes[level] = checkbox
         self.log_autoscroll_checkbutton = Gtk.CheckButton(label="自动滚动到底部")
@@ -4445,27 +4922,23 @@ class ConfigPanel(SimulatedWindow):
         scrolled_window.set_hexpand(True)
         scrolled_window.set_vexpand(True)
         scrolled_window.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scrolled_window.set_margin_top(5)
-        scrolled_window.set_margin_bottom(5)
+        scrolled_window.get_style_context().add_class("config-section")
         page_vbox.pack_start(scrolled_window, True, True, 0)
         self.log_textview = Gtk.TextView()
         self.log_textview.set_editable(False)
         self.log_textview.set_cursor_visible(False)
         self.log_textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_textview.get_style_context().add_class("log-view")
         self.log_text_buffer = self.log_textview.get_buffer()
         scrolled_window.add(self.log_textview)
-        self.stack.add_titled(page_vbox, "log_viewer", "日志查看")
+        self.stack.add_titled(page_vbox, "log", "日志查看")
 
     def _create_bottom_panel(self, parent):
-        """创建底部的全局操作面板"""
         bottom_frame = Gtk.Frame()
         bottom_frame.set_shadow_type(Gtk.ShadowType.IN)
         parent.pack_start(bottom_frame, False, False, 0)
         bottom_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        bottom_hbox.set_margin_start(10)
-        bottom_hbox.set_margin_end(10)
-        bottom_hbox.set_margin_top(8)
-        bottom_hbox.set_margin_bottom(8)
+        bottom_hbox.get_style_context().add_class("config-section")
         bottom_frame.add(bottom_hbox)
         # 高级设置开关
         advanced_label = Gtk.Label(label="显示高级设置")
@@ -4473,56 +4946,24 @@ class ConfigPanel(SimulatedWindow):
         self.advanced_switch.connect("notify::active", self._on_advanced_toggle)
         bottom_hbox.pack_start(advanced_label, False, False, 0)
         bottom_hbox.pack_start(self.advanced_switch, False, False, 0)
-        help_label = Gtk.Label(label="更改会在退出时自动保存，并在下次启动时生效")
-        help_label.set_halign(Gtk.Align.END)
-        bottom_hbox.pack_end(help_label, False, False, 0)
+        self.status_label = Gtk.Label(label="配置面板已就绪")
+        self.status_label.set_halign(Gtk.Align.END)
+        bottom_hbox.pack_end(self.status_label, False, False, 0)
 
     def _on_browse_button_clicked(self, widget):
-        if self.parent_overlay.screen_rect:
-            screen_w, screen_h = self.parent_overlay.screen_rect.width, self.parent_overlay.screen_rect.height
-        else:
-            screen_w, screen_h = self.parent_overlay.get_allocated_width(), self.parent_overlay.get_allocated_height()
-        valid_w = screen_w - self.parent_overlay.monitor_offset_x
-        valid_h = screen_h - self.parent_overlay.monitor_offset_y
-        req_w, req_h = self.file_chooser_panel.get_size_request()
-        x = (valid_w - req_w) // 2
-        y = (valid_h - req_h) // 2
-        self.parent_overlay.fixed_container.move(self.file_chooser_panel, max(0, x), max(0, y))
         def on_dir_selected(path_str):
             if path_str:
                 self.config.SAVE_DIRECTORY = Path(path_str)
-                self.config.parser.set('Output', 'save_directory', path_str)
-                logging.info(f"保存目录已立即更新为: {self.config.SAVE_DIRECTORY}")
-        self.file_chooser_panel.open_for(self.save_dir_entry, callback=on_dir_selected)
+                self.config.set_value('Output', 'save_directory', path_str)
+                self.save_dir_entry.set_text(path_str)
+        current_text = self.save_dir_entry.get_text()
+        initial_path = current_text if current_text else None
+        self.file_chooser_panel.open(callback=on_dir_selected, initial_path=initial_path)
+        self.parent_overlay.overlay_manager.show(self.file_chooser_panel, anchor='center', layer=OverlayManager.LAYER_MEDIUM_UP)
 
     def _show_embedded_color_chooser(self, target_button):
-        global_mouse_pos = self.parent_overlay.controller.scroll_manager._get_pointer_position()
-        offset_x, offset_y = self.parent_overlay.monitor_offset_x, self.parent_overlay.monitor_offset_y
-        if self.parent_overlay.screen_rect:
-            screen_w, screen_h = self.parent_overlay.screen_rect.width, self.parent_overlay.screen_rect.height
-            offset_x += self.parent_overlay.screen_rect.x
-            offset_y += self.parent_overlay.screen_rect.y
-        else:
-            screen_w, screen_h = self.parent_overlay.get_allocated_width(), self.parent_overlay.get_allocated_height()
-        # 显示器坐标 -> 窗口坐标
-        valid_w = screen_w - self.parent_overlay.monitor_offset_x
-        valid_h = screen_h - self.parent_overlay.monitor_offset_y
-        # 全局坐标 -> 窗口坐标
-        mouse_win_x = global_mouse_pos[0] - offset_x
-        mouse_win_y = global_mouse_pos[1] - offset_y
         self.color_chooser_panel.open_for(target_button)
-        self.color_chooser_panel.show_all()
-        _, nat_size = self.color_chooser_panel.get_preferred_size()
-        panel_w, panel_h = nat_size.width, nat_size.height
-        target_x = mouse_win_x + 10
-        target_y = mouse_win_y + 10
-        if target_x + panel_w > valid_w:
-            target_x = mouse_win_x - panel_w - 10
-        if target_y + panel_h > valid_h:
-            target_y = mouse_win_y - panel_h - 10
-        target_x = max(0, target_x)
-        target_y = max(0, target_y)
-        self.parent_overlay.fixed_container.move(self.color_chooser_panel, int(target_x), int(target_y))
+        self.parent_overlay.overlay_manager.show(self.color_chooser_panel, anchor='mouse', layer=OverlayManager.LAYER_MEDIUM_UP)
 
     def _update_filename_preview(self, widget=None):
         template = self.filename_entry.get_text()
@@ -4546,61 +4987,59 @@ class ConfigPanel(SimulatedWindow):
         escaped_filename = GLib.markup_escape_text(final_filename)
         self.filename_preview_label.set_markup(f"<i>{escaped_filename}</i>")
 
-    def _create_output_page(self):
-        """创建输出设置页面"""
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        vbox.set_margin_start(20)
-        vbox.set_margin_end(20)
-        vbox.set_margin_top(20)
-        vbox.set_margin_bottom(20)
-        scrolled.add(vbox)
-        output_page_settings = [
-            ('Output', 'save_directory'), ('Output', 'save_format'),
-            ('Output', 'jpeg_quality'), ('Output', 'filename_template'),
-            ('Output', 'filename_timestamp_format')
-        ]
+    def _add_restore_button(self, container, settings_list):
         restore_button = Gtk.Button(label="恢复本页默认设置")
         restore_button.set_halign(Gtk.Align.END)
         restore_button.set_margin_top(10)
-        restore_button.connect("clicked", self._on_restore_defaults_clicked, output_page_settings)
-        vbox.pack_end(restore_button, False, False, 0)
-        # 保存位置
+        restore_button.connect("clicked", self._on_restore_defaults_clicked, settings_list)
+        container.pack_end(restore_button, False, False, 0)
+
+    def _create_output_page(self):
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        vbox.get_style_context().add_class("config-container")
+        scrolled.add(vbox)
+        output_page_settings = [
+            ('Output', 'save_directory'), ('Output', 'save_format'), ('Output', 'jpeg_quality'),
+            ('Output', 'filename_template'), ('Output', 'filename_timestamp_format')
+        ]
+        self._add_restore_button(vbox, output_page_settings)
         frame1 = Gtk.Frame(label="文件输出")
         vbox.pack_start(frame1, False, False, 0)
         grid1 = Gtk.Grid()
-        grid1.set_margin_start(15)
-        grid1.set_margin_end(15)
-        grid1.set_margin_top(10)
-        grid1.set_margin_bottom(15)
-        grid1.set_row_spacing(10)
-        grid1.set_column_spacing(10)
+        grid1.get_style_context().add_class("config-section")
+        grid1.set_row_spacing(15)
+        grid1.set_column_spacing(15)
         frame1.add(grid1)
         # 保存目录
-        label = Gtk.Label(label="保存到目录:", xalign=0)
-        label.set_tooltip_markup("指定拼接后图片的默认保存目录")
+        label = Gtk.Label(label="保存目录:", xalign=0)
+        label.set_tooltip_markup("指定拼接后图片的保存目录")
         grid1.attach(label, 0, 0, 1, 1)
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.save_dir_entry = Gtk.Entry()
         self.save_dir_entry.set_editable(False)
-        self.save_dir_entry.set_placeholder_text("目录未设置 (请选择保存目录)")
+        self.save_dir_entry.set_placeholder_text("目录未设置 (请点击浏览按钮选择)")
         self.save_dir_entry.set_hexpand(True)
+        self.save_dir_entry.set_can_focus(False)
+        self.save_dir_entry.connect("notify::text", lambda w, p: w.set_can_focus(bool(w.get_text())))
+        self.save_dir_entry.connect("button-press-event", lambda w, e: not bool(w.get_text()))
+        self.widget_map['save_directory'] = self.save_dir_entry
         hbox.pack_start(self.save_dir_entry, True, True, 0)
-        # 创建“浏览”按钮
-        browse_button = Gtk.Button(label="浏览…")
+        browse_button = Gtk.Button(label="浏览...")
         browse_button.connect("clicked", self._on_browse_button_clicked)
         hbox.pack_start(browse_button, False, False, 0)
         grid1.attach(hbox, 1, 0, 1, 1)
         # 文件格式
         label = Gtk.Label(label="文件类型:", xalign=0)
-        label.set_tooltip_markup("选择图片的保存格式\n<b>PNG</b>: 无损压缩，文件较大\n<b>JPEG</b>: 有损压缩，文件较小")
+        label.set_tooltip_markup("选择图片的保存格式\n<b>PNG</b>: 无损压缩\n<b>JPEG</b>: 有损压缩，具有 65500 像素的尺寸上限")
         self.format_combo = Gtk.ComboBoxText()
         self.format_combo.set_tooltip_markup(label.get_tooltip_markup())
         self.format_combo.connect("scroll-event", lambda widget, event: True)
         self.format_combo.append("PNG", "PNG")
         self.format_combo.append("JPEG", "JPEG")
         self.format_combo.connect("changed", self._on_format_changed)
+        self.widget_map['save_format'] = self.format_combo
         cell = self.format_combo.get_cells()[0]
         cell.set_property('xalign', 0.5)
         self.format_combo.set_halign(Gtk.Align.START)
@@ -4615,82 +5054,67 @@ class ConfigPanel(SimulatedWindow):
         self.jpeg_quality_spin.set_halign(Gtk.Align.START)
         self.jpeg_quality_spin.set_range(1, 100)
         self.jpeg_quality_spin.set_increments(1, 10)
+        self.widget_map['jpeg_quality'] = self.jpeg_quality_spin
         grid1.attach(self.jpeg_label, 0, 2, 1, 1)
         grid1.attach(self.jpeg_quality_spin, 1, 2, 1, 1)
-        # 高级设置框架
-        self.output_advanced_frame = Gtk.Frame(label="高级选项")
+        self.output_advanced_frame = Gtk.Frame(label="高级设置")
         vbox.pack_start(self.output_advanced_frame, False, False, 0)
+        self.advanced_containers.append(self.output_advanced_frame)
         grid2 = Gtk.Grid()
-        grid2.set_margin_start(15)
-        grid2.set_margin_end(15)
-        grid2.set_margin_top(10)
-        grid2.set_margin_bottom(15)
-        grid2.set_row_spacing(10)
-        grid2.set_column_spacing(10)
+        grid2.get_style_context().add_class("config-section")
+        grid2.set_row_spacing(15)
+        grid2.set_column_spacing(15)
         self.output_advanced_frame.add(grid2)
         # 文件名格式
         label = Gtk.Label(label="文件名格式:", xalign=0)
         label.set_tooltip_markup("定义保存文件的名称模板\n变量 <b>{timestamp}</b> 会被替换为下方格式定义的时间戳")
         self.filename_entry = Gtk.Entry()
         self.filename_entry.set_tooltip_markup(label.get_tooltip_markup())
-        help_label = Gtk.Label(label="可用变量: {timestamp}")
-        help_label.set_markup("<small>可用变量: {timestamp}</small>")
+        self.widget_map['filename_template'] = self.filename_entry
         grid2.attach(label, 0, 0, 1, 1)
         grid2.attach(self.filename_entry, 1, 0, 1, 1)
-        grid2.attach(help_label, 1, 1, 1, 1)
         # 时间戳格式
         label = Gtk.Label(label="时间戳格式:", xalign=0)
         label.set_tooltip_markup("用于生成文件名的 Python strftime 格式字符串\n常用占位符: <b>%Y</b>(年) <b>%m</b>(月) <b>%d</b>(日) <b>%H</b>(时) <b>%M</b>(分) <b>%S</b>(秒)")
         self.timestamp_entry = Gtk.Entry()
         self.timestamp_entry.set_tooltip_markup(label.get_tooltip_markup())
-        help_label = Gtk.Label(label="遵循 Python strftime 格式")
-        help_label.set_markup("<small>遵循 Python strftime 格式</small>")
-        grid2.attach(label, 0, 2, 1, 1)
-        grid2.attach(self.timestamp_entry, 1, 2, 1, 1)
-        grid2.attach(help_label, 1, 3, 1, 1)
+        self.widget_map['filename_timestamp_format'] = self.timestamp_entry
+        grid2.attach(label, 0, 1, 1, 1)
+        grid2.attach(self.timestamp_entry, 1, 1, 1, 1)
         preview_title_label = Gtk.Label(label="文件名预览:", xalign=0)
         self.filename_preview_label = Gtk.Label(xalign=0)
         self.filename_preview_label.set_selectable(True)
-        grid2.attach(preview_title_label, 0, 4, 1, 1)
-        grid2.attach(self.filename_preview_label, 1, 4, 1, 1)
-        self.filename_entry.connect("changed", self._update_filename_preview)
-        self.timestamp_entry.connect("changed", self._update_filename_preview)
+        grid2.attach(preview_title_label, 0, 2, 1, 1)
+        grid2.attach(self.filename_preview_label, 1, 2, 1, 1)
         self.stack.add_titled(scrolled, "output", "输出设置")
 
     def _create_hotkeys_page(self):
-        """创建热键设置页面"""
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        vbox.set_margin_start(20)
-        vbox.set_margin_end(20)
-        vbox.set_margin_top(20)
-        vbox.set_margin_bottom(20)
+        vbox.get_style_context().add_class("config-container")
         scrolled.add(vbox)
-        info_label = Gtk.Label(label="点击下方的按钮，然后按下想设置的快捷键组合")
+        info_label = Gtk.Label(label="点击配置项右侧的按钮，然后按下想设置的快捷键组合")
         info_label.set_line_wrap(True)
         info_label.set_xalign(0)
         vbox.pack_start(info_label, False, False, 0)
         frame = Gtk.Frame(label="快捷键设置")
         vbox.pack_start(frame, False, False, 0)
         grid = Gtk.Grid()
-        grid.set_margin_start(15)
-        grid.set_margin_end(15)
-        grid.set_margin_top(10)
-        grid.set_margin_bottom(15)
+        grid.get_style_context().add_class("config-section")
         grid.set_row_spacing(10)
         grid.set_column_spacing(15)
         frame.add(grid)
         self.hotkey_configs = [
             ("capture", "截图"), ("finalize", "完成"),
             ("undo", "撤销"), ("cancel", "取消"),
-            ("grid_backward", "整格后退"), ("grid_forward", "整格前进"),
             ("auto_scroll_start", "开始自动滚动"), ("auto_scroll_stop", "停止自动滚动"),
+            ("grid_forward", "整格前进"), ("grid_backward", "整格后退"),
             ("configure_scroll_unit", "配置滚动单位"), ("toggle_grid_mode", "切换整格模式"),
-            ("toggle_preview", "激活/隐藏预览面板"), ("open_config_editor", "激活/隐藏配置面板"),
-            ("toggle_instruction_panel", "显示/隐藏提示面板"), ("toggle_hotkeys_enabled", "启用/禁用快捷键"), 
-            ("preview_zoom_in", "预览面板放大"), ("preview_zoom_out", "预览面板缩小"),
-            ("dialog_confirm", "退出对话框确认"), ("dialog_cancel", "退出对话框取消")
+            ("toggle_config_panel", "显示/隐藏配置面板"), ("toggle_preview", "显示/隐藏预览面板"),
+            ("toggle_hotkeys_enabled", "启用/禁用快捷键"), ("toggle_instruction_panel", "显示/隐藏提示面板"),
+            ("preview_zoom_in", "放大预览图"), ("preview_zoom_out", "缩小预览图"),
+            ("dialog_confirm", "对话框确认"), ("dialog_cancel", "对话框取消")
         ]
         self.managed_settings.extend([('Hotkeys', key) for key, _ in self.hotkey_configs])
         self.hotkey_buttons = {}
@@ -4706,280 +5130,275 @@ class ConfigPanel(SimulatedWindow):
             grid.attach(label, col, row, 1, 1)
             grid.attach(button, col + 1, row, 1, 1)
             self.hotkey_buttons[key] = button
+            self.widget_map[key] = button
         hotkeys_page_settings = [('Hotkeys', key) for key, _ in self.hotkey_configs]
-        restore_button = Gtk.Button(label="恢复本页默认设置")
-        restore_button.set_halign(Gtk.Align.END)
-        restore_button.set_margin_top(10)
-        restore_button.connect("clicked", self._on_restore_defaults_clicked, hotkeys_page_settings)
-        vbox.pack_end(restore_button, False, False, 0)
+        self._add_restore_button(vbox, hotkeys_page_settings)
         self.stack.add_titled(scrolled, "hotkeys", "热键")
 
-    def _create_interface_page(self):
-        """创建界面设置页面"""
+    def _create_components_layout_page(self):
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        vbox.set_margin_start(20)
-        vbox.set_margin_end(20)
-        vbox.set_margin_top(20)
-        vbox.set_margin_bottom(20)
+        vbox.get_style_context().add_class("config-container")
         scrolled.add(vbox)
-        interface_page_settings = [
-            ('Interface.Components', 'enable_buttons'),
-            ('Interface.Components', 'enable_grid_action_buttons'),
-            ('Interface.Components', 'enable_auto_scroll_buttons'),
-            ('Interface.Components', 'enable_side_panel'),
-            ('Interface.Components', 'show_preview_on_start'),
-            ('Interface.Components', 'show_capture_count'),
-            ('Interface.Components', 'show_total_dimensions'),
-            ('Interface.Components', 'show_current_mode'),
-            ('Interface.Components', 'show_instruction_panel_on_start'),
-            ('Behavior', 'capture_with_cursor'),
-            ('Behavior', 'scroll_method'),
-            ('Behavior', 'reuse_invisible_cursor'),
-            ('Behavior', 'forward_action'),
-            ('Behavior', 'backward_action'),
+        components_layout_settings = [
+            ('Interface.Components', 'enable_buttons'), ('Interface.Components', 'enable_side_panel'),
+            ('Interface.Components', 'show_instruction_panel_on_start'), ('Interface.Components', 'show_preview_on_start'),
+            ('Interface.Components', 'enable_auto_scroll_buttons'), ('Interface.Components', 'enable_grid_action_buttons'),
+            ('Interface.Components', 'show_capture_count'), ('Interface.Components', 'show_total_dimensions'), ('Interface.Components', 'show_current_mode'),
+            ('Interface.Layout', 'border_width'), ('Interface.Layout', 'button_panel_width'), ('Interface.Layout', 'side_panel_width'),
         ]
-        restore_button = Gtk.Button(label="恢复本页默认设置")
-        restore_button.set_halign(Gtk.Align.END)
-        restore_button.set_margin_top(10)
-        restore_button.connect("clicked", self._on_restore_defaults_clicked, interface_page_settings)
-        vbox.pack_end(restore_button, False, False, 0)
-        # 可见组件
-        frame1 = Gtk.Frame(label="可见组件")
-        vbox.pack_start(frame1, False, False, 0)
-        vbox1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        vbox1.set_margin_start(15)
-        vbox1.set_margin_end(15)
-        vbox1.set_margin_top(10)
-        vbox1.set_margin_bottom(15)
-        frame1.add(vbox1)
-        component_configs = [
-            ("enable_buttons", "启用主操作按钮", "控制是否显示“截图”、“完成”、“撤销”、“取消”这四个功能按钮"),
-            ("enable_grid_action_buttons", "启用前进/后退按钮", "控制在<b>整格模式</b>下是否显示“前进”和“后退”按钮\n禁用后，仍能通过快捷键操作"),
-            ("enable_auto_scroll_buttons", "启用开始/停止按钮", "控制在<b>自由模式</b>下是否显示“开始”和“停止”按钮"),
-            ("enable_side_panel", "启用侧边栏", "是否在截图区域旁边显示一个用于显示信息面板和功能面板的侧边栏"),
-            ("show_preview_on_start", "启动时显示预览面板", "控制是否在截图会话开始时自动打开预览面板"),
-            ("show_capture_count", "显示已截图数量", "是否在侧边栏信息面板中显示当前已截取的图片数量"),
-            ("show_total_dimensions", "显示最终图片总尺寸", "是否在侧边栏信息面板中显示拼接后图片的总宽度和总高度"),
-            ("show_current_mode", "显示当前模式", "是否在侧边栏信息面板中显示当前所处的模式（自由/整格/自动）"),
+        self._add_restore_button(vbox, components_layout_settings)
+        core_comp_frame = Gtk.Frame(label="核心组件")
+        vbox.pack_start(core_comp_frame, False, False, 0)
+        core_comp_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        core_comp_vbox.get_style_context().add_class("config-section")
+        core_comp_frame.add(core_comp_vbox)
+        basic_component_configs = [
+            ("enable_buttons", "启用按钮面板", "是否在截图区域右侧显示按钮面板"),
+            ("enable_side_panel", "启用侧边栏", "是否在截图区域旁显示包括信息面板和功能面板的侧边栏"),
+            ("show_preview_on_start", "启动时显示预览面板", "是否在截图会话开始时自动打开预览面板"),
             ("show_instruction_panel_on_start", "启动时显示提示面板", "每次启动截图会话时，是否在左下角显示一个包含快捷键的提示面板")
         ]
-        self.component_checkboxes = {}
-        for key, desc, tooltip in component_configs:
+        for key, desc, tooltip in basic_component_configs:
             checkbox = Gtk.CheckButton(label=desc)
             checkbox.set_tooltip_markup(tooltip)
-            checkbox.connect("toggled", lambda w, k=key: self._on_component_toggled(w, k))
-            vbox1.pack_start(checkbox, False, False, 0)
-            self.component_checkboxes[key] = checkbox
-        # 操作行为
-        frame2 = Gtk.Frame(label="操作行为")
-        vbox.pack_start(frame2, False, False, 0)
-        grid2 = Gtk.Grid()
-        grid2.set_margin_start(15)
-        grid2.set_margin_end(15)
-        grid2.set_margin_top(10)
-        grid2.set_margin_bottom(15)
-        grid2.set_row_spacing(10)
-        grid2.set_column_spacing(10)
-        frame2.add(grid2)
-        # 包含鼠标指针
-        self.cursor_checkbox = Gtk.CheckButton(label="截取鼠标指针")
-        self.cursor_checkbox.set_tooltip_markup("截图时是否将鼠标指针也一并截取下来")
-        grid2.attach(self.cursor_checkbox, 0, 0, 2, 1)
-        self.free_scroll_matching_checkbox = Gtk.CheckButton(label="自由模式启用滚动误差修正")
-        tooltip = "在<b>自由模式</b>下，使用模板匹配来修正滚动误差，此功能会增加拼接处理时间\n启用后，请确保每次滚动有重叠部分，否则修正无效"
-        self.free_scroll_matching_checkbox.set_tooltip_markup(tooltip)
-        grid2.attach(self.free_scroll_matching_checkbox, 3, 0, 2, 1)
-        # 高级行为设置
-        self.behavior_advanced_frame = Gtk.Frame(label="高级行为设置")
-        vbox.pack_start(self.behavior_advanced_frame, False, False, 0)
-        grid3 = Gtk.Grid()
-        grid3.set_margin_start(15)
-        grid3.set_margin_end(15)
-        grid3.set_margin_top(10)
-        grid3.set_margin_bottom(15)
-        grid3.set_row_spacing(10)
-        grid3.set_column_spacing(10)
-        self.behavior_advanced_frame.add(grid3)
-        # 滚动实现方式
-        label = Gtk.Label(label="滚动方式:", xalign=0)
-        label.set_tooltip_markup("<b>移动用户光标</b>: 临时将用户鼠标移动到截图区域中心来滚动，兼容性好但有干扰\n<b>使用隐形光标</b>: 创建一个独立的虚拟光标来滚动，无干扰但退出时可能导致界面卡顿")
-        self.scroll_method_combo = Gtk.ComboBoxText()
-        self.scroll_method_combo.set_tooltip_markup(label.get_tooltip_markup())
-        self.scroll_method_combo.connect("scroll-event", lambda widget, event: True)
-        self.scroll_method_combo.append("move_user_cursor", "移动用户光标")
-        self.scroll_method_combo.append("invisible_cursor", "使用隐形光标（实验性功能）")
-        self.reuse_cursor_checkbox = Gtk.CheckButton(label="复用隐形光标设备")
-        self.reuse_cursor_checkbox.set_tooltip_markup("勾选后，在使用“隐形光标”滚动方式时，程序退出后不会删除创建的虚拟鼠标和触摸板设备，下次启动时会尝试复用它们")
-        self.reuse_cursor_checkbox.connect("toggled", lambda w: self._on_behavior_toggled(w, 'reuse_invisible_cursor'))
-        if IS_WAYLAND:
-            label.set_visible(False)
-            self.scroll_method_combo.set_visible(False)
-            self.reuse_cursor_checkbox.set_visible(False)
-        grid3.attach(self.reuse_cursor_checkbox, 3, 0, 2, 1)
-        grid3.attach(label, 0, 0, 1, 1)
-        grid3.attach(self.scroll_method_combo, 1, 0, 1, 1)
-        # 前进/后退按钮功能
-        action_options = [
-            ("scroll", "仅滚动"),
-            ("scroll_capture", "滚动后截图"),
-            ("capture_scroll", "截图后滚动"),
-            ("scroll_delete", "滚动并删除"),
+            core_comp_vbox.pack_start(checkbox, False, False, 0)
+            self.widget_map[key] = checkbox
+        sub_comp_frame = Gtk.Frame(label="组件微调")
+        vbox.pack_start(sub_comp_frame, False, False, 0)
+        self.advanced_containers.append(sub_comp_frame)
+        sub_comp_grid = Gtk.Grid()
+        sub_comp_grid.get_style_context().add_class("config-section")
+        sub_comp_grid.set_row_spacing(10)
+        sub_comp_grid.set_column_spacing(15)
+        sub_comp_frame.add(sub_comp_grid)
+        sub_component_configs = [
+            ("enable_auto_scroll_buttons", "启用开始/停止按钮", "控制在<b>自由/自动模式</b>下是否显示“开始”和“停止”按钮"),
+            ("enable_grid_action_buttons", "启用前进/后退按钮", "控制在<b>整格模式</b>下是否显示“前进”和“后退”按钮"),
+            ("show_capture_count", "显示已截图数量", "是否在侧边栏信息面板中显示当前已截取的图片数量"),
+            ("show_total_dimensions", "显示最终图片总尺寸", "是否在侧边栏信息面板中显示拼接后图片的宽度和总高度"),
+            ("show_current_mode", "显示当前模式", "是否在侧边栏信息面板中显示当前所处的模式（自由/整格/自动）"),
         ]
-        label = Gtk.Label(label="“前进”动作:", xalign=0)
-        label.set_tooltip_markup("定义在<b>整格模式</b>下，点击“前进”按钮或使用其快捷键时执行的复合动作")
-        self.forward_combo = Gtk.ComboBoxText()
-        self.forward_combo.set_tooltip_markup(label.get_tooltip_markup())
-        self.forward_combo.connect("scroll-event", lambda widget, event: True)
-        for value, desc in action_options:
-            self.forward_combo.append(value, desc)
-        grid3.attach(label, 0, 1, 1, 1)
-        grid3.attach(self.forward_combo, 1, 1, 1, 1)
-        label = Gtk.Label(label="“后退”动作:", xalign=0)
-        label.set_tooltip_markup("定义在<b>整格模式</b>下，点击“后退”按钮时执行的复合动作")
-        self.backward_combo = Gtk.ComboBoxText()
-        self.backward_combo.set_tooltip_markup(label.get_tooltip_markup())
-        self.backward_combo.connect("scroll-event", lambda widget, event: True)
-        for value, desc in action_options:
-            self.backward_combo.append(value, desc)
-        grid3.attach(label, 0, 2, 1, 1)
-        grid3.attach(self.backward_combo, 1, 2, 1, 1)
-        self.stack.add_titled(scrolled, "interface", "截图界面")
-
-    def _create_theme_layout_page(self):
-        """创建主题与布局页面"""
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        vbox.set_margin_start(20)
-        vbox.set_margin_end(20)
-        vbox.set_margin_top(20)
-        vbox.set_margin_bottom(20)
-        scrolled.add(vbox)
-        theme_layout_settings = [
-            ('Interface.Theme', 'border_color'),
-            ('Interface.Theme', 'matching_indicator_color'),
-            ('Interface.Layout', 'border_width'),
-            ('Interface.Layout', 'handle_height'),
-            ('Interface.Layout', 'side_panel_width'),
-            ('Interface.Layout', 'button_spacing'),
-            ('Interface.Layout', 'processing_dialog_width'),
-            ('Interface.Layout', 'processing_dialog_height'),
-            ('Interface.Layout', 'processing_dialog_spacing'),
-            ('Interface.Layout', 'processing_dialog_border_width'),
-            ('Interface.Theme', 'processing_dialog_css'),
-            ('Interface.Theme', 'info_panel_css'),
-            ('Interface.Theme', 'simulated_window_css'),
-            ('Interface.Theme', 'notification_css'),
-            ('Interface.Theme', 'dialog_css'),
-            ('Interface.Theme', 'mask_css'),
-            ('Interface.Theme', 'instruction_panel_css'),
-        ]
-        restore_button = Gtk.Button(label="恢复本页默认设置")
-        restore_button.set_halign(Gtk.Align.END)
-        restore_button.set_margin_top(10)
-        restore_button.connect("clicked", self._on_restore_defaults_clicked, theme_layout_settings)
-        vbox.pack_end(restore_button, False, False, 0)
-        # 核心外观
-        frame1 = Gtk.Frame(label="核心外观")
-        vbox.pack_start(frame1, False, False, 0)
-        grid1 = Gtk.Grid()
-        grid1.set_margin_start(15)
-        grid1.set_margin_end(15)
-        grid1.set_margin_top(10)
-        grid1.set_margin_bottom(15)
-        grid1.set_row_spacing(10)
-        grid1.set_column_spacing(10)
-        frame1.add(grid1)
-        # 边框颜色
-        label = Gtk.Label(label="边框颜色:", xalign=0)
-        self.border_color_button = CustomColorButton()
-        self.border_color_button.connect("clicked", self._show_embedded_color_chooser)
-        grid1.attach(label, 0, 0, 1, 1)
-        grid1.attach(self.border_color_button, 1, 0, 1, 1)
-        # 指示器颜色
-        label_ind = Gtk.Label(label="匹配指示器颜色:", xalign=0)
-        label_ind.set_tooltip_markup("误差修正功能启用时，在边框上标记区域的颜色")
-        self.indicator_color_button = CustomColorButton()
-        self.indicator_color_button.connect("clicked", self._show_embedded_color_chooser)
-        self.indicator_color_button.set_tooltip_markup(label_ind.get_tooltip_markup())
-        grid1.attach(label_ind, 0, 1, 1, 1)
-        grid1.attach(self.indicator_color_button, 1, 1, 1, 1)
-        # 边框宽度
-        label = Gtk.Label(label="边框宽度:", xalign=0)
-        self.border_width_spin = Gtk.SpinButton()
-        self.border_width_spin.connect("scroll-event", lambda widget, event: True)
-        self.border_width_spin.set_range(1, 25)
-        self.border_width_spin.set_increments(1, 5)
-        self.border_width_spin.set_halign(Gtk.Align.START)
-        grid1.attach(label, 0, 2, 1, 1)
-        grid1.attach(self.border_width_spin, 1, 2, 1, 1)
-        # 布局微调
-        frame2 = Gtk.Frame(label="布局微调")
-        vbox.pack_start(frame2, False, False, 0)
-        grid2 = Gtk.Grid()
-        grid2.set_margin_start(15)
-        grid2.set_margin_end(15)
-        grid2.set_margin_top(10)
-        grid2.set_margin_bottom(15)
-        grid2.set_row_spacing(10)
-        grid2.set_column_spacing(10)
-        frame2.add(grid2)
+        for i, (key, desc, tooltip) in enumerate(sub_component_configs):
+            checkbox = Gtk.CheckButton(label=desc)
+            checkbox.set_tooltip_markup(tooltip)
+            sub_comp_grid.attach(checkbox, i % 2, i // 2, 1, 1)
+            self.widget_map[key] = checkbox
+        layout_frame = Gtk.Frame(label="布局显示")
+        vbox.pack_start(layout_frame, False, False, 0)
+        self.advanced_containers.append(layout_frame)
+        layout_grid = Gtk.Grid()
+        layout_grid.get_style_context().add_class("config-section")
+        layout_grid.set_row_spacing(15)
+        layout_grid.set_column_spacing(15)
+        layout_frame.add(layout_grid)
         layout_configs = [
-            ("handle_height", "拖动手柄高度", 3, 50, "在截图选区上下边缘，可用于拖动调整高度的区域大小，单位：逻辑px"),
-            ("button_panel_width", "按钮面板宽度", 80, 200, "右侧按钮面板的宽度，单位：逻辑px"),
-            ("side_panel_width", "侧边栏宽度", 80, 200, "功能面板和信息面板的总宽度，单位：逻辑px"),
-            ("button_spacing", "按钮间距", 0, 20, "各个按钮之间的垂直间距，单位：逻辑px"),
-            ("processing_dialog_width", "处理中对话框宽度", 100, 400, "完成截图后出现的对话框的宽度，单位：逻辑px"),
-            ("processing_dialog_height", "处理中对话框高度", 50, 200, "完成截图后出现的对话框的高度，单位：逻辑px"),
-            ("processing_dialog_spacing", "处理中对话框间距", 5, 30, "处理中对话框内部元素（图标、文字、进度条）的间距，单位：逻辑px"),
-            ("processing_dialog_border_width", "处理中对话框边距", 5, 50, "处理中对话框内容区域距离边缘的距离，单位：逻辑px")
+            ("border_width", "边框宽度", (1, 20), (1, 5), "截图区域边框的宽度，单位：逻辑px"),
+            ("button_panel_width", "按钮面板宽度", (80, 200), (5, 20), "右侧按钮面板的宽度，单位：逻辑px"),
+            ("side_panel_width", "侧边栏宽度", (120, 200), (5, 20), "功能面板和信息面板的宽度，单位：逻辑px")
         ]
-        self.layout_spins = {}
-        for i, (key, desc, min_val, max_val, tooltip) in enumerate(layout_configs):
+        for i, (key, desc, (min_val, max_val), (step, page), tooltip) in enumerate(layout_configs):
             label = Gtk.Label(label=f"{desc}:", xalign=0)
             label.set_tooltip_markup(tooltip)
             spin = Gtk.SpinButton()
             spin.set_tooltip_markup(tooltip)
             spin.connect("scroll-event", lambda widget, event: True)
             spin.set_range(min_val, max_val)
-            spin.set_increments(1, 5)
+            spin.set_increments(step, page)
             spin.set_halign(Gtk.Align.START)
-            row = i // 2
-            col = (i % 2) * 2
-            grid2.attach(label, col, row, 1, 1)
-            grid2.attach(spin, col + 1, row, 1, 1)
-            self.layout_spins[key] = spin
+            layout_grid.attach(label, 0, i, 1, 1)
+            layout_grid.attach(spin, 1, i, 1, 1)
+            self.widget_map[key] = spin
+        self.stack.add_titled(scrolled, "components_layout", "组件布局")
+
+    def _create_behavior_page(self):
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        vbox.get_style_context().add_class("config-container")
+        scrolled.add(vbox)
+        behavior_page_settings = [
+            ('Behavior', 'copy_to_clipboard_on_finish'), ('Behavior', 'capture_with_cursor'), ('Behavior', 'enable_free_scroll_matching'),
+            ('Behavior', 'auto_scroll_ticks_per_step'), ('Behavior', 'auto_scroll_interval_ms'),
+            ('Behavior', 'scroll_method'), ('Behavior', 'reuse_invisible_cursor'),
+            ('Behavior', 'grid_scroll_interval_ms'), ('Behavior', 'forward_action'), ('Behavior', 'backward_action'), ('Behavior', 'grid_scroll_ticks_formula'),
+        ]
+        self._add_restore_button(vbox, behavior_page_settings)
+        frame1 = Gtk.Frame(label="常用交互")
+        vbox.pack_start(frame1, False, False, 0)
+        vbox1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        vbox1.get_style_context().add_class("config-section")
+        frame1.add(vbox1)
+        common_configs = [
+            ('copy_to_clipboard_on_finish', '完成后复制到剪贴板', "拼接完成后，是否自动将最终生成的图片复制到系统剪贴板\n若图片过大则只会复制路径"),
+            ('capture_with_cursor', '截取鼠标指针', "自由模式下截图时是否将鼠标指针也一并截取下来"),
+            ('enable_free_scroll_matching', '自由模式启用误差修正', "在<b>自由模式</b>下，使用模板匹配来修正误差\n启用后，请确保每次滚动有重叠部分，否则无法修正")
+        ]
+        for key, desc, tooltip in common_configs:
+            cb = Gtk.CheckButton(label=desc)
+            cb.set_tooltip_markup(tooltip)
+            vbox1.pack_start(cb, False, False, 0)
+            self.widget_map[key] = cb
+        frame2 = Gtk.Frame(label="自动模式")
+        vbox.pack_start(frame2, False, False, 0)
+        grid2 = Gtk.Grid()
+        grid2.get_style_context().add_class("config-section")
+        grid2.set_row_spacing(15)
+        grid2.set_column_spacing(15)
+        frame2.add(grid2)
+        auto_configs = [
+            ("auto_scroll_ticks_per_step", "滚动步长 (格)", (1, 8), (1, 2), "自动模式下，每一步滚动几格"),
+            ("auto_scroll_interval_ms", "滚动间隔 (ms)", (50, 800), (50, 100), "自动模式下，每次滚动完后等待截图的间隔时间")
+        ]
+        for i, (key, desc, (min_val, max_val), (step, page), tooltip) in enumerate(auto_configs):
+            label = Gtk.Label(label=f"{desc}:", xalign=0)
+            label.set_tooltip_markup(tooltip)
+            spin = Gtk.SpinButton()
+            spin.set_range(min_val, max_val)
+            spin.set_increments(step, page)
+            spin.set_tooltip_markup(tooltip)
+            spin.connect("scroll-event", lambda widget, event: True)
+            grid2.attach(label, 0, i, 1, 1)
+            grid2.attach(spin, 1, i, 1, 1)
+            self.widget_map[key] = spin
+        frame3 = Gtk.Frame(label="隐形光标")
+        vbox.pack_start(frame3, False, False, 0)
+        self.advanced_containers.append(frame3)
+        grid3 = Gtk.Grid()
+        grid3.get_style_context().add_class("config-section")
+        grid3.set_row_spacing(15)
+        grid3.set_column_spacing(15)
+        frame3.add(grid3)
+        label = Gtk.Label(label="滚动方式:", xalign=0)
+        label.set_tooltip_markup("<b>移动用户光标</b>: 将用户鼠标移动到截图区域中心来滚动，兼容性好但有干扰\n<b>使用隐形光标</b>: 创建另一个光标来滚动，无干扰但退出时可能导致界面卡顿")
+        method_combo = Gtk.ComboBoxText()
+        method_combo.append("move_user_cursor", "移动用户光标")
+        method_combo.append("invisible_cursor", "使用隐形光标（实验性）")
+        method_combo.connect("scroll-event", lambda widget, event: True)
+        self.widget_map['scroll_method'] = method_combo
+        reuse_cb = Gtk.CheckButton(label="复用隐形光标")
+        reuse_cb.set_tooltip_markup("若使用隐形光标且选择复用，则程序退出后不会删除创建的光标，下次启动时会尝试复用")
+        self.widget_map['reuse_invisible_cursor'] = reuse_cb
+        if IS_WAYLAND:
+            label.set_sensitive(False)
+            method_combo.set_sensitive(False)
+            reuse_cb.set_sensitive(False)
+        grid3.attach(label, 0, 0, 1, 1)
+        grid3.attach(method_combo, 1, 0, 1, 1)
+        grid3.attach(reuse_cb, 2, 0, 1, 1)
+        frame4 = Gtk.Frame(label="整格模式")
+        vbox.pack_start(frame4, False, False, 0)
+        self.advanced_containers.append(frame4)
+        grid4 = Gtk.Grid()
+        grid4.get_style_context().add_class("config-section")
+        grid4.set_row_spacing(15)
+        grid4.set_column_spacing(15)
+        frame4.add(grid4)
+        grid_interval_label = Gtk.Label(label="滚动间隔 (ms):", xalign=0)
+        grid_interval_tooltip = "整格模式下，每次滚动完后的间隔时间"
+        grid_interval_label.set_tooltip_markup(grid_interval_tooltip)
+        grid_interval_spin = Gtk.SpinButton()
+        grid_interval_spin.set_range(50, 1000)
+        grid_interval_spin.set_increments(50, 100)
+        grid_interval_spin.set_tooltip_markup(grid_interval_tooltip)
+        grid_interval_spin.connect("scroll-event", lambda widget, event: True)
+        grid_interval_spin.set_halign(Gtk.Align.START)
+        grid4.attach(grid_interval_label, 0, 0, 1, 1)
+        grid4.attach(grid_interval_spin, 1, 0, 1, 1)
+        self.widget_map['grid_scroll_interval_ms'] = grid_interval_spin
+        action_options = [
+            ("scroll", "仅滚动"),
+            ("scroll_capture", "滚动后截图"),
+            ("capture_scroll", "截图后滚动"),
+            ("scroll_delete", "滚动并删除"),
+        ]
+        actions_config = [
+            ('forward_action', '前进执行动作', "定义在<b>整格模式</b>下，点击“前进”按钮或使用其快捷键时执行的复合动作"),
+            ('backward_action', '后退执行动作', "定义在<b>整格模式</b>下，点击“后退”按钮或使用其快捷键时执行的复合动作")
+        ]
+        for i, (key, desc, tooltip) in enumerate(actions_config):
+            lbl = Gtk.Label(label=f"{desc}:", xalign=0)
+            lbl.set_tooltip_markup(tooltip)
+            combo = Gtk.ComboBoxText()
+            combo.set_tooltip_markup(tooltip)
+            combo.connect("scroll-event", lambda widget, event: True)
+            for val, desc in action_options:
+                combo.append(val, desc)
+            combo.set_halign(Gtk.Align.START)
+            grid4.attach(lbl, 0, i + 1, 1, 1)
+            grid4.attach(combo, 1, i + 1, 1, 1)
+            self.widget_map[key] = combo
+        f_label = Gtk.Label(label="滚动格数公式:", xalign=0)
+        f_label.set_tooltip_markup("在整格模式下且启用误差修正时，计算滚动格数的公式\n变量 <b>{ticks}</b> 代表（高度 / 滚动单位）向下取整，支持函数: <b>min, max, int</b>")
+        f_entry = Gtk.Entry()
+        f_entry.set_tooltip_markup(f_label.get_tooltip_markup())
+        f_entry.set_hexpand(True)
+        grid4.attach(f_label, 0, 3, 1, 1)
+        grid4.attach(f_entry, 1, 3, 1, 1)
+        self.widget_map['grid_scroll_ticks_formula'] = f_entry
+        self.stack.add_titled(scrolled, "behavior", "行为设置")
+
+    def _create_theme_appearance_page(self):
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        vbox.get_style_context().add_class("config-container")
+        scrolled.add(vbox)
+        theme_appearance_settings = [
+            ('Interface.Theme', 'border_color'), ('Interface.Theme', 'static_bar_color'),
+            ('Interface.Theme', 'info_panel_css'), ('Interface.Theme', 'button_css'), ('Interface.Theme', 'instruction_panel_css'),
+            ('Interface.Theme', 'simulated_window_css'), ('Interface.Theme', 'preview_panel_css'), ('Interface.Theme', 'config_panel_css'),
+            ('Interface.Theme', 'notification_css'),
+            ('Interface.Theme', 'mask_css'), ('Interface.Theme', 'dialog_css'), ('Interface.Theme', 'feedback_widget_css'),
+        ]
+        self._add_restore_button(vbox, theme_appearance_settings)
+        color_frame = Gtk.Frame(label="颜色外观")
+        vbox.pack_start(color_frame, False, False, 0)
+        color_grid = Gtk.Grid()
+        color_grid.get_style_context().add_class("config-section")
+        color_grid.set_row_spacing(10)
+        color_grid.set_column_spacing(15)
+        color_frame.add(color_grid)
+        color_configs = [
+            ('border_color', "边框颜色", "截图区域边框主要的颜色"),
+            ('static_bar_color', "静态栏指示色", "在边框上标记检测到的顶部栏、底部栏和侧边栏的颜色")
+        ]
+        for i, (key, desc, tooltip) in enumerate(color_configs):
+            label = Gtk.Label(label=f"{desc}:", xalign=0)
+            btn = CustomColorButton()
+            btn.connect("clicked", self._show_embedded_color_chooser)
+            label.set_tooltip_markup(tooltip)
+            btn.set_tooltip_markup(tooltip)
+            self.widget_map[key] = btn
+            color_grid.attach(label, 0, i, 1, 1)
+            color_grid.attach(btn, 1, i, 1, 1)
         # 自定义样式（CSS）
         css_expander = Gtk.Expander(label="自定义样式（CSS）")
+        css_expander.set_expanded(True)
         vbox.pack_start(css_expander, True, True, 0)
         css_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        css_vbox.set_margin_start(10)
-        css_vbox.set_margin_end(10)
-        css_vbox.set_margin_top(5)
-        css_vbox.set_margin_bottom(10)
+        css_vbox.get_style_context().add_class("config-section")
         css_expander.add(css_vbox)
-        self.css_textviews = {}
         css_configs = [
-            ("processing_dialog_css", "处理中面板样式"), 
-            ("notification_css", "通知面板样式"),
-            ("dialog_css", "对话框样式"),
-            ("mask_css", "遮罩层样式"),
             ("info_panel_css", "信息面板样式"),
+            ("button_css", "按钮样式"),
             ("instruction_panel_css", "提示面板样式"),
-            ("simulated_window_css", "模拟窗口通用样式")
+            ("notification_css", "通知样式"),
+            ("simulated_window_css", "模拟窗口通用样式"),
+            ("preview_panel_css", "预览面板样式"),
+            ('config_panel_css', '配置面板样式'),
+            ("mask_css", "遮罩层样式"),
+            ("dialog_css", "对话框样式"),
+            ("feedback_widget_css", "反馈面板样式"),
         ]
         for key, desc in css_configs:
             label = Gtk.Label(label=f"{desc}:", xalign=0)
-            label.set_tooltip_markup("在此处输入自定义 CSS 代码以调整组件外观")
+            label.set_tooltip_markup("在此处输入自定义 CSS 代码以调整外观")
             scrolled_css = Gtk.ScrolledWindow()
             scrolled_css.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-            scrolled_css.set_size_request(-1, 190)
-            scrolled_css.set_margin_start(10)
-            scrolled_css.set_margin_end(5)
-            scrolled_css.set_margin_top(5)
-            scrolled_css.set_margin_bottom(5)
+            scrolled_css.set_size_request(-1, 200)
+            scrolled_css.get_style_context().add_class("config-section")
             textview = Gtk.TextView()
             textview.set_wrap_mode(Gtk.WrapMode.WORD)
             scrolled_css.add(textview)
@@ -4988,151 +5407,129 @@ class ConfigPanel(SimulatedWindow):
             frame.add(scrolled_css)
             css_vbox.pack_start(label, False, False, 0)
             css_vbox.pack_start(frame, True, True, 0)
-            self.css_textviews[key] = textview
-        self.theme_layout_page = scrolled
-        self.stack.add_titled(scrolled, "theme", "主题与布局")
-
-    def _discover_sound_themes(self):
-        """扫描 /usr/share/sounds 目录，找出所有可用的主题和音效"""
-        sound_base_path = Path("/usr/share/sounds")
-        themes = {}
-        if not sound_base_path.is_dir():
-            logging.warning(f"声音目录 {sound_base_path} 不存在，无法扫描主题")
-            return themes
-        for theme_path in sound_base_path.iterdir():
-            stereo_path = theme_path / "stereo"
-            if theme_path.is_dir() and stereo_path.is_dir():
-                theme_name = theme_path.name
-                sounds = []
-                for sound_file in stereo_path.iterdir():
-                    if sound_file.is_file() and sound_file.suffix in ['.oga', '.wav', '.ogg']:
-                        sounds.append(sound_file.stem)
-                if sounds:
-                    themes[theme_name] = sorted(sounds)
-        logging.debug(f"发现 {len(themes)} 个声音主题")
-        return themes
+            self.widget_map[key] = textview
+        self.theme_appearance_page = scrolled
+        self.stack.add_titled(scrolled, "theme", "主题外观")
 
     def _on_sound_theme_changed(self, combo):
         selected_theme = combo.get_active_id()
-        if not selected_theme or selected_theme not in self.sound_data:
+        if not selected_theme or selected_theme not in self.sound_themes:
             return
-        sound_list = self.sound_data[selected_theme]
-        sound_combos = [
-            self.sound_entries['capture_sound'],
-            self.sound_entries['undo_sound'],
-            self.sound_entries['finalize_sound']
-        ]
+        sounds_in_theme = self.sound_themes[selected_theme]
+        sound_combos = [self.widget_map.get(k) for k in self.SOUND_KEYS if self.widget_map.get(k)]
         for sound_combo in sound_combos:
             current_value = sound_combo.get_active_id()
             sound_combo.remove_all()
-            for sound in sound_list:
+            for sound in sounds_in_theme:
                 sound_combo.append(sound, sound)
-            if current_value in sound_list:
+            if current_value in sounds_in_theme:
                 sound_combo.set_active_id(current_value)
 
     def _on_play_sound_clicked(self, button, sound_combo):
-        theme_combo = self.sound_entries['sound_theme']
+        theme_combo = self.widget_map.get('sound_theme')
         theme_name = theme_combo.get_active_id()
         sound_name = sound_combo.get_active_id()
         if theme_name and sound_name:
             logging.debug(f"试听音效: 主题='{theme_name}', 声音='{sound_name}'")
-            play_sound(sound_name, theme_name=theme_name)
+            SystemInteraction.play_sound(sound_name, theme_name=theme_name)
         elif not theme_name:
             logging.warning("无法试听：请先选择一个声音主题")
         else:
             logging.warning("无法试听：请先选择一个音效")
 
     def _create_system_performance_page(self):
-        """创建系统与性能页面（高级）"""
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        vbox.set_margin_start(20)
-        vbox.set_margin_end(20)
-        vbox.set_margin_top(20)
-        vbox.set_margin_bottom(20)
+        vbox.get_style_context().add_class("config-container")
         scrolled.add(vbox)
         system_perf_settings = [
-            ('System', 'copy_to_clipboard_on_finish'),
-            ('System', 'notification_click_action'),
-            ('System', 'large_image_opener'),
-            ('System', 'sound_theme'),
-            ('System', 'capture_sound'),
-            ('System', 'undo_sound'),
-            ('System', 'finalize_sound'),
-            ('Performance', 'auto_scroll_ticks_per_step'),
-            ('Performance', 'max_scroll_per_tick'),
-            ('Performance', 'min_scroll_per_tick'),
-            ('Performance', 'max_viewer_dimension'),
+            ('System', 'max_viewer_dimension'), ('System', 'large_image_opener'),
+            ('Performance', 'max_scroll_per_tick'), ('Performance', 'min_scroll_per_tick'), ('Preview', 'preview_cache_size'),
+            ('System', 'sound_theme'), ('System', 'capture_sound'), ('System', 'undo_sound'), ('System', 'finalize_sound'), ('System', 'warning_sound'),
             ('System', 'log_file'),
-            ('System', 'temp_directory_base'),
         ]
-        restore_button = Gtk.Button(label="恢复本页默认设置")
-        restore_button.set_halign(Gtk.Align.END)
-        restore_button.set_margin_top(10)
-        restore_button.connect("clicked", self._on_restore_defaults_clicked, system_perf_settings)
-        vbox.pack_end(restore_button, False, False, 0)
-        # 系统交互
-        frame1 = Gtk.Frame(label="系统交互")
+        self._add_restore_button(vbox, system_perf_settings)
+        frame1 = Gtk.Frame(label="打开图片")
         vbox.pack_start(frame1, False, False, 0)
         grid1 = Gtk.Grid()
-        grid1.set_margin_start(15)
-        grid1.set_margin_end(15)
-        grid1.set_margin_top(10)
-        grid1.set_margin_bottom(15)
-        grid1.set_row_spacing(10)
-        grid1.set_column_spacing(10)
+        grid1.get_style_context().add_class("config-section")
+        grid1.set_row_spacing(15)
+        grid1.set_column_spacing(15)
         frame1.add(grid1)
-        # 完成后复制到剪贴板
-        self.clipboard_checkbox = Gtk.CheckButton(label="完成后复制到剪贴板")
-        self.clipboard_checkbox.set_tooltip_markup("拼接完成后，是否自动将最终生成的图片复制到系统剪贴板")
-        grid1.attach(self.clipboard_checkbox, 0, 0, 2, 1)
-        # 点击通知时
-        label = Gtk.Label(label="通知点击行为:", xalign=0)
-        label.set_tooltip_markup("设置点击“截图完成”的系统通知后，执行的操作")
-        self.notification_combo = Gtk.ComboBoxText()
-        self.notification_combo.set_tooltip_markup(label.get_tooltip_markup())
-        self.notification_combo.connect("scroll-event", lambda widget, event: True)
-        self.notification_combo.append("none", "无操作")
-        self.notification_combo.append("open_file", "打开文件")
-        self.notification_combo.append("open_directory", "打开目录")
-        grid1.attach(label, 0, 1, 1, 1)
-        grid1.attach(self.notification_combo, 1, 1, 1, 1)
-        # 大尺寸图片打开方式
-        label = Gtk.Label(label="大尺寸图片打开命令:", xalign=0)
-        label.set_tooltip_markup("当生成图片长或宽超过下方阈值时，使用此终端命令打开图片\n<b>{filepath}</b> 会被替换为图片文件路径，示例：shotwell \"{filepath}\"\n直接设为 <b>default_browser</b> 可用浏览器打开")
+        # 图片尺寸阈值
+        dim_label = Gtk.Label(label="图片尺寸阈值:", xalign=0)
+        dim_tooltip = "当最终图片长或宽超过此值时，会使用下面的命令打开图片\n设为 <b>-1</b> 总是用系统默认方式打开图片\n设为 <b>0</b> 总是用自定义命令打开图片"
+        dim_label.set_tooltip_markup(dim_tooltip)
+        dim_spin = Gtk.SpinButton()
+        dim_spin.set_tooltip_markup(dim_tooltip)
+        dim_spin.connect("scroll-event", lambda widget, event: True)
+        dim_spin.set_range(-1, 131071)
+        dim_spin.set_increments(1, 100)
+        dim_spin.set_halign(Gtk.Align.START)
+        self.widget_map['max_viewer_dimension'] = dim_spin
+        grid1.attach(dim_label, 0, 0, 1, 1)
+        grid1.attach(dim_spin, 1, 0, 1, 1)
+        # 大尺寸图片打开命令
+        label = Gtk.Label(label="大图打开命令:", xalign=0)
+        label.set_tooltip_markup("当最终图片长或宽超过上方阈值时，使用此终端命令打开图片\n<b>{filepath}</b> 会被替换为图片文件路径，示例：flatpak run org.libvips.vipsdisp \"{filepath}\"\n直接设为 <b>default_browser</b> 可用浏览器打开")
         self.large_opener_entry = Gtk.Entry()
         self.large_opener_entry.set_tooltip_markup(label.get_tooltip_markup())
-        help_label = Gtk.Label(label="可用变量: {filepath}, default_browser")
-        help_label.set_markup("<small>可用变量: {filepath}, default_browser</small>")
-        grid1.attach(label, 0, 2, 1, 1)
-        grid1.attach(self.large_opener_entry, 1, 2, 1, 1)
-        grid1.attach(help_label, 1, 3, 1, 1)
-        # 声音主题
-        frame2 = Gtk.Frame(label="声音主题")
+        self.large_opener_entry.set_hexpand(True)
+        self.widget_map['large_image_opener'] = self.large_opener_entry
+        grid1.attach(label, 0, 1, 1, 1)
+        grid1.attach(self.large_opener_entry, 1, 1, 1, 1)
+        # 性能调优
+        frame2 = Gtk.Frame(label="性能调优")
         vbox.pack_start(frame2, False, False, 0)
         grid2 = Gtk.Grid()
-        grid2.set_margin_start(15)
-        grid2.set_margin_end(15)
-        grid2.set_margin_top(10)
-        grid2.set_margin_bottom(15)
-        grid2.set_row_spacing(10)
-        grid2.set_column_spacing(10)
+        grid2.get_style_context().add_class("config-section")
+        grid2.set_row_spacing(15)
+        grid2.set_column_spacing(15)
         frame2.add(grid2)
-        self.sound_entries = {}
+        performance_configs = [
+            ("max_scroll_per_tick", "每格最大滚动像素", (120, 500), (10, 50), "用于匹配和校准的最大滚动阈值（单位：缓冲区px），需要不小于实际滚动单位"),
+            ("min_scroll_per_tick", "每格最小滚动像素", (1, 60), (1, 10), "用于匹配和校准的最小滚动阈值（单位：缓冲区px），可以大于实际滚动单位"),
+            ("preview_cache_size", "预览缓存大小 (张)", (10, 50), (1, 5), "预览在内存中保留的图片数量，不会少于视口内的图片数量，增加可减少加载时间但会占用更多内存")
+        ]
+        num_items = len(performance_configs)
+        mid_point = (num_items + 1) // 2
+        for i, (key, desc, (min_val, max_val), (step, page), tooltip) in enumerate(performance_configs):
+            row = i % mid_point
+            col_base = (i // mid_point) * 2
+            label = Gtk.Label(label=f"{desc}:", xalign=0)
+            label.set_tooltip_markup(tooltip)
+            spin = Gtk.SpinButton()
+            spin.set_tooltip_markup(tooltip)
+            spin.connect("scroll-event", lambda widget, event: True)
+            spin.set_range(min_val, max_val)
+            spin.set_increments(step, page)
+            spin.set_halign(Gtk.Align.START)
+            grid2.attach(label, col_base, row, 1, 1)
+            grid2.attach(spin, col_base + 1, row, 1, 1)
+            self.widget_map[key] = spin
+        # 声音主题
+        frame3 = Gtk.Frame(label="声音主题")
+        vbox.pack_start(frame3, False, False, 0)
+        grid3 = Gtk.Grid()
+        grid3.get_style_context().add_class("config-section")
+        grid3.set_row_spacing(10)
+        grid3.set_column_spacing(15)
+        frame3.add(grid3)
         label = Gtk.Label(label="声音主题:", xalign=0)
         theme_combo = Gtk.ComboBoxText()
         theme_combo.connect("scroll-event", lambda widget, event: True)
-        for theme_name in sorted(self.sound_data.keys()):
+        for theme_name in sorted(self.sound_themes.keys()):
             theme_combo.append(theme_name, theme_name)
         theme_combo.connect("changed", self._on_sound_theme_changed)
-        self.sound_entries['sound_theme'] = theme_combo
-        grid2.attach(label, 0, 0, 1, 1)
-        grid2.attach(theme_combo, 1, 0, 1, 1)
+        self.widget_map['sound_theme'] = theme_combo
+        grid3.attach(label, 0, 0, 1, 1)
+        grid3.attach(theme_combo, 1, 0, 1, 1)
         sound_configs = [
             ("capture_sound", "截图音效"),
             ("undo_sound", "撤销音效"),
-            ("finalize_sound", "完成音效")
+            ("finalize_sound", "完成音效"),
+            ("warning_sound", "警告音效")
         ]
         for i, (key, desc) in enumerate(sound_configs):
             label = Gtk.Label(label=f"{desc}:", xalign=0)
@@ -5144,84 +5541,51 @@ class ConfigPanel(SimulatedWindow):
             play_button.connect("clicked", self._on_play_sound_clicked, sound_combo)
             hbox.pack_start(sound_combo, False, False, 0)
             hbox.pack_start(play_button, False, False, 0)
-            self.sound_entries[key] = sound_combo
-            grid2.attach(label, 0, i + 1, 1, 1)
-            grid2.attach(hbox, 1, i + 1, 1, 1)
-        # 性能调优
-        frame3 = Gtk.Frame(label="性能调优")
-        vbox.pack_start(frame3, False, False, 0)
-        grid3 = Gtk.Grid()
-        grid3.set_margin_start(15)
-        grid3.set_margin_end(15)
-        grid3.set_margin_top(10)
-        grid3.set_margin_bottom(15)
-        grid3.set_row_spacing(10)
-        grid3.set_column_spacing(10)
-        frame3.add(grid3)
-        performance_configs = [
-            ("grid_matching_max_overlap", "整格模式误差修正范围", 10, 20, "<b>整格模式</b>下的误差修正设置最大搜索范围，单位：缓冲区px"),
-            ("free_scroll_matching_max_overlap", "自由模式误差修正范围", 20, 300, "<b>自由模式</b>下的误差修正设置最大搜索范围\n值越大，处理用时越长，单位：缓冲区px"),
-            ("auto_scroll_ticks_per_step", "自动滚动步长（格数）", 1, 8, "自动模式下，每一步滚动几格\n值越大滚动越快"),
-            ("max_scroll_per_tick", "自动截图高度（每格）", 120, 500, "自动模式下，对应滚动一格的截图高度 (px)\n总截图高度 = 此值 * 滚动格数，单位：缓冲区px"),
-            ("min_scroll_per_tick", "最小滚动像素", 1, 60, "用于匹配和校准的最小滚动阈值 (px)，单位：缓冲区px"),
-            ("max_viewer_dimension", "图片尺寸阈值", -1, 131071, "最终图片长或宽超过此值时，会使用上面的“大尺寸图片打开命令”\n设为 <b>-1</b> 禁用此功能，总是用系统默认方式打开图片\n设为 <b>0</b> 总是用自定义命令打开图片"),
-            ("preview_drag_sensitivity", "预览拖动灵敏度", 0.5, 10.0, "预览面板中按住左键拖动图像的速度倍数")
-        ]
-        self.performance_spins = {}
-        num_items = len(performance_configs)
-        mid_point = (num_items + 1) // 2
-        for i, (key, desc, min_val, max_val, tooltip) in enumerate(performance_configs):
-            row = i % mid_point
-            col_base = (i // mid_point) * 2
-            label = Gtk.Label(label=f"{desc}:", xalign=0)
-            label.set_tooltip_markup(tooltip)
-            spin = Gtk.SpinButton()
-            spin.set_tooltip_markup(tooltip)
-            spin.connect("scroll-event", lambda widget, event: True)
-            spin.set_range(min_val, max_val)
-            spin.set_increments(1, 10)
-            if isinstance(min_val, float) or isinstance(max_val, float):
-                spin.set_digits(1)
-                spin.set_increments(0.1, 1.0)
-            spin.set_halign(Gtk.Align.START)
-            grid3.attach(label, col_base, row, 1, 1)
-            grid3.attach(spin, col_base + 1, row, 1, 1)
-            self.performance_spins[key] = spin
+            self.widget_map[key] = sound_combo
+            grid3.attach(label, 0, i + 1, 1, 1)
+            grid3.attach(hbox, 1, i + 1, 1, 1)
         # 路径
         frame4 = Gtk.Frame(label="路径")
         vbox.pack_start(frame4, False, False, 0)
         grid4 = Gtk.Grid()
-        grid4.set_margin_start(15)
-        grid4.set_margin_end(15)
-        grid4.set_margin_top(10)
-        grid4.set_margin_bottom(15)
-        grid4.set_row_spacing(10)
-        grid4.set_column_spacing(10)
+        grid4.get_style_context().add_class("config-section")
+        grid4.set_row_spacing(15)
+        grid4.set_column_spacing(15)
         frame4.add(grid4)
-        path_configs = [
-            ("log_file", "日志文件路径", "指定日志文件的保存路径，支持使用 ~ 代表用户主目录"),
-            ("temp_directory_base", "临时目录模板", "定义用于存放单次会话截图的目录模板\n变量 <b>{pid}</b> 会被替换为进程ID")
-        ]
-        self.path_entries = {}
-        for i, (key, desc, tooltip) in enumerate(path_configs):
-            label = Gtk.Label(label=f"{desc}:", xalign=0)
-            label.set_tooltip_markup(tooltip)
-            entry = Gtk.Entry()
-            entry.set_tooltip_markup(tooltip)
-            entry.set_hexpand(True)
-            grid4.attach(label, 0, i, 1, 1)
-            grid4.attach(entry, 1, i, 1, 1)
-            self.path_entries[key] = entry
+        log_label = Gtk.Label(label="日志文件路径:", xalign=0)
+        log_label.set_tooltip_markup("指定日志文件的保存路径，支持使用 <b>~</b> 代表主目录，变量 <b>{pid}</b> 代表当前进程 ID")
+        log_entry = Gtk.Entry()
+        log_entry.set_tooltip_markup(log_label.get_tooltip_markup())
+        log_entry.set_hexpand(True)
+        grid4.attach(log_label, 0, 0, 1, 1)
+        grid4.attach(log_entry, 1, 0, 1, 1)
+        self.widget_map['log_file'] = log_entry
+        temp_label = Gtk.Label(label="临时目录:", xalign=0)
+        temp_label.set_tooltip_markup("存放当前实例截图的目录，修改请编辑配置文件")
+        temp_entry = Gtk.Entry()
+        temp_entry.set_text(str(self.config.TEMP_DIRECTORY))
+        temp_entry.set_tooltip_markup(temp_label.get_tooltip_markup())
+        temp_entry.set_editable(False)
+        temp_entry.set_can_focus(True)
+        temp_entry.set_hexpand(True)
+        grid4.attach(temp_label, 0, 1, 1, 1)
+        grid4.attach(temp_entry, 1, 1, 1, 1)
+        cfg_label = Gtk.Label(label="配置文件路径:", xalign=0)
+        cfg_label.set_tooltip_markup("本次程序运行加载的配置文件路径")
+        cfg_entry = Gtk.Entry()
+        cfg_entry.set_text(str(self.config.config_path))
+        cfg_entry.set_tooltip_markup(cfg_label.get_tooltip_markup())
+        cfg_entry.set_editable(False)
+        cfg_entry.set_can_focus(True)
+        cfg_entry.set_hexpand(True)
+        grid4.attach(cfg_label, 0, 2, 1, 1)
+        grid4.attach(cfg_entry, 1, 2, 1, 1)
         self.system_performance_page = scrolled
         self.stack.add_titled(scrolled, "system", "系统与性能")
 
     def _create_grid_calibration_page(self):
-        """创建整格模式校准页面"""
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        vbox.set_margin_start(20)
-        vbox.set_margin_end(20)
-        vbox.set_margin_top(20)
-        vbox.set_margin_bottom(20)
+        vbox.get_style_context().add_class("config-container")
         info_label = Gtk.Label(label="用于手动添加或调整应用的滚动单位 (缓冲区px)")
         info_label.set_xalign(0)
         vbox.pack_start(info_label, False, False, 0)
@@ -5231,12 +5595,16 @@ class ConfigPanel(SimulatedWindow):
         vbox.pack_start(scrolled, True, True, 0)
         self.grid_listbox = Gtk.ListBox()
         self.grid_listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        empty_lbl = Gtk.Label(label="暂无已保存的配置")
+        empty_lbl.get_style_context().add_class("dim-label")
+        empty_lbl.show()
+        self.grid_listbox.set_placeholder(empty_lbl)
         scrolled.add(self.grid_listbox)
         button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         button_box.set_halign(Gtk.Align.END)
         vbox.pack_start(button_box, False, False, 0)
         add_button = Gtk.Button(label="添加")
-        add_button.connect("clicked", self._on_grid_add)
+        add_button.connect("clicked", lambda w: self._add_grid_row())
         remove_button = Gtk.Button(label="删除选中项")
         remove_button.connect("clicked", self._on_grid_remove)
         button_box.pack_start(add_button, False, False, 0)
@@ -5245,7 +5613,6 @@ class ConfigPanel(SimulatedWindow):
         self.stack.add_titled(vbox, "grid", "整格模式校准")
 
     def _add_grid_row(self, app_class="", unit=0, matching_enabled=False):
-        """向整格校准列表框中添加一行"""
         row = Gtk.ListBoxRow()
         hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         hbox.set_margin_start(10)
@@ -5254,32 +5621,50 @@ class ConfigPanel(SimulatedWindow):
         hbox.set_margin_bottom(5)
         row.add(hbox)
         entry = Gtk.Entry()
-        entry.connect("button-press-event", self._on_grid_row_child_clicked)
         entry.set_placeholder_text("应用程序类名")
         entry.set_text(app_class)
+        entry.last_key = app_class
         entry.set_hexpand(True)
         spin = Gtk.SpinButton()
-        spin.connect("button-press-event", self._on_grid_row_child_clicked)
-        spin.connect("scroll-event", lambda widget, event: True)
-        spin.set_range(1, 300)
+        spin.set_range(0, 300)
         spin.set_increments(1, 10)
         spin.set_value(unit)
         check = Gtk.CheckButton(label="修正误差")
         check.set_tooltip_markup("启用模板匹配修正滚动误差\n启用后，请确保滚动距离小于截图区高度，否则修正无效")
-        check.connect("button-press-event", self._on_grid_row_child_clicked)
         check.set_active(matching_enabled)
+        def on_grid_change(*args):
+            raw_text = entry.get_text()
+            key = raw_text.strip().lower()
+            if not key: return False
+            if raw_text != key:
+                entry.set_text(key)
+            val = f"{spin.get_value_as_int()}, {str(check.get_active()).lower()}"
+            old_key = getattr(entry, 'last_key', '')
+            if old_key and old_key != key:
+                self.config.remove_value('ApplicationScrollUnits', old_key)
+            self.config.set_value('ApplicationScrollUnits', key, val)
+            entry.last_key = key
+            return False
+        entry.connect("focus-out-event", on_grid_change)
+        spin.connect("value-changed", on_grid_change)
+        check.connect("toggled", on_grid_change)
+        for w in [entry, spin, check]:
+            w.connect("button-press-event", self._on_grid_row_child_clicked)
+        spin.connect("scroll-event", lambda w,e: True)
         hbox.pack_start(entry, True, True, 0)
         hbox.pack_start(spin, False, False, 0)
         hbox.pack_start(check, False, False, 0)
         self.grid_listbox.add(row)
         row.show_all()
 
-    def _on_grid_add(self, widget):
-        self._add_grid_row()
-
     def _on_grid_remove(self, widget):
         selected_row = self.grid_listbox.get_selected_row()
         if selected_row:
+            hbox = selected_row.get_child()
+            entry = hbox.get_children()[0]
+            key = entry.get_text().strip().lower()
+            if key:
+                self.config.remove_value('ApplicationScrollUnits', key)
             self.grid_listbox.remove(selected_row)
 
     def _on_grid_row_child_clicked(self, widget, event):
@@ -5290,71 +5675,20 @@ class ConfigPanel(SimulatedWindow):
             self.grid_listbox.select_row(parent)
         return False
 
-    def _create_interface_strings_page(self):
-        """创建界面文本自定义页面"""
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_tooltip_markup("自定义程序界面中显示的各种文本")
-        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        vbox.set_margin_start(20)
-        vbox.set_margin_end(20)
-        vbox.set_margin_top(20)
-        vbox.set_margin_bottom(20)
-        scrolled.add(vbox)
-        frame = Gtk.Frame(label="界面文本")
-        vbox.pack_start(frame, False, False, 0)
-        grid = Gtk.Grid()
-        grid.set_margin_start(15)
-        grid.set_margin_end(15)
-        grid.set_margin_top(10)
-        grid.set_margin_bottom(15)
-        grid.set_row_spacing(10)
-        grid.set_column_spacing(10)
-        frame.add(grid)
-        string_configs = [
-            ("dialog_quit_title", "退出确认标题"),
-            ("dialog_quit_message", "退出确认消息"),
-            ("dialog_quit_button_yes", "退出确认按钮 (是)"),
-            ("dialog_quit_button_no", "退出确认按钮 (否)"),
-            ("capture_count_format", "截图数量格式"),
-            ("processing_dialog_text", "处理中对话框文本"),
-        ]
-        self.string_entries = {}
-        for i, (key, desc) in enumerate(string_configs):
-            label = Gtk.Label(label=f"{desc}:", xalign=0)
-            entry = Gtk.Entry()
-            entry.set_hexpand(True)
-            grid.attach(label, 0, i, 1, 1)
-            grid.attach(entry, 1, i, 1, 1)
-            self.string_entries[key] = entry
-        self.managed_settings.extend([('Interface.Strings', key) for key in self.string_entries.keys()])
-        self.interface_strings_page = scrolled
-        strings_page_settings = [('Interface.Strings', key) for key in self.string_entries.keys()]
-        restore_button = Gtk.Button(label="恢复本页默认设置")
-        restore_button.set_halign(Gtk.Align.END)
-        restore_button.set_margin_top(10)
-        restore_button.connect("clicked", self._on_restore_defaults_clicked, strings_page_settings)
-        vbox.pack_end(restore_button, False, False, 0)
-        self.stack.add_titled(scrolled, "strings", "界面文本")
-
     def _on_advanced_toggle(self, switch, gparam):
         self.show_advanced = switch.get_active()
         self._update_advanced_visibility()
 
     def _update_advanced_visibility(self):
-        """根据高级开关状态更新UI元素的可见性"""
-        # 页面级可见性
         advanced_pages = [
-            self.theme_layout_page,
+            self.theme_appearance_page,
             self.system_performance_page,
-            self.grid_calibration_page,
-            self.interface_strings_page
+            self.grid_calibration_page
         ]
         for page_widget in advanced_pages:
             page_widget.set_visible(self.show_advanced)
-        # 页面内组件的可见性
-        self.output_advanced_frame.set_visible(self.show_advanced)
-        self.behavior_advanced_frame.set_visible(self.show_advanced)
+        for container in self.advanced_containers:
+            container.set_visible(self.show_advanced)
 
     def _on_format_changed(self, combo):
         is_jpeg = combo.get_active_text() == "JPEG"
@@ -5362,61 +5696,27 @@ class ConfigPanel(SimulatedWindow):
         self.jpeg_quality_spin.set_sensitive(is_jpeg)
         self._update_filename_preview()
 
-    def _on_hotkey_changed(self, widget, key):
-        text = widget.get_text()
-        self.config.save_setting('Hotkeys', key, text)
-
-    def _on_behavior_toggled(self, widget, key):
-        is_active = widget.get_active()
-        self.config.save_setting('Behavior', key, str(is_active).lower())
-    def _on_component_toggled(self, widget, key):
-        is_active = widget.get_active()
-        self.config.save_setting('Interface.Components', key, str(is_active).lower())
-
     def _on_restore_defaults_clicked(self, button, settings_to_restore):
-        p_default = self.default_parser
-        p_current = self.config.parser
+        self._cancel_hotkey_capture()
+        self._is_batch_restoring = True
+        restored_count = 0
         for section, key in settings_to_restore:
-            default_value = p_default.get(section, key, raw=True)
-            p_current.set(section, key, default_value)
-            widget = self._find_widget_for_setting(section, key)
+            default_str = self.config.get_default_string(section, key)
+            current_str = self.config.get_raw_string(section, key)
+            if current_str != default_str:
+                restored_count += 1
+                self.config.set_value(section, key, default_str)
+            widget = self.widget_map.get(key)
             if widget:
-                self._update_widget_value(widget, key, default_value)
+                self._update_widget_value(widget, section, key, default_str)
+        self._is_batch_restoring = False
+        if restored_count > 0:
+            self.status_label.set_text(f"已恢复 {restored_count} 项配置到默认值")
+        else:
+            self.status_label.set_text("当前页配置已是默认值")
         page_keys = [item[1] for item in settings_to_restore]
         if 'filename_template' in page_keys:
             self._update_filename_preview()
-
-    def _find_widget_for_setting(self, section, key):
-        key_to_widget_map = {
-            'save_directory': self.save_dir_entry,
-            'save_format': self.format_combo,
-            'jpeg_quality': self.jpeg_quality_spin,
-            'filename_template': self.filename_entry,
-            'filename_timestamp_format': self.timestamp_entry,
-            'border_color': self.border_color_button,
-            'matching_indicator_color': self.indicator_color_button,
-            'border_width': self.border_width_spin,
-            'copy_to_clipboard_on_finish': self.clipboard_checkbox,
-            'notification_click_action': self.notification_combo,
-            'large_image_opener': self.large_opener_entry,
-            'capture_with_cursor': self.cursor_checkbox,
-            'enable_free_scroll_matching': self.free_scroll_matching_checkbox,
-            'scroll_method': self.scroll_method_combo,
-            'reuse_invisible_cursor': self.reuse_cursor_checkbox,
-            'forward_action': self.forward_combo,
-            'backward_action': self.backward_combo,
-        }
-        if key in key_to_widget_map: return key_to_widget_map[key]
-        if key in self.hotkey_buttons: return self.hotkey_buttons[key]
-        if key in self.component_checkboxes: return self.component_checkboxes[key]
-        if key in self.layout_spins: return self.layout_spins[key]
-        if key in self.css_textviews: return self.css_textviews[key]
-        if key in self.sound_entries: return self.sound_entries[key]
-        if key in self.performance_spins: return self.performance_spins[key]
-        if key in self.path_entries: return self.path_entries[key]
-        if key in self.string_entries: return self.string_entries[key]
-        logging.warning(f"在_find_widget_for_setting中未找到key '{key}'对应的控件")
-        return None
 
     def _get_widget_value(self, widget, key):
         if isinstance(widget, Gtk.CheckButton) or isinstance(widget, Gtk.Switch):
@@ -5425,163 +5725,170 @@ class ConfigPanel(SimulatedWindow):
             rgba = widget.get_rgba()
             return f"{rgba.red:.2f}, {rgba.green:.2f}, {rgba.blue:.2f}, {rgba.alpha:.2f}"
         elif isinstance(widget, Gtk.Button):
-            label = widget.get_label()
-            if "请按下" in label:
-                return self.config.parser.get('Hotkeys', key, fallback="")
-            return label
+            if widget == self.capturing_hotkey_button:
+                attr_name = f"HOTKEY_{key.upper()}"
+                hotkey_def = getattr(self.config, attr_name, None)
+                return hotkey_def.to_string() if hotkey_def else ""
+            return widget.get_label()
         elif isinstance(widget, Gtk.Entry):
-            text = widget.get_text()
-            if text == self.DIR_PLACEHOLDER and widget.get_style_context().has_class("dir-not-set"):
-                return ""
-            return text
+            return widget.get_text()
         elif isinstance(widget, Gtk.ComboBoxText):
             return widget.get_active_id()
         elif isinstance(widget, Gtk.SpinButton):
-            if key in ('preview_drag_sensitivity'):
-                 return f"{widget.get_value():.1f}"
+            if widget.get_digits() == 0:
+                return str(widget.get_value_as_int())
             else:
-                 return str(widget.get_value_as_int())
+                return str(widget.get_value())
         elif isinstance(widget, Gtk.TextView):
             buffer = widget.get_buffer()
             start, end = buffer.get_bounds()
             return buffer.get_text(start, end, False)
-        logging.warning(f"在_get_widget_value中未处理控件类型: {type(widget)} for key '{key}'")
         return None
 
-    def _update_widget_value(self, widget, key, value):
-        if isinstance(widget, Gtk.Switch) or isinstance(widget, Gtk.CheckButton):
-            widget.set_active(value.lower() == 'true')
+    def _update_widget_value(self, widget, section, key, raw_str):
+        attr_name = f"HOTKEY_{key.upper()}" if section == 'Hotkeys' else key.upper()
+        typed_val = getattr(self.config, attr_name)
+        if isinstance(widget, (Gtk.Switch, Gtk.CheckButton)):
+            widget.set_active(typed_val)
         elif isinstance(widget, CustomColorButton):
-            if value and value.count(',') == 3:
-                try:
-                    r, g, b, a = [float(c.strip()) for c in value.split(',')]
-                    widget.set_rgba(Gdk.RGBA(r, g, b, a))
-                except ValueError:
-                    logging.warning(f"配置文件中的颜色值 '{value}' 包含非数字内容，无法解析")
-            elif value:
-                logging.warning(f"配置文件中的颜色值 '{value}' 格式错误，应为 'r, g, b, a'。跳过设置")
-        elif isinstance(widget, (Gtk.Entry, Gtk.Button)):
-            if key == 'save_directory':
-                if value and value.strip():
-                    widget.get_style_context().remove_class("dir-not-set")
-                    widget.set_text(str(Path(value).expanduser()))
-                else:
-                    widget.get_style_context().add_class("dir-not-set")
-                    widget.set_text(self.DIR_PLACEHOLDER)
+            widget.set_rgba(Gdk.RGBA(*typed_val))
+        elif isinstance(widget, Gtk.Button):
+            if section == 'Hotkeys':
+                widget.set_label(typed_val.to_string())
             else:
-                widget.set_label(value) if isinstance(widget, Gtk.Button) else widget.set_text(value)
+                widget.set_label(raw_str)
+        elif isinstance(widget, Gtk.Entry):
+            widget.set_text(raw_str)
         elif isinstance(widget, Gtk.ComboBoxText):
-            widget.set_active_id(value)
+            widget.set_active_id(raw_str)
         elif isinstance(widget, Gtk.SpinButton):
-            widget.set_value(float(value))
+            widget.set_value(typed_val)
         elif isinstance(widget, Gtk.TextView):
-            widget.get_buffer().set_text(value.lstrip())
-        else:
-            logging.warning(f"在_update_widget_value中未处理控件类型: {type(widget)} for key '{key}'")
+            widget.get_buffer().set_text(raw_str.lstrip())
 
     def _load_config_values(self):
-        """从config对象加载所有值并设置到UI控件"""
-        p = self.config.parser
-        sound_keys_to_skip = ['sound_theme', 'capture_sound', 'undo_sound', 'finalize_sound']
+        keys_to_skip = ['sound_theme'] + self.SOUND_KEYS
         for section, key in self.managed_settings:
-            if key in sound_keys_to_skip:
+            if key in keys_to_skip:
                 continue
-            widget = self._find_widget_for_setting(section, key)
+            widget = self.widget_map.get(key)
             if widget:
-                value = p.get(section, key, raw=True, fallback="")
-                self._update_widget_value(widget, key, value)
-        theme_widget = self.sound_entries['sound_theme']
-        theme_value = p.get('System', 'sound_theme', fallback="")
-        if theme_value:
-            theme_widget.set_active_id(theme_value)
+                raw_str = self.config.get_raw_string(section, key)
+                self._update_widget_value(widget, section, key, raw_str)
+        theme_widget = self.widget_map.get('sound_theme')
+        theme_widget.set_active_id(self.config.SOUND_THEME)
         self._on_sound_theme_changed(theme_widget)
-        for key in ['capture_sound', 'undo_sound', 'finalize_sound']:
-            widget = self.sound_entries[key]
-            value = p.get('System', key, fallback="")
+        for key in self.SOUND_KEYS:
+            widget = self.widget_map.get(key)
+            value = getattr(self.config, key.upper(), None)
             if value:
                 widget.set_active_id(value)
         self.grid_listbox.foreach(lambda child: self.grid_listbox.remove(child))
-        if p.has_section('ApplicationScrollUnits'):
-            for app, value_str in p.items('ApplicationScrollUnits'):
-                parts = [p.strip() for p in value_str.split(',')]
-                try:
-                    unit = int(parts[0])
-                    enabled = parts[1].lower() == 'true' if len(parts) > 1 else False
-                    self._add_grid_row(app, unit, enabled)
-                except (ValueError, IndexError):
-                    self._add_grid_row(app, 0, False)
+        scroll_units = self.config.get_section_items('ApplicationScrollUnits')
+        for app, value_str in scroll_units:
+            unit, enabled = self.config.parse_string_to_value('ApplicationScrollUnits', app, value_str)
+            self._add_grid_row(app, unit, enabled)
         self._update_filename_preview()
         self._on_format_changed(self.format_combo)
 
-    def _save_all_configs(self):
-        """将所有UI控件的值保存回config对象"""
-        p = self.config.parser
+    def _bind_all_widgets(self):
         for section, key in self.managed_settings:
-            widget = self._find_widget_for_setting(section, key)
-            if widget:
-                value = self._get_widget_value(widget, key)
-                if value is not None:
-                    p.set(section, key, value)
-        if p.has_section('ApplicationScrollUnits'):
-            p.remove_section('ApplicationScrollUnits')
-        p.add_section('ApplicationScrollUnits')
-        for row in self.grid_listbox.get_children():
-            hbox = row.get_child()
-            entry, spin, check = hbox.get_children()
-            app_class = entry.get_text().strip().lower()
-            if app_class:
-                unit = spin.get_value_as_int()
-                enabled = check.get_active()
-                value_to_save = f"{unit},{str(enabled).lower()}"
-                p.set('ApplicationScrollUnits', app_class, value_to_save)
-        save_dir_str = p.get('Output', 'save_directory', fallback='')
-        self.config.SAVE_DIRECTORY = Path(save_dir_str).expanduser() if save_dir_str.strip() else None
-        try:
-            with open(self.config.config_path, 'w') as configfile:
-                p.write(configfile)
-            logging.info(f"所有配置已成功保存到 {self.config.config_path}")
-        except Exception as e:
-            logging.error(f"写入配置文件失败: {e}")
-            send_desktop_notification("配置保存失败", f"无法写入配置文件: {e}\n更改可能未保存", "dialog-error", level="warning")
+            if section == 'Hotkeys': continue
+            widget = self.widget_map.get(key)
+            if not widget: continue
+            def on_change(w, *args, _s=section, _k=key):
+                self._on_setting_changed(w, _s, _k)
+                if isinstance(w, Gtk.Entry): return False
+            if isinstance(widget, (Gtk.Switch, Gtk.CheckButton)):
+                if isinstance(widget, Gtk.Switch): widget.connect("notify::active", on_change)
+                else: widget.connect("toggled", on_change)
+            elif isinstance(widget, Gtk.SpinButton):
+                widget.connect("value-changed", on_change)
+            elif isinstance(widget, Gtk.ComboBoxText):
+                widget.connect("changed", on_change)
+            elif isinstance(widget, CustomColorButton):
+                widget.connect("color-changed", on_change)
+            elif isinstance(widget, Gtk.Entry):
+                widget.connect("focus-out-event", on_change)
+                widget.connect("activate", on_change)
+                if key in ['filename_template', 'filename_timestamp_format']:
+                    widget.connect("changed", self._update_filename_preview)
+            elif isinstance(widget, Gtk.TextView):
+                widget.connect("focus-out-event", on_change)
+
+    def _on_setting_changed(self, widget, section, key):
+        new_value = self._get_widget_value(widget, key)
+        if new_value is not None:
+            current = self.config.get_raw_string(section, key)
+            if current != new_value:
+                self.config.set_value(section, key, new_value)
+
+    def _on_config_changed_signal(self, config_obj, section, key, value):
+        if self._is_batch_restoring:
+            return
+        if self.config.is_restart_required(key):
+            msg = f"已保存 '{key}' (需重启生效)"
+        else:
+            msg = f"已保存 '{key}' (已生效)"
+        self.status_label.set_text(msg)
+        if section == 'ApplicationScrollUnits':
+            target_app = key.lower()
+            if value is None:
+                return
+            unit, enabled = self.config.parse_string_to_value('ApplicationScrollUnits', key, value)
+            for row in self.grid_listbox.get_children():
+                hbox = row.get_child()
+                entry, spin, check = hbox.get_children()
+                if entry.get_text().strip().lower() == target_app:
+                    if spin.get_value_as_int() != unit:
+                        spin.set_value(unit)
+                    if check.get_active() != enabled:
+                        check.set_active(enabled)
+                    break
+            else:
+                self._add_grid_row(target_app, unit, enabled)
+
+    def update_status_focus(self, has_focus):
+        global hotkey_manager
+        disable_msg = "快捷键已自动禁用"
+        if has_focus:
+            if hotkey_manager and hotkey_manager.are_hotkeys_enabled:
+                self.status_label.set_text(disable_msg)
+        else:
+            if self.status_label.get_text() == disable_msg:
+                self.status_label.set_text("")
 
 class PreviewPanel(SimulatedWindow):
-    """显示截图预览的滚动窗口"""
-    ZOOM_FACTOR = 1.26  # 缩放系数
-    MIN_ZOOM = 0.25     # 最小缩放比例
-    MAX_ZOOM = 4.0      # 最大缩放比例
-    def __init__(self, model: StitchModel, config: Config, parent_overlay: 'CaptureOverlay'):
+    """显示长图预览的面板"""
+    def __init__(self, model: StitchModel, config_obj: Config, parent_overlay: 'CaptureOverlay'):
         super().__init__(parent_overlay, title="长图预览", css_class="simulated-window", resizable=True)
         self.model = model
-        self.config = config
-        self.zoom_level = 1.0
-        self.manual_zoom_active = False
+        self.config = config_obj
+        self.is_fit_width_mode = True
         self.effective_scale_factor = 1.0
         # 逻辑px
         self.drawing_area_width = 1
         self.drawing_area_height = 1
-        self.center_vertically = False
-        self.was_at_bottom = True
-        self.display_total_height = 0
-        self.last_viewport_width = -1
-        self.last_viewport_height = -1
-        self.is_dragging = False
-        self.drag_start_x = 0 # 窗口坐标
-        self.drag_start_y = 0 # 窗口坐标
-        self.drag_start_hadj_value = 0
-        self.drag_start_vadj_value = 0
+        self.stick_to_bottom = True
+        self._pending_center_ratios = None
+        self._is_autoscroll_pending = False
+        self.last_viewport_size = (-1, -1)
+        self._resize_timer_id = None
+        self.drag_start_pos = None # 窗口坐标
+        self.drag_start_scroll = None
         self.is_selection_mode = False
-        self.is_drawing_selection = False
-        self.is_resizing_selection = None
+        self.selection_action = None
+        self.current_pointer = (0, 0) # 窗口坐标
         # 缓冲区px
-        self.selection_absolute_start_y = None
-        self.selection_absolute_end_y = None
-        # 逻辑px
-        self.resize_handle_size = 10 # 边缘拖动手柄的像素容差
+        self.selection_anchor_y = None
+        self.selection_moving_y = None
         self.selection_autoscroll_timer = None
         self.selection_autoscroll_velocity = 0.0
-        self.AUTOSCROLL_SENSITIVITY = 1.0
-        self.AUTOSCROLL_INTERVAL = 50
+        # 逻辑px
         self.initial_y_offset = 0
+        self.last_scroll_y = 0
+        self.scroll_dy = 0
+        self.last_roi_set = set()
         top_button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         top_button_box.set_margin_top(0)
         top_button_box.set_margin_bottom(0)
@@ -5594,7 +5901,7 @@ class PreviewPanel(SimulatedWindow):
         self.btn_start_selection.connect("clicked", self._on_start_selection_mode)
         self.btn_cancel_selection = Gtk.Button(label="取消")
         self.btn_cancel_selection.set_tooltip_text("退出选择")
-        self.btn_cancel_selection.connect("clicked", self._on_cancel_selection_mode)
+        self.btn_cancel_selection.connect("clicked", lambda btn: self.cancel_selection_mode())
         self.btn_cancel_selection.set_sensitive(False)
         self.btn_delete_selection = Gtk.Button(label="删除")
         self.btn_delete_selection.set_tooltip_text("删除选定区域（修复内容重复）")
@@ -5605,10 +5912,10 @@ class PreviewPanel(SimulatedWindow):
         self.btn_restore_selection.connect("clicked", self._on_restore_clicked)
         self.btn_undo_mod = Gtk.Button.new_from_icon_name("edit-undo-symbolic", Gtk.IconSize.BUTTON)
         self.btn_undo_mod.set_tooltip_text("撤销上一步编辑 (删除/恢复)")
-        self.btn_undo_mod.connect("clicked", self._on_undo_mod_clicked)
+        self.btn_undo_mod.connect("clicked", lambda w: self.model.undo())
         self.btn_redo_mod = Gtk.Button.new_from_icon_name("edit-redo-symbolic", Gtk.IconSize.BUTTON)
         self.btn_redo_mod.set_tooltip_text("重做上一步编辑 (删除/恢复)")
-        self.btn_redo_mod.connect("clicked", self._on_redo_mod_clicked)
+        self.btn_redo_mod.connect("clicked", lambda w: self.model.redo())
         for btn in [self.btn_start_selection, self.btn_cancel_selection,
                     self.btn_delete_selection, self.btn_restore_selection,
                     self.btn_undo_mod, self.btn_redo_mod]:
@@ -5639,31 +5946,36 @@ class PreviewPanel(SimulatedWindow):
         self.add_content(button_hbox, expand=False, fill=False)
         self.btn_scroll_top = Gtk.Button.new_from_icon_name("go-top-symbolic", Gtk.IconSize.BUTTON)
         self.btn_scroll_top.set_tooltip_text("滚动到顶部")
-        self.btn_scroll_top.connect("clicked", self._scroll_to_top)
+        self.btn_scroll_top.connect("clicked", lambda w: self._scroll_vertical('top'))
         button_hbox.pack_start(self.btn_scroll_top, False, False, 0)
         self.btn_scroll_bottom = Gtk.Button.new_from_icon_name("go-bottom-symbolic", Gtk.IconSize.BUTTON)
         self.btn_scroll_bottom.set_tooltip_text("滚动到底部")
-        self.btn_scroll_bottom.connect("clicked", self._scroll_to_bottom)
+        self.btn_scroll_bottom.connect("clicked", lambda w: self._scroll_vertical('bottom'))
         button_hbox.pack_start(self.btn_scroll_bottom, False, False, 0)
         separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
         button_hbox.pack_start(separator, False, False, 5)
         self.btn_zoom_out = Gtk.Button.new_from_icon_name("zoom-out-symbolic", Gtk.IconSize.BUTTON)
         self.btn_zoom_out.set_tooltip_text("缩小")
-        self.btn_zoom_out.connect("clicked", self._zoom_out)
+        self.btn_zoom_out.connect("clicked", lambda w: self.adjust_zoom('out'))
         button_hbox.pack_start(self.btn_zoom_out, False, False, 0)
         self.btn_zoom_reset = Gtk.Button.new_from_icon_name("zoom-original-symbolic", Gtk.IconSize.BUTTON)
         self.btn_zoom_reset.set_tooltip_text("重置缩放 (100%)")
-        self.btn_zoom_reset.connect("clicked", self._reset_zoom)
+        self.btn_zoom_reset.connect("clicked", lambda w: self.adjust_zoom('reset'))
         button_hbox.pack_start(self.btn_zoom_reset, False, False, 0)
+        self.btn_zoom_fit = Gtk.Button.new_from_icon_name("zoom-fit-best-symbolic", Gtk.IconSize.BUTTON)
+        self.btn_zoom_fit.set_tooltip_text("自适应宽度")
+        self.btn_zoom_fit.connect("clicked", self._set_fit_width_mode)
+        button_hbox.pack_start(self.btn_zoom_fit, False, False, 0)
         self.btn_zoom_in = Gtk.Button.new_from_icon_name("zoom-in-symbolic", Gtk.IconSize.BUTTON)
         self.btn_zoom_in.set_tooltip_text("放大")
-        self.btn_zoom_in.connect("clicked", self._zoom_in)
+        self.btn_zoom_in.connect("clicked", lambda w: self.adjust_zoom('in'))
         button_hbox.pack_start(self.btn_zoom_in, False, False, 0)
         self.zoom_label = Gtk.Label(label="100%")
         self.zoom_label.set_margin_start(5)
         button_hbox.pack_start(self.zoom_label, False, False, 0)
-        self.model_update_handler_id = self.model.connect("model-updated", self.on_model_updated)
-        self.model_mod_handler_id = self.model.connect('modification-stack-changed', self._on_modification_stack_changed)
+        self.model.connect("model-updated", self.on_model_updated)
+        self.model.connect("image-ready", lambda m, f, p: self.drawing_area.queue_draw())
+        self.model.connect('modification-stack-changed', lambda m: self._update_button_sensitivity())
         v_adj = self.scrolled_window.get_vadjustment()
         if v_adj:
             v_adj.connect("value-changed", self.on_scroll_changed)
@@ -5674,65 +5986,25 @@ class PreviewPanel(SimulatedWindow):
         self.drawing_area.connect("button-release-event", self._on_drawing_area_button_release)
         self.drawing_area.connect("size-allocate", self._on_drawing_area_size_allocate)
         self.scrolled_window.connect("size-allocate", self.on_viewport_resized)
-        self._setup_cursors()
         self.on_model_updated(self.model)
         self._update_button_sensitivity()
         self.show_all()
         min_req_size, _ = self.get_preferred_size()
-        self.min_width_calculated = min_req_size.width
-        self._resize_limit_w = self.min_width_calculated
-        initial_w = self.min_width_calculated + 60
-        initial_h = 750
+        initial_w = min_req_size.width + 60
+        initial_h = self.config.PREVIEW_PANEL_HEIGHT
         self.set_size_request(initial_w, initial_h)
 
-    def cleanup(self):
-        if self.model and self.model_update_handler_id:
-            try:
-                self.model.disconnect(self.model_update_handler_id)
-                self.model_update_handler_id = None
-            except Exception as e:
-                logging.warning(f"{e}")
-        if self.model and self.model_mod_handler_id:
-            try:
-                self.model.disconnect(self.model_mod_handler_id)
-                self.model_mod_handler_id = None
-            except Exception as e:
-                logging.warning(f"{e}")
-        if self.selection_autoscroll_timer:
-            GLib.source_remove(self.selection_autoscroll_timer)
-            self.selection_autoscroll_timer = None
-
-    def _setup_cursors(self):
-        """获取并存储拖动所需的光标"""
-        display = Gdk.Display.get_default()
-        self.cursors = {
-            'default': None,
-            'grab': Gdk.Cursor.new_from_name(display, "grab"),
-            'grabbing': Gdk.Cursor.new_from_name(display, "grabbing"),
-            'crosshair': Gdk.Cursor.new_from_name(display, "crosshair"),
-            'n-resize': Gdk.Cursor.new_from_name(display, "n-resize"),
-            's-resize': Gdk.Cursor.new_from_name(display, "s-resize"),
-        }
-
-    def _on_key_press(self, widget, event):
-        """处理预览面板的按键事件"""
-        if not self.get_visible():
-            return False
-        keyval = event.keyval
-        state = event.state & self.config.GTK_MODIFIER_MASK
-        def is_match(hotkey_config):
-            return keyval in hotkey_config['gtk_keys'] and state == hotkey_config['gtk_mask']
-        if is_match(self.config.HOTKEY_PREVIEW_ZOOM_IN):
-            self._zoom_in()
-            return True
-        elif is_match(self.config.HOTKEY_PREVIEW_ZOOM_OUT):
-            self._zoom_out()
-            return True
-        return False
+    def hide(self):
+        self.drag_start_pos = None
+        self.drag_start_scroll = None
+        self.selection_action = None
+        self._stop_autoscroll()
+        if self.drawing_area.get_window():
+            self.drawing_area.get_window().set_cursor(self.cursors['default'])
+        super().hide()
 
     # 逻辑px {
     def _get_center_ratios(self, viewport_w=None, viewport_h=None):
-        """计算当前视口中心相对于内容的归一化坐标"""
         hadj = self.scrolled_window.get_hadjustment()
         vadj = self.scrolled_window.get_vadjustment()
         if viewport_w is None:
@@ -5752,7 +6024,6 @@ class PreviewPanel(SimulatedWindow):
         return center_x_ratio, center_y_ratio
 
     def _set_scroll_from_ratios(self, center_x_ratio, center_y_ratio):
-        """根据归一化中心坐标设置滚动位置"""
         hadj = self.scrolled_window.get_hadjustment()
         vadj = self.scrolled_window.get_vadjustment()
         viewport_w = self.scrolled_window.get_allocated_width()
@@ -5766,92 +6037,84 @@ class PreviewPanel(SimulatedWindow):
             new_v_value = (center_y_ratio * new_content_h) - (viewport_h / 2)
             vadj.set_value(new_v_value)
 
-    def _set_zoom_level_centered(self, new_zoom):
-        """设置缩放级别并保持视觉中心不变"""
-        if abs(new_zoom - self.zoom_level) < 1e-5:
+    def _update_zoom_label(self):
+        self.zoom_label.set_text(f"{self.effective_scale_factor * 100:.0f}%")
+        return False
+
+    def adjust_zoom(self, action):
+        if action == 'in':
+            new_zoom = min(self.effective_scale_factor * self.config.PREVIEW_ZOOM_FACTOR, self.config.PREVIEW_MAX_ZOOM)
+        elif action == 'out':
+            new_zoom = max(self.effective_scale_factor / self.config.PREVIEW_ZOOM_FACTOR, self.config.PREVIEW_MIN_ZOOM)
+        elif action == 'reset':
+            new_zoom = 1.0
+        else:
             return
-        center_x_ratio, center_y_ratio = self._get_center_ratios()
-        self.zoom_level = new_zoom
-        self.manual_zoom_active = True
+        if abs(new_zoom - self.effective_scale_factor) < 1e-5 and not self.is_fit_width_mode:
+            return
+        self._pending_center_ratios = self._get_center_ratios()
+        self.is_fit_width_mode = False
+        self.effective_scale_factor = new_zoom
         self._update_drawing_area_size()
         self._update_button_sensitivity()
         self._update_zoom_label()
-        def update_scroll():
-            self._set_scroll_from_ratios(center_x_ratio, center_y_ratio)
-            return False
-        GLib.idle_add(update_scroll)
 
-    def _zoom_in(self, button=None):
-        current_base_zoom = self.zoom_level if self.manual_zoom_active else self.effective_scale_factor
-        new_zoom = current_base_zoom * self.ZOOM_FACTOR
-        if new_zoom > self.MAX_ZOOM:
-            new_zoom = self.MAX_ZOOM
-        self._set_zoom_level_centered(new_zoom)
-
-    def _zoom_out(self, button=None):
-        current_base_zoom = self.zoom_level if self.manual_zoom_active else self.effective_scale_factor
-        new_zoom = current_base_zoom / self.ZOOM_FACTOR
-        if new_zoom < self.MIN_ZOOM:
-            new_zoom = self.MIN_ZOOM
-        self._set_zoom_level_centered(new_zoom)
-
-    def _reset_zoom(self, button=None):
-        if abs(self.effective_scale_factor - 1.0) > 1e-5 or not self.manual_zoom_active:
-            self._set_zoom_level_centered(1.0)
-
-    def _update_zoom_label(self):
-        self.zoom_label.set_text(f"{self.effective_scale_factor * 100:.0f}%")
-        return GLib.SOURCE_REMOVE
+    def _set_fit_width_mode(self, button=None):
+        if self.is_fit_width_mode:
+            return
+        self._pending_center_ratios = self._get_center_ratios()
+        self.is_fit_width_mode = True
+        self._update_drawing_area_size()
+        self._update_button_sensitivity()
+        self._update_zoom_label()
 
     def on_viewport_resized(self, widget, allocation):
-        if allocation.width != self.last_viewport_width or allocation.height != self.last_viewport_height:
-            old_w = self.last_viewport_width if self.last_viewport_width > 0 else allocation.width
-            old_h = self.last_viewport_height if self.last_viewport_height > 0 else allocation.height
-            center_x_ratio, center_y_ratio = self._get_center_ratios(viewport_w=old_w, viewport_h=old_h)
-            self.last_viewport_width = allocation.width
-            self.last_viewport_height = allocation.height
-            self._update_drawing_area_size(scroll_if_needed=False)
-            GLib.idle_add(self._set_scroll_from_ratios, center_x_ratio, center_y_ratio)
+        if (allocation.width, allocation.height) != self.last_viewport_size:
+            old_w = self.last_viewport_size[0] if self.last_viewport_size[0] > 0 else allocation.width
+            old_h = self.last_viewport_size[1] if self.last_viewport_size[1] > 0 else allocation.height
+            if self._pending_center_ratios is None:
+                self._pending_center_ratios = self._get_center_ratios(viewport_w=old_w, viewport_h=old_h)
+            self.last_viewport_size = (allocation.width, allocation.height)
+            if self._resize_timer_id is not None: return
+            def _do_update():
+                self._resize_timer_id = None
+                self._update_drawing_area_size()
+                return False
+            self._resize_timer_id = GLib.timeout_add(16, _do_update)
 
     def _on_drawing_area_size_allocate(self, widget, allocation):
         widget.queue_draw()
+        if self._pending_center_ratios or self.stick_to_bottom:
+            self._apply_pending_scroll()
 
     def on_model_updated(self, model_instance):
-        logging.debug("预览面板收到模型更新信号，准备更新尺寸并重绘")
         if self.model.capture_count == 0 and self.is_selection_mode:
-            logging.debug("预览面板：模型已空，自动退出选择模式")
-            self._on_cancel_selection_mode(None)
+            logging.debug("模型已空，预览面板自动退出选择模式")
+            self.cancel_selection_mode()
         v_adj = self.scrolled_window.get_vadjustment()
-        old_upper = v_adj.get_upper()
-        should_scroll_now = False
-        if old_upper > 0:
-            is_currently_at_bottom = v_adj.get_value() + v_adj.get_page_size() >= old_upper - 5
-            should_scroll_now = self.was_at_bottom
-        else:
-            self.was_at_bottom = True
-            should_scroll_now = True
-        self._update_drawing_area_size(scroll_if_needed=should_scroll_now)
+        if v_adj.get_upper() <= 0:
+            self.stick_to_bottom = True
+        self._update_drawing_area_size()
     # 逻辑px }
 
-    def _scroll_to_top(self, button):
+    def _scroll_vertical(self, target):
         v_adj = self.scrolled_window.get_vadjustment()
-        v_adj.set_value(v_adj.get_lower())
-
-    def _scroll_to_bottom(self, button):
-        v_adj = self.scrolled_window.get_vadjustment()
-        target_value = v_adj.get_upper() - v_adj.get_page_size()
-        v_adj.set_value(max(v_adj.get_lower(), target_value))
+        if not v_adj: return
+        if target == 'top':
+            v_adj.set_value(v_adj.get_lower())
+        elif target == 'bottom':
+            v_adj.set_value(max(v_adj.get_lower(), v_adj.get_upper() - v_adj.get_page_size()))
 
     def _get_selection_absolute_bounds(self):
-        if self.selection_absolute_start_y is None or self.selection_absolute_end_y is None:
-            return None, None
-        y1_model = min(self.selection_absolute_start_y, self.selection_absolute_end_y)
-        y2_model = max(self.selection_absolute_start_y, self.selection_absolute_end_y)
-        return y1_model, y2_model
+        if self.selection_anchor_y is None or self.selection_moving_y is None:
+            return None, None, False
+        y_start_abs = min(self.selection_anchor_y, self.selection_moving_y)
+        y_end_abs = max(self.selection_anchor_y, self.selection_moving_y)
+        is_valid = (y_end_abs - y_start_abs) > 0
+        return y_start_abs, y_end_abs, is_valid
 
     def _update_button_sensitivity(self, adjustment=None):
-        y1_abs, y2_abs = self._get_selection_absolute_bounds() # 缓冲区px
-        has_valid_selection = y1_abs is not None and y2_abs is not None and abs(y1_abs - y2_abs) > 1e-5
+        _, _, has_valid_selection = self._get_selection_absolute_bounds()
         has_captures = self.model.capture_count > 0
         self.btn_start_selection.set_sensitive(has_captures and (not self.is_selection_mode))
         self.btn_cancel_selection.set_sensitive(has_captures and self.is_selection_mode)
@@ -5863,87 +6126,75 @@ class PreviewPanel(SimulatedWindow):
         can_scroll = v_adj and (v_adj.get_upper() > v_adj.get_page_size() + 1)
         self.btn_scroll_top.set_sensitive(can_scroll)
         self.btn_scroll_bottom.set_sensitive(can_scroll)
-        self.btn_zoom_in.set_sensitive(self.zoom_level < self.MAX_ZOOM)
-        self.btn_zoom_out.set_sensitive(self.zoom_level > self.MIN_ZOOM)
-        self.btn_zoom_reset.set_sensitive(abs(self.effective_scale_factor - 1.0) > 1e-5)
+        self.btn_zoom_in.set_sensitive(self.effective_scale_factor < self.config.PREVIEW_MAX_ZOOM)
+        self.btn_zoom_out.set_sensitive(self.effective_scale_factor > self.config.PREVIEW_MIN_ZOOM)
+        self.btn_zoom_reset.set_sensitive(abs(self.effective_scale_factor - 1.0) > 1e-5 or self.is_fit_width_mode)
+        self.btn_zoom_fit.set_sensitive(not self.is_fit_width_mode)
 
-    def _update_drawing_area_size(self, scroll_if_needed=False):
+    def _update_drawing_area_size(self):
         """根据模型数据、缩放级别和视口大小计算绘制区域尺寸和缩放因子"""
-        monitor_scale = self.parent_overlay.scale
+        monitor_scale = self.parent_overlay.session.scale
         # 缓冲区px
         image_width = self.model.image_width
         virtual_height = self.model.total_virtual_height
+        viewport_width = self.scrolled_window.get_allocated_width()
+        viewport_height = self.scrolled_window.get_allocated_height()
+        if viewport_width <= 0:
+            viewport_width, viewport_height = self.get_default_size()
         if image_width <= 0 or virtual_height <= 0:
             # 逻辑px
-            viewport_width = self.scrolled_window.get_allocated_width()
-            viewport_height = self.scrolled_window.get_allocated_height()
-            if viewport_width <= 0:
-                 viewport_width, viewport_height = self.get_default_size()
             self.drawing_area_width = max(1, viewport_width)
             self.drawing_area_height = max(1, viewport_height)
-            if self.manual_zoom_active:
-                self.effective_scale_factor = self.zoom_level
-            else:
+            if self.is_fit_width_mode:
                 self.effective_scale_factor = 1.0
-            self.center_vertically = True
-            self.display_total_height = self.drawing_area_height
         else:
             # 缓冲区px -> 逻辑px
             logical_img_w = image_width / monitor_scale
             logical_img_h = virtual_height / monitor_scale
-            viewport_width = self.scrolled_window.get_allocated_width()
-            viewport_height = self.scrolled_window.get_allocated_height()
-            if viewport_width <= 0:
-                viewport_width, _ = self.get_default_size()
-            auto_scale_factor = 1.0
-            if logical_img_w > viewport_width and viewport_width > 0:
-                auto_scale_factor = viewport_width / logical_img_w
-            if self.manual_zoom_active:
-                self.effective_scale_factor = self.zoom_level
-            else:
-                self.effective_scale_factor = auto_scale_factor
+            if self.is_fit_width_mode:
+                self.effective_scale_factor = (viewport_width / logical_img_w) if (0 < viewport_width < logical_img_w) else 1.0
             self.drawing_area_width = math.ceil(logical_img_w * self.effective_scale_factor)
             self.drawing_area_height = math.ceil(logical_img_h * self.effective_scale_factor)
-            self.center_vertically = self.drawing_area_height < viewport_height
-            self.display_total_height = self.drawing_area_height
-        self.initial_y_offset = (viewport_height - self.drawing_area_height) / 2 if self.center_vertically else 0
-        self.initial_y_offset = max(0, self.initial_y_offset)
+        self.initial_y_offset = (viewport_height - self.drawing_area_height) // 2 if self.drawing_area_height < viewport_height else 0
         GLib.idle_add(self._update_zoom_label)
+        old_w, old_h = self.drawing_area.get_size_request()
+        size_changed = (old_w != self.drawing_area_width) or (old_h != self.drawing_area_height)
         self.drawing_area.set_size_request(self.drawing_area_width, self.drawing_area_height)
         self.drawing_area.queue_draw()
+        if self.stick_to_bottom or self._pending_center_ratios:
+            self._is_autoscroll_pending = True
+            if not size_changed:
+                GLib.idle_add(self._apply_pending_scroll)
         GLib.idle_add(self._update_button_sensitivity)
-        if scroll_if_needed and self.drawing_area_height > 0 and not self.is_dragging:
-            GLib.idle_add(self._scroll_to_bottom_if_needed)
 
-    def _scroll_to_bottom_if_needed(self):
-        """检查并滚动到 Adjustment 的底部"""
+    def _apply_pending_scroll(self):
         # 逻辑px
         v_adj = self.scrolled_window.get_vadjustment()
-        if not v_adj:
-             return GLib.SOURCE_REMOVE
-        new_upper = v_adj.get_upper()
-        page_size = v_adj.get_page_size()
-        if new_upper > page_size:
-             target_value = new_upper - page_size
-             current_value = v_adj.get_value()
-             if abs(current_value - target_value) > 1:
-                  v_adj.set_value(target_value)
-                  self.was_at_bottom = True
-        else:
-             self.was_at_bottom = True
-        return GLib.SOURCE_REMOVE
+        if not v_adj: return False
+        if self._pending_center_ratios:
+            self._set_scroll_from_ratios(*self._pending_center_ratios)
+        elif self.stick_to_bottom:
+            new_upper = v_adj.get_upper()
+            page_size = v_adj.get_page_size()
+            if new_upper > page_size:
+                v_adj.set_value(new_upper - page_size)
+        self._pending_center_ratios = None
+        self._is_autoscroll_pending = False
+        return False
 
     def on_scroll_changed(self, adjustment):
-        is_now_at_bottom = adjustment.get_value() + adjustment.get_page_size() >= adjustment.get_upper() - 5
-        if self.was_at_bottom and not is_now_at_bottom:
-             self.was_at_bottom = False
-        elif not self.was_at_bottom and is_now_at_bottom:
-             self.was_at_bottom = True
+        if self._is_autoscroll_pending:
+            return
+        if self.selection_action:
+            self._update_selection_from_pointer()
+        current_value = adjustment.get_value()
+        self.scroll_dy = current_value - self.last_scroll_y
+        self.last_scroll_y = current_value
+        self.stick_to_bottom = current_value + adjustment.get_page_size() >= adjustment.get_upper() - 5
 
     def _drawing_y_to_render_y(self, drawing_y):
-        if self.effective_scale_factor == 0: return 0
-        monitor_scale = self.parent_overlay.scale
-        return ((drawing_y - self.initial_y_offset) / self.effective_scale_factor) * monitor_scale # 缩放后的逻辑px -> 逻辑px -> 缓冲区px
+        monitor_scale = self.parent_overlay.session.scale
+        return ((drawing_y - self.initial_y_offset) / self.effective_scale_factor) * monitor_scale # 屏幕逻辑px -> 原逻辑px -> 缓冲区px
 
     def _absolute_y_to_render_y(self, absolute_y):
         # 缓冲区px
@@ -5951,30 +6202,18 @@ class PreviewPanel(SimulatedWindow):
             return absolute_y
         for piece in self.model.render_plan:
             if piece['absolute_y_start'] <= absolute_y < piece['absolute_y_end']:
-                offset = absolute_y - piece['absolute_y_start']
-                return piece['render_y_start'] + offset
-        for piece in self.model.render_plan:
-            if piece['absolute_y_start'] > absolute_y:
+                return piece['render_y_start'] + (absolute_y - piece['absolute_y_start'])
+            elif piece['absolute_y_start'] > absolute_y:
                 return piece['render_y_start']
-        if self.model.render_plan:
-            last = self.model.render_plan[-1]
-            return last['render_y_start'] + last['height']
-        return 0
+        last = self.model.render_plan[-1]
+        return last['render_y_start'] + last['height']
 
     def _render_y_to_absolute_y(self, render_y):
         # 缓冲区px
         if not self.model.render_plan:
             return render_y
         piece_render_y_starts = [p['render_y_start'] for p in self.model.render_plan]
-        index = bisect.bisect_right(piece_render_y_starts, render_y) - 1
-        index = max(0, index)
-        if index >= len(self.model.render_plan):
-            if self.model.render_plan:
-                last_piece = self.model.render_plan[-1]
-                offset = render_y - last_piece['render_y_start']
-                return last_piece['absolute_y_start'] + offset
-            else:
-                return render_y
+        index = max(0, bisect.bisect_right(piece_render_y_starts, render_y) - 1)
         piece = self.model.render_plan[index]
         if render_y >= piece['render_y_start'] + piece['height']:
             if index + 1 < len(self.model.render_plan):
@@ -5982,110 +6221,99 @@ class PreviewPanel(SimulatedWindow):
                 return next_piece['absolute_y_start']
             else:
                 return piece['absolute_y_end']
-        offset_in_render_piece = render_y - piece['render_y_start']
-        absolute_y = piece['absolute_y_start'] + offset_in_render_piece
-        return absolute_y
+        return piece['absolute_y_start'] + render_y - piece['render_y_start']
+
+    def _update_selection_from_pointer(self):
+        if not self.selection_action:
+            return
+        vadj = self.scrolled_window.get_vadjustment()
+        res = self.scrolled_window.translate_coordinates(self.parent_overlay, 0, 0)
+        if not res or not vadj: return
+        # 逻辑px
+        viewport_top = res[1]
+        draw_y = vadj.get_value() + self.current_pointer[1] - viewport_top
+        min_y = self.initial_y_offset
+        max_y = self.initial_y_offset + self.drawing_area_height
+        clamped_drawing_y = max(min_y, min(draw_y, max_y))
+        # 缓冲区px
+        render_plan_y = self._drawing_y_to_render_y(clamped_drawing_y)
+        self.selection_moving_y = round(self._render_y_to_absolute_y(render_plan_y))
+        GLib.idle_add(self.drawing_area.queue_draw)
 
     def _get_hovered_resize_handle(self, y):
         # 缓冲区px
-        render_plan_y_at_mouse = self._drawing_y_to_render_y(y)
-        if self.is_drawing_selection or self.effective_scale_factor == 0:
+        if self.selection_action:
             return None
-        monitor_scale = self.parent_overlay.scale
-        y_top_orig, y_bottom_orig = self._get_selection_absolute_bounds()
-        if y_top_orig is None:
+        y_top_abs, y_bottom_abs, is_valid = self._get_selection_absolute_bounds()
+        if not is_valid:
             return None
-        y_top_render = self._absolute_y_to_render_y(y_top_orig)
-        y_bottom_render = self._absolute_y_to_render_y(y_bottom_orig)
-        handle_size_render_space = (self.resize_handle_size * monitor_scale) / self.effective_scale_factor # 缩放后的逻辑px -> 逻辑px -> 缓冲区px
-        if abs(render_plan_y_at_mouse - y_top_render) < handle_size_render_space:
-            return 'top'
-        if abs(render_plan_y_at_mouse - y_bottom_render) < handle_size_render_space:
-            return 'bottom'
+        y_top_render = self._absolute_y_to_render_y(y_top_abs)
+        y_bottom_render = self._absolute_y_to_render_y(y_bottom_abs)
+        monitor_scale = self.parent_overlay.session.scale
+        handle_size_render = (self.config.PREVIEW_RESIZE_HANDLE_SIZE / self.effective_scale_factor) * monitor_scale # 屏幕逻辑px -> 原逻辑px -> 缓冲区px
+        render_y_at_mouse = self._drawing_y_to_render_y(y)
+        dist_top = abs(render_y_at_mouse - y_top_render)
+        dist_bottom = abs(render_y_at_mouse - y_bottom_render)
+        if dist_top < handle_size_render or dist_bottom < handle_size_render:
+            return 'top' if dist_top < dist_bottom else 'bottom'
         return None
 
     def _on_start_selection_mode(self, button):
         if self.is_selection_mode:
             return
         self.is_selection_mode = True
-        if self.is_dragging:
-            self.is_dragging = False
-            self.drawing_area.get_window().set_cursor(self.cursors['default'])
+        if self.drag_start_pos is not None:
+            self.drag_start_pos = None
+            self.drag_start_scroll = None
         self.drawing_area.get_window().set_cursor(self.cursors['crosshair'])
         self._update_button_sensitivity()
         self.drawing_area.queue_draw()
 
-    def _on_cancel_selection_mode(self, button):
+    def cancel_selection_mode(self):
         if not self.is_selection_mode:
             return
         self.is_selection_mode = False
-        self.selection_absolute_start_y = None
-        self.selection_absolute_end_y = None
-        self.is_drawing_selection = False
-        self.is_resizing_selection = None
-        if self.selection_autoscroll_timer:
-            GLib.source_remove(self.selection_autoscroll_timer)
-            self.selection_autoscroll_timer = None
-        self.selection_autoscroll_velocity = 0.0
+        self.selection_anchor_y = None
+        self.selection_moving_y = None
+        self.selection_action = None
+        self._stop_autoscroll()
         self.drawing_area.get_window().set_cursor(self.cursors['default'])
         self._update_button_sensitivity()
         self.drawing_area.queue_draw()
 
     def _on_delete_clicked(self, button):
-        """处理删除按钮点击事件"""
         # 缓冲区px
-        y1_abs, y2_abs = self._get_selection_absolute_bounds()
-        if y1_abs is None or y2_abs is None or abs(y1_abs - y2_abs) < 1e-5:
-            logging.warning("_on_delete_clicked: 选区无效，不执行任何操作")
+        y_start_abs, y_end_abs, is_valid = self._get_selection_absolute_bounds()
+        if not is_valid:
+            logging.warning("删除操作已取消：当前选区无效")
             return
-        mod = {
-            'type': 'delete',
-            'y_start_abs': min(y1_abs, y2_abs),
-            'y_end_abs': max(y1_abs, y2_abs)
-        }
+        mod = {'type': 'delete', 'y_start_abs': y_start_abs, 'y_end_abs': y_end_abs}
         if self.model.modifications and self.model.modifications[-1] == mod:
-            logging.debug("StitchModel: 跳过添加重复的 'delete' 修改")
+            logging.debug("'delete' 修改重复，跳过添加")
             return
         self.model.add_modification(mod)
         self.drawing_area.queue_draw()
 
     def _on_restore_clicked(self, button):
         # 缓冲区px
-        """处理恢复按钮点击事件"""
-        y1_abs, y2_abs = self._get_selection_absolute_bounds()
-        if y1_abs is None or y2_abs is None or abs(y1_abs - y2_abs) < 1e-5:
-            logging.warning("_on_restore_clicked: 选区无效，不执行任何操作")
+        sel_start_abs, sel_end_abs, is_valid = self._get_selection_absolute_bounds()
+        if not is_valid:
+            logging.warning("恢复操作已取消：当前选区无效")
             return
-        selection_start_abs = min(y1_abs, y2_abs)
-        selection_end_abs = max(y1_abs, y2_abs)
         mods_added = 0
         restored_seams_indices = {mod['seam_index'] for mod in self.model.modifications if mod['type'] == 'restore'}
-        for i, abs_piece in enumerate(self.model.absolute_plan[:-1]):
-            original_overlap = abs_piece['overlap_with_next']
-            if original_overlap == 0:
-                continue
-            next_piece = self.model.absolute_plan[i+1]
-            seam_start_abs = next_piece['absolute_y_start']
-            seam_end_abs = next_piece['absolute_y_start'] + original_overlap
-            if (seam_start_abs >= selection_start_abs) and (seam_start_abs < selection_end_abs):
+        for i, entry in enumerate(self.model.entries[:-1]):
+            next_entry = self.model.entries[i+1]
+            seam_abs_y = next_entry['absolute_y_start']
+            if sel_start_abs <= seam_abs_y < sel_end_abs:
                 if i in restored_seams_indices:
-                    logging.debug(f"接缝 {i} (a-y {seam_start_abs:.0f}) 已被恢复，跳过重复添加。")
+                    logging.debug(f"接缝 {i} 已被恢复，跳过")
                     continue
-                seam_deleted = False
-                for mod in self.model.modifications:
-                    if mod['type'] == 'delete':
-                        if mod['y_start_abs'] <= seam_start_abs and mod['y_end_abs'] > seam_start_abs:
-                            seam_deleted = True
-                            break
-                if seam_deleted:
-                    logging.debug(f"接缝 {i} (a-y {seam_start_abs:.0f}) 在选区内，但已被删除，跳过恢复。")
+                if any(del_start <= seam_abs_y < del_end for del_start, del_end in self.model.merged_del_regions):
+                    logging.debug(f"接缝 {i} 位于已删除区域内，跳过恢复操作")
                     continue
-                logging.debug(f"选区 ({selection_start_abs:.0f}, {selection_end_abs:.0f}) 触碰了接缝 {i} (a-y {seam_start_abs:.0f})。添加恢复修改。")
-                mod = {
-                    'type': 'restore',
-                    'seam_index': i,
-                    'original_overlap': original_overlap
-                }
+                logging.debug(f"选区跨越接缝 {i} (abs_y: {seam_abs_y})，添加恢复修改")
+                mod = {'type': 'restore', 'seam_index': i}
                 self.model.add_modification(mod)
                 mods_added += 1
         if mods_added > 0:
@@ -6093,187 +6321,208 @@ class PreviewPanel(SimulatedWindow):
         else:
             logging.debug("选区内未发现可恢复的接缝")
 
-    def _on_undo_mod_clicked(self, button):
-        self.model.undo()
-
-    def _on_redo_mod_clicked(self, button):
-        self.model.redo()
-
-    def _on_modification_stack_changed(self, model):
-        self._update_button_sensitivity()
+    def _get_color(self, name):
+        context = self.drawing_area.get_style_context()
+        success, color = context.lookup_color(name)
+        if success:
+            return (color.red, color.green, color.blue, color.alpha)
+        default_str = self.config.get_default_css_color('preview_panel', name, "#000000")
+        parsed = Gdk.RGBA()
+        if parsed.parse(default_str):
+            return (parsed.red, parsed.green, parsed.blue, parsed.alpha)
+        return (0.0, 0.0, 0.0, 1.0)
 
     def on_draw(self, widget, cr):
-         """绘制 DrawingArea 的内容"""
-         # 逻辑px
-         widget_width = widget.get_allocated_width()
-         widget_height = widget.get_allocated_height()
-         cr.set_source_rgb(0.1, 0.1, 0.1)
-         cr.paint()
-         if not self.model.render_plan:
-             cr.set_source_rgb(0.8, 0.8, 0.8)
-             layout = PangoCairo.create_layout(cr)
-             font_desc = Pango.FontDescription("Sans 24")
-             layout.set_font_description(font_desc)
-             layout.set_text("暂无截图", -1)
-             text_width, text_height = layout.get_pixel_size()
-             x = (widget_width - text_width) / 2
-             y = (widget_height - text_height) / 2
-             cr.move_to(x, y)
-             PangoCairo.show_layout(cr, layout)
-             return
-         monitor_scale = self.parent_overlay.scale
-         zoom_level = self.effective_scale_factor
-         draw_area_w = self.drawing_area_width
-         draw_area_h = self.drawing_area_height
-         draw_x_offset = (widget_width - draw_area_w) / 2 if widget_width > draw_area_w else 0
-         draw_y_offset = (widget_height - draw_area_h) / 2 if self.center_vertically else 0
-         draw_y_offset = max(0, draw_y_offset)
-         cr.translate(draw_x_offset, draw_y_offset)
-         final_scale = zoom_level / monitor_scale
-         cr.scale(final_scale, final_scale) # 缓冲区px -> 逻辑px -> 缩放后的逻辑px
-         # 缓冲区px
-         clip_x1, visible_y1_widget, clip_x2, visible_y2_widget = cr.clip_extents()
-         visible_y1_model, visible_y2_model = cr.clip_extents()[1::2]
-         model_y_positions = [p['render_y_start'] for p in self.model.render_plan]
-         first_index = max(0, bisect.bisect_right(model_y_positions, visible_y1_model) - 1)
-         drawn_count = 0
-         for i in range(first_index, len(self.model.render_plan)):
-             piece = self.model.render_plan[i]
-             filepath = piece.get('filepath')
-             src_y = piece.get('src_y', 0)
-             src_height = piece.get('height', 0)
-             dest_y = model_y_positions[i]
-             dest_h = src_height
-             if dest_y >= visible_y2_model:
-                 break
-             if dest_y + dest_h <= visible_y1_model:
-                 continue
-             pixbuf = self.model._get_cached_pixbuf(filepath)
-             if not pixbuf:
-                 logging.error(f"无法为 {Path(filepath).name} 获取 Pixbuf")
-                 continue
-             original_width = pixbuf.get_width()
-             try:
-                 cr.save()
-                 cr.translate(0, dest_y)
-                 Gdk.cairo_set_source_pixbuf(cr, pixbuf, 0, -src_y)
-                 cr.rectangle(0, 0, original_width, src_height)
-                 cr.clip()
-                 cr.paint()
-                 cr.restore()
-                 drawn_count += 1
-             except Exception as e:
-                 logging.error(f"绘制 Pixbuf {Path(filepath).name} (src_y={src_y}) 时出错: {e}")
-                 try: cr.restore()
-                 except cairo.Error: pass
-         # 如果在选择模式下，绘制蒙版和选框
-         current_scale = final_scale
-         if self.is_selection_mode:
-             cr.set_source_rgba(0.1, 0.1, 0.1, 0.6)
-             total_draw_y_start = 0
-             total_draw_height = self.model.total_virtual_height
-             total_draw_x_start = 0
-             total_draw_width = self.model.image_width
-             sel_y1_orig, sel_y2_orig = self._get_selection_absolute_bounds()
-             if sel_y1_orig is None:
-                  cr.rectangle(total_draw_x_start, total_draw_y_start, total_draw_width, total_draw_height)
-                  cr.fill()
-             else:
-                 sel_y1_render = self._absolute_y_to_render_y(sel_y1_orig)
-                 sel_y2_render = self._absolute_y_to_render_y(sel_y2_orig)
-                 sel_h_render = abs(sel_y2_render - sel_y1_render)
-                 height_above = max(0, min(sel_y1_render, sel_y2_render) - total_draw_y_start)
-                 if height_above > 0.1:
-                     cr.rectangle(total_draw_x_start, total_draw_y_start, total_draw_width, height_above)
-                     cr.fill()
-                 height_below = max(0, (total_draw_y_start + total_draw_height) - max(sel_y1_render, sel_y2_render))
-                 if height_below > 0.1:
-                     cr.rectangle(total_draw_x_start, max(sel_y1_render, sel_y2_render), total_draw_width, height_below)
-                     cr.fill()
-                 if sel_h_render > 0.1:
-                     cr.set_line_width(2.0 / current_scale) # 缩放后的逻辑px -> 逻辑px -> 缓冲区px
-                     if self.is_drawing_selection:
-                         cr.set_source_rgba(1.0, 1.0, 1.0, 0.9)
-                         cr.set_dash([6.0 / current_scale, 4.0 / current_scale])
-                     else:
-                         cr.set_source_rgba(0.9, 0.9, 0.9, 0.8)
-                         cr.set_dash([])
-                     cr.rectangle(total_draw_x_start, min(sel_y1_render, sel_y2_render), total_draw_width, sel_h_render)
-                     cr.stroke()
-                     cr.set_dash([])
-                 elif sel_h_render < 0.1 and not self.is_drawing_selection and not self.is_resizing_selection:
-                     cr.set_line_width(3.0 / current_scale)
-                     cr.set_source_rgba(1.0, 0.1, 0.1, 0.7)
-                     cr.set_dash([8.0 / current_scale, 6.0 / current_scale])
-                     seam_y_render = sel_y1_render
-                     cr.move_to(total_draw_x_start, seam_y_render)
-                     cr.line_to(total_draw_x_start + total_draw_width, seam_y_render)
-                     cr.stroke()
-                     cr.set_dash([])
-                 selection_start_abs = min(sel_y1_orig, sel_y2_orig)
-                 selection_end_abs = max(sel_y1_orig, sel_y2_orig)
-                 delete_regions = [
-                     (mod['y_start_abs'], mod['y_end_abs']) 
-                     for mod in self.model.modifications 
-                     if mod['type'] == 'delete'
-                 ]
-                 restored_seam_indices = {
-                     mod['seam_index'] 
-                     for mod in self.model.modifications 
-                     if mod['type'] == 'restore'
-                 }
-                 cr.set_line_width(3.0 / current_scale)
-                 cr.set_dash([8.0 / current_scale, 6.0 / current_scale])
-                 total_draw_width = self.model.image_width
-                 total_draw_x_start = 0
-                 for i, abs_piece in enumerate(self.model.absolute_plan[:-1]):
-                     seam_start_abs = self.model.absolute_plan[i+1]['absolute_y_start']
-                     if (seam_start_abs >= selection_start_abs) and (seam_start_abs < selection_end_abs):
-                         is_deleted = False
-                         for del_start, del_end in delete_regions:
-                             if del_start <= seam_start_abs < del_end:
-                                 is_deleted = True
-                                 break
-                         if is_deleted:
-                             continue
-                         original_overlap = abs_piece['overlap_with_next']
-                         is_restored = (i in restored_seam_indices)
-                         is_originally_seamless = (original_overlap <= 1e-5)
-                         if is_originally_seamless or is_restored:
-                             cr.set_source_rgba(0.7, 0.3, 0.8, 0.8) 
-                         else:
-                             cr.set_source_rgba(0.2, 0.5, 1.0, 0.8)
-                         seam_y_render = self._absolute_y_to_render_y(seam_start_abs)
-                         cr.move_to(total_draw_x_start, seam_y_render)
-                         cr.line_to(total_draw_x_start + total_draw_width, seam_y_render)
-                         cr.stroke()
-                 cr.set_dash([])
+        # 逻辑px
+        widget_width = widget.get_allocated_width()
+        widget_height = widget.get_allocated_height()
+        bg_color = self._get_color('preview_bg')
+        cr.set_source_rgba(*bg_color)
+        cr.paint()
+        if not self.model.render_plan:
+            text_color = self._get_color('preview_text')
+            cr.set_source_rgba(*text_color)
+            layout = PangoCairo.create_layout(cr)
+            layout.set_font_description(Pango.FontDescription("Sans 24"))
+            layout.set_text("暂无截图", -1)
+            text_width, text_height = layout.get_pixel_size()
+            x = (widget_width - text_width) // 2
+            y = (widget_height - text_height) // 2
+            cr.move_to(x, y)
+            PangoCairo.show_layout(cr, layout)
+            return
+        monitor_scale = self.parent_overlay.session.scale
+        draw_area_w = self.drawing_area_width
+        draw_area_h = self.drawing_area_height
+        draw_x_offset = (widget_width - draw_area_w) // 2 if widget_width > draw_area_w else 0
+        cr.translate(draw_x_offset, self.initial_y_offset)
+        final_scale = self.effective_scale_factor / monitor_scale
+        cr.scale(final_scale, final_scale) # 缓冲区px -> 原逻辑px -> 屏幕逻辑px
+        # 缓冲区px
+        clip_x1, visible_y1_widget, clip_x2, visible_y2_widget = cr.clip_extents()
+        visible_y1_model, visible_y2_model = cr.clip_extents()[1::2]
+        model_y_positions = [p['render_y_start'] for p in self.model.render_plan]
+        first_index = max(0, bisect.bisect_right(model_y_positions, visible_y1_model) - 1)
+        current_roi_set = set()
+        preload_count = max(2, self.config.PREVIEW_CACHE_SIZE // 5)
+        current_loop_index = first_index
+        while current_loop_index < len(self.model.render_plan):
+            piece = self.model.render_plan[current_loop_index]
+            dest_y = piece['render_y_start']
+            if dest_y >= visible_y2_model:
+                break
+            current_roi_set.add(piece['filepath'])
+            current_loop_index += 1
+        preload_indices = []
+        if self.scroll_dy > 0:
+            start_preload = current_loop_index
+            preload_indices.extend(range(start_preload, min(len(self.model.render_plan), start_preload + preload_count)))
+        elif self.scroll_dy < 0:
+            end_preload = first_index
+            preload_indices.extend(range(max(0, end_preload - preload_count), end_preload))
+        else:
+            half = max(1, preload_count // 2)
+            preload_indices.extend(range(max(0, first_index - half), first_index))
+            preload_indices.extend(range(current_loop_index, min(len(self.model.render_plan), current_loop_index + half)))
+        for idx in preload_indices:
+            current_roi_set.add(self.model.render_plan[idx]['filepath'])
+        if current_roi_set != self.last_roi_set:
+            self.model.update_roi(current_roi_set)
+            self.last_roi_set = current_roi_set
+        for i in range(first_index, len(self.model.render_plan)):
+            piece = self.model.render_plan[i]
+            filepath = piece.get('filepath')
+            entry_index = piece.get('entry_index')
+            src_y = piece.get('src_y', 0)
+            src_height = piece.get('height', 0)
+            dest_y = model_y_positions[i]
+            dest_h = src_height
+            if dest_y >= visible_y2_model:
+                break
+            if dest_y + dest_h <= visible_y1_model:
+                continue
+            bundle = self.model.request_image(filepath)
+            if not bundle:
+                entry = self.model.entries[entry_index] if 0 <= entry_index < len(self.model.entries) else None
+                thumb_bundle = entry.get('thumb') if entry else None
+                if thumb_bundle:
+                    thumb_surface, _ = thumb_bundle
+                    cr.save()
+                    cr.set_antialias(cairo.ANTIALIAS_NONE)
+                    cr.translate(0, dest_y)
+                    orig_h = entry['height']
+                    thumb_h = thumb_surface.get_height()
+                    thumb_w = thumb_surface.get_width()
+                    scale_y = orig_h / thumb_h if thumb_h > 0 else 1
+                    scale_x = self.model.image_width / thumb_w if thumb_w > 0 else 1
+                    cr.scale(scale_x, scale_y)
+                    t_src_y = src_y / scale_y
+                    cr.set_source_surface(thumb_surface, 0, -t_src_y)
+                    cr.get_source().set_extend(cairo.EXTEND_PAD)
+                    cr.rectangle(0, 0, thumb_w, src_height / scale_y)
+                    cr.fill()
+                    cr.restore()
+                continue
+            surface, _ = bundle
+            original_width = surface.get_width()
+            cr.save()
+            try:
+                cr.translate(0, dest_y)
+                cr.set_source_surface(surface, 0, -src_y)
+                cr.get_source().set_extend(cairo.EXTEND_PAD)
+                cr.rectangle(0, 0, original_width, src_height + 1.0 / final_scale)
+                cr.fill()
+            except Exception as e:
+                logging.error(f"绘制 surface {Path(filepath).name} 时出错: {e}")
+            finally:
+                cr.restore()
+        # 如果在选择模式下，绘制蒙版和选框
+        current_scale = final_scale
+        if self.is_selection_mode:
+            mask_color = self._get_color('preview_mask')
+            cr.set_source_rgba(*mask_color)
+            total_draw_y_start = 0
+            total_draw_height = self.model.total_virtual_height
+            total_draw_x_start = 0
+            total_draw_width = self.model.image_width
+            sel_start_abs, sel_end_abs, is_valid = self._get_selection_absolute_bounds()
+            if not is_valid:
+                cr.rectangle(total_draw_x_start, total_draw_y_start, total_draw_width, total_draw_height)
+                cr.fill()
+            else:
+                sel_start_render = self._absolute_y_to_render_y(sel_start_abs)
+                sel_end_render = self._absolute_y_to_render_y(sel_end_abs)
+                height_above = max(0, sel_start_render - total_draw_y_start)
+                if height_above >= 1:
+                    cr.rectangle(total_draw_x_start, total_draw_y_start, total_draw_width, height_above)
+                    cr.fill()
+                height_below = max(0, (total_draw_y_start + total_draw_height) - sel_end_render)
+                if height_below >= 1:
+                    cr.rectangle(total_draw_x_start, sel_end_render, total_draw_width, height_below)
+                    cr.fill()
+                sel_h_render = abs(sel_end_render - sel_start_render)
+                if sel_h_render >= 1:
+                    cr.set_line_width(2.0 / current_scale)
+                    if self.selection_action == 'draw':
+                        drawing_border_color = self._get_color('preview_drawing_border')
+                        cr.set_source_rgba(*drawing_border_color)
+                        cr.set_dash([6.0 / current_scale, 4.0 / current_scale])
+                    else:
+                        static_border_color = self._get_color('preview_static_border')
+                        cr.set_source_rgba(*static_border_color)
+                        cr.set_dash([])
+                    cr.rectangle(total_draw_x_start, sel_start_render, total_draw_width, sel_h_render)
+                    cr.stroke()
+                    cr.set_dash([])
+                elif sel_h_render < 1 and not self.selection_action:
+                    cr.set_line_width(3.0 / current_scale)
+                    del_line_color = self._get_color('preview_delete_line')
+                    cr.set_source_rgba(*del_line_color)
+                    cr.set_dash([8.0 / current_scale, 6.0 / current_scale])
+                    seam_y_render = sel_start_render
+                    cr.move_to(total_draw_x_start, seam_y_render)
+                    cr.line_to(total_draw_x_start + total_draw_width, seam_y_render)
+                    cr.stroke()
+                    cr.set_dash([])
+                restored_seam_indices = {mod['seam_index'] for mod in self.model.modifications if mod['type'] == 'restore'}
+                cr.set_line_width(3.0 / current_scale)
+                cr.set_dash([8.0 / current_scale, 6.0 / current_scale])
+                unmatched_color = self._get_color('preview_unmatched_seam')
+                matched_color = self._get_color('preview_matched_seam')
+                for i, entry in enumerate(self.model.entries[:-1]):
+                    next_entry = self.model.entries[i+1]
+                    seam_start_abs = next_entry['absolute_y_start']
+                    if sel_start_abs <= seam_start_abs < sel_end_abs:
+                        if any(del_start <= seam_start_abs < del_end for del_start, del_end in self.model.merged_del_regions):
+                            continue
+                        has_cropping = (entry['crop_bottom'] < entry['height']) or (next_entry['crop_top'] > 0)
+                        if (not has_cropping) or (i in restored_seam_indices):
+                            cr.set_source_rgba(*unmatched_color)
+                        else:
+                            cr.set_source_rgba(*matched_color)
+                        seam_y_render = self._absolute_y_to_render_y(seam_start_abs)
+                        cr.move_to(total_draw_x_start, seam_y_render)
+                        cr.line_to(total_draw_x_start + total_draw_width, seam_y_render)
+                        cr.stroke()
+                cr.set_dash([])
 
     def _on_drawing_area_button_press(self, widget, event):
         if event.button == 1:
             if self.is_selection_mode:
                 # 缓冲区px
                 render_plan_y = self._drawing_y_to_render_y(event.y)
-                absolute_model_y = self._render_y_to_absolute_y(render_plan_y)
+                absolute_model_y = round(self._render_y_to_absolute_y(render_plan_y))
                 handle = self._get_hovered_resize_handle(event.y)
                 if handle:
-                    self.is_resizing_selection = handle
-                    self.is_drawing_selection = False
-                    y1_abs, y2_abs = self._get_selection_absolute_bounds()
-                    if handle == 'top':
-                        self.selection_absolute_start_y = absolute_model_y
-                        self.selection_absolute_end_y = y2_abs
-                    else:
-                        self.selection_absolute_start_y = y1_abs
-                        self.selection_absolute_end_y = absolute_model_y
-                    cursor_name = 'n-resize' if handle == 'top' else 's-resize'
-                    self.drawing_area.get_window().set_cursor(self.cursors[cursor_name])
-                    logging.debug(f"开始调整选区手柄: {handle}")
+                    self.selection_action = 'resize'
+                    y_top_abs, y_bottom_abs, _ = self._get_selection_absolute_bounds()
+                    self.selection_moving_y = absolute_model_y
+                    self.selection_anchor_y = y_bottom_abs if handle == 'top' else y_top_abs
+                    self.drawing_area.get_window().set_cursor(self.cursors['ns-resize'])
                 else:
-                    self.is_drawing_selection = True
-                    self.is_resizing_selection = None
-                    self.selection_absolute_start_y = absolute_model_y
-                    self.selection_absolute_end_y = absolute_model_y
+                    self.selection_action = 'draw'
+                    self.selection_anchor_y = absolute_model_y
+                    self.selection_moving_y = absolute_model_y
                     self.drawing_area.get_window().set_cursor(self.cursors['grabbing'])
                     self.drawing_area.queue_draw()
                 return True
@@ -6283,272 +6532,217 @@ class PreviewPanel(SimulatedWindow):
             can_scroll_h = hadj and hadj.get_upper() > hadj.get_page_size()
             can_scroll_v = vadj and vadj.get_upper() > vadj.get_page_size()
             if can_scroll_h or can_scroll_v:
-                self.is_dragging = True
-                win_x, win_y = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
-                self.drag_start_x = win_x
-                self.drag_start_y = win_y
-                self.drag_start_hadj_value = hadj.get_value() if hadj else 0
-                self.drag_start_vadj_value = vadj.get_value() if vadj else 0
+                self.drag_start_pos = self.parent_overlay.controller.scroll_manager.get_pointer_position(target=CoordSys.WINDOW)
+                self.drag_start_scroll = (hadj.get_value() if hadj else 0, vadj.get_value() if vadj else 0)
                 self.drawing_area.get_window().set_cursor(self.cursors['grab'])
                 return True
         return False
 
-    def _check_and_trigger_autoscroll(self, event):
+    def _stop_autoscroll(self):
+        if self.selection_autoscroll_timer is not None:
+            GLib.source_remove(self.selection_autoscroll_timer)
+            self.selection_autoscroll_timer = None
+        self.selection_autoscroll_velocity = 0.0
+
+    def _check_and_trigger_autoscroll(self):
         # 逻辑px
-        if not (self.is_drawing_selection or self.is_resizing_selection):
-            if self.selection_autoscroll_timer:
-                GLib.source_remove(self.selection_autoscroll_timer)
-                self.selection_autoscroll_timer = None
-            self.selection_autoscroll_velocity = 0.0
+        if not self.selection_action:
+            self._stop_autoscroll()
             return
         vadj = self.scrolled_window.get_vadjustment()
-        if not vadj:
-            return
-        viewport_y = vadj.get_value()
-        viewport_h = vadj.get_page_size()
-        viewport_bottom = viewport_y + viewport_h
-        mouse_y_in_drawing_area = event.y 
+        if not vadj: return
+        res = self.scrolled_window.translate_coordinates(self.parent_overlay, 0, 0)
+        viewport_top = res[1] if res else 0
+        viewport_bottom = viewport_top + self.scrolled_window.get_allocated_height()
         velocity = 0.0
-        if mouse_y_in_drawing_area < viewport_y:
-            diff = viewport_y - mouse_y_in_drawing_area
-            velocity = -(diff * self.AUTOSCROLL_SENSITIVITY)
-        elif mouse_y_in_drawing_area > viewport_bottom:
-            diff = mouse_y_in_drawing_area - viewport_bottom
-            velocity = diff * self.AUTOSCROLL_SENSITIVITY
+        if self.current_pointer[1] < viewport_top:
+            diff = viewport_top - self.current_pointer[1]
+            velocity = -(diff * self.config.PREVIEW_AUTOSCROLL_SENSITIVITY)
+        elif self.current_pointer[1] > viewport_bottom:
+            diff = self.current_pointer[1] - viewport_bottom
+            velocity = diff * self.config.PREVIEW_AUTOSCROLL_SENSITIVITY
         current_val = vadj.get_value()
         max_val = vadj.get_upper() - vadj.get_page_size()
         min_val = vadj.get_lower()
-        if (velocity > 0 and current_val >= max_val - 1.0) or \
-           (velocity < 0 and current_val <= min_val + 1.0):
+        if (velocity > 0 and current_val >= max_val - 1.0) or (velocity < 0 and current_val <= min_val + 1.0):
             velocity = 0.0
         self.selection_autoscroll_velocity = velocity
-        should_run = abs(self.selection_autoscroll_velocity) > 0.1
+        should_run = abs(self.selection_autoscroll_velocity) >= 1.0
         if should_run and self.selection_autoscroll_timer is None:
             logging.debug(f"启动自动滚动定时器")
-            self.selection_autoscroll_timer = GLib.timeout_add(
-                self.AUTOSCROLL_INTERVAL, 
-                self._auto_scroll_selection
-            )
-        elif not should_run and self.selection_autoscroll_timer is not None:
-            logging.debug("速度归零，停止自动滚动定时器")
-            GLib.source_remove(self.selection_autoscroll_timer)
-            self.selection_autoscroll_timer = None
+            self.selection_autoscroll_timer = GLib.timeout_add(16, self._auto_scroll_selection)
+        elif not should_run:
+            if self.selection_autoscroll_timer is not None:
+                logging.debug("速度低于阈值，停止自动滚动定时器")
+            self._stop_autoscroll()
+
+    def _auto_scroll_selection(self):
+        if not self.selection_action or abs(self.selection_autoscroll_velocity) < 1.0:
+            self._stop_autoscroll()
+            return False
+        # 逻辑px
+        vadj = self.scrolled_window.get_vadjustment()
+        current_value = vadj.get_value()
+        new_value = current_value + self.selection_autoscroll_velocity
+        lower = vadj.get_lower()
+        upper = vadj.get_upper() - vadj.get_page_size()
+        new_value_clamped = max(lower, min(new_value, upper))
+        if abs(new_value_clamped - current_value) > 1e-3:
+            vadj.set_value(new_value_clamped)
+        if abs(new_value_clamped - new_value) > 1e-3:
+            logging.debug("自动滚动到达边缘，定时器停止")
+            self._stop_autoscroll()
+            return False
+        return True
 
     def _on_drawing_area_motion_notify(self, widget, event):
-        def get_clamped_y(raw_y):
-            y_offset = self.initial_y_offset
-            min_y = y_offset
-            max_y = y_offset + self.display_total_height
-            return max(min_y, min(raw_y, max_y))
-        if self.is_resizing_selection:
-            clamped_drawing_y = get_clamped_y(event.y) # 逻辑px
-            # 缓冲区px
-            render_plan_y = self._drawing_y_to_render_y(clamped_drawing_y)
-            absolute_model_y = self._render_y_to_absolute_y(render_plan_y)
-            if self.is_resizing_selection == 'top':
-                self.selection_absolute_start_y = absolute_model_y
-            else:
-                self.selection_absolute_end_y = absolute_model_y
-            self._check_and_trigger_autoscroll(event)
-            GLib.idle_add(self.drawing_area.queue_draw)
-            return True
-        if self.is_drawing_selection:
-            clamped_drawing_y = get_clamped_y(event.y)
-            render_plan_y = self._drawing_y_to_render_y(clamped_drawing_y)
-            absolute_model_y = self._render_y_to_absolute_y(render_plan_y)
-            self.selection_absolute_end_y = absolute_model_y
-            self._check_and_trigger_autoscroll(event)
-            GLib.idle_add(self.drawing_area.queue_draw)
+        self.current_pointer = self.parent_overlay.controller.scroll_manager.get_pointer_position(target=CoordSys.WINDOW)
+        if self.selection_action:
+            self._update_selection_from_pointer()
+            self._check_and_trigger_autoscroll()
             return True
         if self.is_selection_mode:
             handle = self._get_hovered_resize_handle(event.y)
-            if handle == 'top':
-                self.drawing_area.get_window().set_cursor(self.cursors['n-resize'])
-            elif handle == 'bottom':
-                self.drawing_area.get_window().set_cursor(self.cursors['s-resize'])
+            if handle:
+                self.drawing_area.get_window().set_cursor(self.cursors['ns-resize'])
             else:
                 self.drawing_area.get_window().set_cursor(self.cursors['crosshair'])
             return True
-        if self.is_dragging:
+        if self.drag_start_pos is not None:
             # 逻辑px
             hadj = self.scrolled_window.get_hadjustment()
             vadj = self.scrolled_window.get_vadjustment()
-            current_hadj_before = hadj.get_value() if hadj else 0
-            current_vadj_before = vadj.get_value() if vadj else 0
-            drag_sensitivity = self.config.PREVIEW_DRAG_SENSITIVITY
-            win_x, win_y = widget.translate_coordinates(self.parent_overlay, event.x, event.y)
-            delta_x = win_x - self.drag_start_x
-            delta_y = win_y - self.drag_start_y
+            delta_x = self.current_pointer[0] - self.drag_start_pos[0]
+            delta_y = self.current_pointer[1] - self.drag_start_pos[1]
             if hadj:
-                new_h_value = self.drag_start_hadj_value - (delta_x * drag_sensitivity)
+                new_h_value = self.drag_start_scroll[0] - (delta_x * self.config.PREVIEW_DRAG_SENSITIVITY)
                 new_h_value_clamped = max(hadj.get_lower(), min(new_h_value, hadj.get_upper() - hadj.get_page_size()))
                 hadj.set_value(new_h_value_clamped)
             if vadj:
-                new_v_value = self.drag_start_vadj_value - (delta_y * drag_sensitivity)
+                new_v_value = self.drag_start_scroll[1] - (delta_y * self.config.PREVIEW_DRAG_SENSITIVITY)
                 new_v_value_clamped = max(vadj.get_lower(), min(new_v_value, vadj.get_upper() - vadj.get_page_size()))
                 vadj.set_value(new_v_value_clamped)
-            actual_h_after = hadj.get_value() if hadj else 0
-            actual_v_after = vadj.get_value() if vadj else 0
             self.drawing_area.get_window().set_cursor(self.cursors['grabbing'])
             return True
         return False
 
     def _on_drawing_area_button_release(self, widget, event):
         if event.button == 1:
-            if self.selection_autoscroll_timer:
-                GLib.source_remove(self.selection_autoscroll_timer)
-                self.selection_autoscroll_timer = None
+            if self.selection_autoscroll_timer is not None:
                 logging.debug("鼠标释放，停止自动滚动")
-            self.selection_autoscroll_velocity = 0.0
-            if self.is_drawing_selection:
-                self.is_drawing_selection = False
-                # 缓冲区px
-                y1_abs, y2_abs = self._get_selection_absolute_bounds()
-                if y1_abs is not None and y2_abs is not None and abs(y1_abs - y2_abs) < 1e-5:
-                        self.selection_absolute_start_y = None
-                        self.selection_absolute_end_y = None
-                self.drawing_area.get_window().set_cursor(self.cursors['crosshair'])
+            self._stop_autoscroll()
+            if self.selection_action:
+                _, _, is_valid = self._get_selection_absolute_bounds()
+                if not is_valid:
+                    self.selection_anchor_y = None
+                    self.selection_moving_y = None
+                self.selection_action = None
+                handle = self._get_hovered_resize_handle(event.y)
+                if handle:
+                    self.drawing_area.get_window().set_cursor(self.cursors['ns-resize'])
+                else:
+                    self.drawing_area.get_window().set_cursor(self.cursors['crosshair'])
                 self._update_button_sensitivity()
                 GLib.idle_add(self.drawing_area.queue_draw)
                 return True
-            if self.is_resizing_selection:
-                self.is_resizing_selection = None
-                self.drawing_area.get_window().set_cursor(self.cursors['crosshair'])
-                self._update_button_sensitivity()
-                GLib.idle_add(self.drawing_area.queue_draw)
-                return True
-            if self.is_dragging:
-                self.is_dragging = False
+            if self.drag_start_pos is not None:
+                self.drag_start_pos = None
+                self.drag_start_scroll = None
                 self.drawing_area.get_window().set_cursor(self.cursors['default'])
                 return True
         return False
 
-    def _auto_scroll_selection(self):
-        """定时器回调，用于在选择时自动滚动视口"""
-        if not (self.is_drawing_selection or self.is_resizing_selection):
-            self.selection_autoscroll_timer = None
-            self.selection_autoscroll_velocity = 0.0
-            logging.debug("_auto_scroll_selection 触发，但已不在选择/调整大小状态")
-            return False
-        if abs(self.selection_autoscroll_velocity) < 0.1:
-            self.selection_autoscroll_timer = None
-            logging.debug("_auto_scroll_selection 触发，但滚动速度接近 0")
-            return False
-        # 逻辑px
-        vadj = self.scrolled_window.get_vadjustment()
-        current_value = vadj.get_value()
-        step = self.selection_autoscroll_velocity
-        new_value = current_value + step
-        lower = vadj.get_lower()
-        upper = vadj.get_upper() - vadj.get_page_size()
-        if new_value < lower:
-            new_value_clamped = lower
-        elif new_value > upper:
-            new_value_clamped = upper
-        else:
-            new_value_clamped = new_value
-        actual_scroll_amount_drawing = new_value_clamped - current_value
-        if abs(actual_scroll_amount_drawing) > 1e-3:
-            vadj.set_value(new_value_clamped)
-            mouse_offset = self.selection_autoscroll_velocity / self.AUTOSCROLL_SENSITIVITY
-            base_y = vadj.get_value() + vadj.get_page_size() if self.selection_autoscroll_velocity > 0 else vadj.get_value()
-            new_drawing_y = base_y + mouse_offset
-            # 缓冲区px
-            new_render_y = self._drawing_y_to_render_y(new_drawing_y)
-            new_absolute_y = self._render_y_to_absolute_y(new_render_y)
-            if self.is_resizing_selection == 'top':
-                self.selection_absolute_start_y = new_absolute_y
-            elif self.is_resizing_selection == 'bottom':
-                self.selection_absolute_end_y = new_absolute_y
-            elif self.is_drawing_selection:
-                self.selection_absolute_end_y = new_absolute_y
-            self.drawing_area.queue_draw()
-        if abs(new_value_clamped - new_value) > 1e-3:
-            logging.debug("自动滚动到达边缘，定时器停止")
-            self.selection_autoscroll_timer = None
-            self.selection_autoscroll_velocity = 0.0
-            return False
-        return True
+class CoordinatePatternWidget(Gtk.DrawingArea):
+    """用于窗口坐标校准的控件，绘制特定的点阵图案"""
+    # 逻辑px
+    def __init__(self):
+        super().__init__()
+        self.pixel_scale = 2
+        self.padding = 12
+        self.bg_color_gray = 0.15
+        self.bitmap = self._generate_bitmap()
+        rows, cols = self.bitmap.shape
+        self.content_w = cols * self.pixel_scale
+        self.content_h = rows * self.pixel_scale
+        self.set_size_request(self.content_w + self.padding * 2, self.content_h + self.padding * 2)
 
-class CaptureOverlay(Gtk.Window):
-    def __init__(self, config: Config, window_manager: WindowManagerBase, frame_grabber: FrameGrabberBase):
-        super().__init__(type=Gtk.WindowType.TOPLEVEL)
-        global GLOBAL_OVERLAY
-        GLOBAL_OVERLAY = self
-        self.fixed_container = Gtk.Fixed()
-        self.add(self.fixed_container)
-        self.fixed_container.show()
-        self.session = CaptureSession()
-        self.controller = ActionController(self.session, self, config)
-        # 逻辑px
-        self.monitor_offset_x = 0
-        self.monitor_offset_y = 0
-        self.is_selection_done = False
-        self.is_finished = False
+    def _generate_bitmap(self):
+        # 校准用的 HZK16 点阵数据 (拼, 长, 图)
+        CALIBRATION_BYTES_PIN = b'\x12\x08\x11\x18\x10\xa0\x13\xfc\xfd\x10\x11\x10\x15\x10\x19\x147\xfe\xd1\x10\x11\x10\x11\x10\x11\x10\x11\x10R\x10$\x10'
+        CALIBRATION_BYTES_CHANG = b'\x08\x00\x08\x10\x080\x08@\x08\x80\t\x00\x08\x04\xff\xfe\t\x00\t\x00\x08\x80\x08@\x08 \t\x1c\x0e\x08\x08\x00'
+        CALIBRATION_BYTES_TU = b'\x00\x04\x7f\xfeD\x04G\xe4LDR\x84A\x04B\x84FDI<p\x94F\x04A\x04@\x84\x7f\xfc@\x04'
+        data_list = [CALIBRATION_BYTES_PIN, CALIBRATION_BYTES_CHANG, CALIBRATION_BYTES_TU]
+        char_h = 16
+        char_w = 16
+        total_w = len(data_list) * char_w
+        bytes_per_row = char_w // 8
+        bitmap = np.zeros((char_h, total_w), dtype=bool)
+        for char_idx, char_bytes in enumerate(data_list):
+            x_offset = char_idx * char_w
+            for row in range(char_h):
+                for byte_idx in range(bytes_per_row):
+                    current_byte = char_bytes[row * bytes_per_row + byte_idx]
+                    for bit in range(8):
+                        if current_byte & (0x80 >> bit):
+                            bitmap[row, x_offset + byte_idx * 8 + bit] = True
+        return bitmap
+
+    def do_draw(self, cr):
+        w = self.get_allocated_width()
+        h = self.get_allocated_height()
+        cr.set_source_rgb(self.bg_color_gray, self.bg_color_gray, self.bg_color_gray)
+        radius = 8
+        degrees = math.pi / 180.0
+        cr.new_sub_path()
+        cr.arc(w - radius, radius, radius, -90 * degrees, 0 * degrees)
+        cr.arc(w - radius, h - radius, radius, 0 * degrees, 90 * degrees)
+        cr.arc(radius, h - radius, radius, 90 * degrees, 180 * degrees)
+        cr.arc(radius, radius, radius, 180 * degrees, 270 * degrees)
+        cr.close_path()
+        cr.fill()
+        cr.translate(self.padding, self.padding)
+        cr.set_source_rgb(1, 1, 1)
+        # 关闭抗锯齿
+        cr.set_antialias(cairo.ANTIALIAS_NONE)
+        rows, cols = self.bitmap.shape
+        ps = self.pixel_scale
+        for y in range(rows):
+            for x in range(cols):
+                if self.bitmap[y, x]:
+                    cr.rectangle(x * ps, y * ps, ps, ps)
+        cr.fill()
+        return False
+
+class CoordinateManager:
+    def __init__(self, session: CaptureSession, overlay: 'CaptureOverlay', frame_grabber: FrameGrabber):
+        self.session = session
+        self.overlay = overlay
+        self.frame_grabber = frame_grabber
+        self.is_running = False
         self.is_calibration_done = False
-        self._initial_grab_done = False
-        self.start_x_rel = 0 # 窗口坐标
-        self.start_y_rel = 0
-        self.current_x_rel = 0
-        self.current_y_rel = 0
-        self.is_dragging_selection = False
-        self.preview_panel = None
-        self.config_panel = None
-        self.stitch_model = self.controller.stitch_model
-        self.stitch_model.connect('model-updated', self.on_model_updated_ui)
-        self.evdev_wheel_scroller = None
-        self.invisible_scroller = None
-        self.screen_rect = None # 全局坐标
-        self.scale = self.get_scale_factor()
-        self.is_dialog_open = False
-        self.show_side_panel = True
-        self.show_button_panel = True
-        self.side_panel_on_left = True
-        self.current_notification_widget = None
-        self.notification_timeout_id = None
-        self.instruction_panel = None
-        self._instr_panel_natural_h = 0
-        self._instr_panel_natural_w = 0
-        self.user_wants_instruction_panel = config.SHOW_INSTRUCTION_PANEL_ON_START
-        WINDOW_MANAGER.setup_overlay_window(self)
-        self.apply_global_styles()
-        self.create_panels()
-        self._setup_overlay_mask()
-        self.side_panel.hide()
-        self.button_panel.hide()
-        self._initialize_cursors()
-        self._connect_events()
-        logging.info(f"GTK 覆盖层已创建")
 
-    def _on_global_focus_changed(self, window, widget):
-        global hotkey_listener
-        if not hotkey_listener or not are_hotkeys_enabled:
-            return
-        if widget is None:
-            hotkey_listener.set_normal_keys_grabbed(True)
-            return
-        input_types = (Gtk.Entry, Gtk.SpinButton, Gtk.TextView, Gtk.SearchEntry)
-        is_input_widget = isinstance(widget, input_types)
-        if is_input_widget:
-            hotkey_listener.set_normal_keys_grabbed(False)
-            logging.debug(f"输入控件 {type(widget).__name__} 获得焦点，暂停热键")
-        else:
-            hotkey_listener.set_normal_keys_grabbed(True)
-
-    def _setup_overlay_mask(self):
-        """创建一个全屏半透明遮罩层，用于模拟模态对话框"""
-        self.overlay_mask = Gtk.EventBox()
-        self.overlay_mask.set_visible_window(False)
-        self.overlay_mask.set_app_paintable(True)
-        self.overlay_mask.get_style_context().add_class("mask-layer")
-        self.overlay_mask.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
-        self.overlay_mask.connect("button-press-event", lambda w, e: True) 
-        self.overlay_mask.connect("draw", self._on_draw_overlay_mask)
-        self.overlay_mask.set_visible(False)
-        self.fixed_container.put(self.overlay_mask, 0, 0) # 窗口坐标
+    def get_screen_geometry(self) -> Gdk.Rectangle:
+        """获取覆盖层应在的显示器的几何信息"""
+        # 逻辑px全局坐标
+        window = self.overlay
+        display = Gdk.Display.get_default()
+        if window.get_window() and window.get_window().is_visible():
+            monitor = display.get_monitor_at_window(window.get_window())
+            if monitor:
+                return monitor.get_geometry()
+        monitor = display.get_primary_monitor()
+        if monitor:
+            return monitor.get_geometry()
+        logging.warning("无法确定显示器，将使用 1920x1080 作为回退")
+        rect = Gdk.Rectangle()
+        rect.x = 0
+        rect.y = 0
+        rect.width = 1920
+        rect.height = 1080
+        return rect
 
     def get_all_monitors_geometry(self):
-        """获取所有显示器的合并全局几何范围 (x_min, y_min, x_max, y_max)"""
+        """获取所有显示器的合并全局几何范围"""
         display = Gdk.Display.get_default()
         n_monitors = display.get_n_monitors()
         min_x, min_y = 0, 0
@@ -6567,342 +6761,69 @@ class CaptureOverlay(Gtk.Window):
                     max_y = max(max_y, geo.y + geo.height)
         return min_x, min_y, max_x, max_y
 
-    def window_to_monitor(self, wx, wy):
-        """窗口坐标 -> 显示器坐标"""
-        # 逻辑px
-        return wx + self.monitor_offset_x, wy + self.monitor_offset_y
-
-    def window_to_global(self, wx, wy):
-        """窗口坐标 -> 全局坐标"""
-        # 逻辑px
-        mx, my = self.window_to_monitor(wx, wy)
-        if self.screen_rect:
-            return mx + self.screen_rect.x, my + self.screen_rect.y
-        return mx, my
-
-    def _on_draw_overlay_mask(self, widget, cr):
-        """手动绘制半透明遮罩"""
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.6)
-        cr.set_operator(cairo.OPERATOR_OVER)
-        cr.paint()
-        return True
-
-    def _initialize_cursors(self):
-        """一次性创建所有需要的光标并缓存"""
-        display = self.get_display()
-        cursor_names = [
-            'default', 'n-resize', 's-resize', 'w-resize', 'e-resize',
-            'nw-resize', 'se-resize', 'ne-resize', 'sw-resize',
-            'grab', 'grabbing', "crosshair"
-        ]
-        self.cursors = {
-            name: Gdk.Cursor.new_from_name(display, name) for name in cursor_names
-        }
-        surface = cairo.ImageSurface(cairo.Format.ARGB32, 1, 1)
-        self.cursors['blank'] = Gdk.Cursor.new_from_surface(display, surface, 0, 0)
-
-    def show_embedded_notification(self, title, message, level, timeout=None, action_config=None):
-        """在窗口顶部中间显示内嵌通知"""
-        # 窗口坐标
-        current_alloc = self.get_allocation()
-        if not self.screen_rect and current_alloc.width <= 1:
-            logging.debug(f"窗口尚未布局 (width={current_alloc.width})，推迟显示通知: {title}")
-            GLib.timeout_add(300, self.show_embedded_notification, title, message, level, timeout, action_config)
-            return
-        if self.current_notification_widget:
-            self.dismiss_notification(self.current_notification_widget, trigger_cleanup=False)
-        act_path = action_config.get('path') if action_config else None
-        act_ctrl = action_config.get('controller') if action_config else None
-        act_w = action_config.get('width', 0) if action_config else 0
-        act_h = action_config.get('height', 0) if action_config else 0
-        panel = EmbeddedNotificationPanel(self, title, message, level, act_path, act_w, act_h)
-        panel.controller_ref = act_ctrl
-        self.fixed_container.put(panel, 0, 0)
-        panel.show_all()
-        _, nat_size = panel.get_preferred_size()
-        panel_w, panel_h = nat_size.width, nat_size.height
-        win_w = panel_w
-        if self.screen_rect:
-            win_w, _ = self.screen_rect.width, self.screen_rect.height
-        x = (win_w - panel_w) // 2
-        y = 40
-        self.fixed_container.move(panel, x, y)
-        self.current_notification_widget = panel
-        default_timeouts = {
-            "normal": 3,
-            "warning": 8,
-            "success": 8,
-            "critical": 0
-        }
-        if timeout is not None:
-            timeout_sec = timeout
-        else:
-            timeout_sec = default_timeouts.get(level, 3)
-        if timeout_sec > 0:
-            self.notification_timeout_id = GLib.timeout_add_seconds(timeout_sec, lambda: self.dismiss_notification(panel))
-        self._update_input_shape()
-
-    def enter_notification_mode(self):
-        """仅显示通知：隐藏所有面板，停止绘制选区"""
-        logging.info("进入通知驻留模式")
-        self.is_finished = True
-        self.side_panel.hide()
-        self.button_panel.hide()
-        self.instruction_panel.hide()
-        if hasattr(self, 'overlay_mask'):
-            self.overlay_mask.hide()
-        if self.preview_panel: self.preview_panel.hide()
-        if self.config_panel: self.config_panel.hide()
-        self.queue_draw()
-        self._update_input_shape()
-
-    def dismiss_notification(self, widget, trigger_cleanup=True):
-        if self.notification_timeout_id:
-            GLib.source_remove(self.notification_timeout_id)
-            self.notification_timeout_id = None
-        if widget:
-            widget.destroy()
-        if self.current_notification_widget == widget:
-            self.current_notification_widget = None
-            if self.get_window():
-                if not self.is_selection_done:
-                    self.get_window().set_cursor(self.cursors['crosshair'])
-                else:
-                    self.get_window().set_cursor(None)
-            if trigger_cleanup and hasattr(widget, 'controller_ref') and widget.controller_ref:
-                if self.is_finished:
-                    logging.info("通知关闭且处于完成状态，触发最终退出")
-                    widget.controller_ref._perform_cleanup()
-
-    def _connect_events(self):
-        """连接所有Gtk信号和事件"""
-        self.connect("map-event", self.on_map_event)
-        self.connect("set-focus", self._on_global_focus_changed)
-        self.connect("draw", self.on_draw)
-        self.connect("size-allocate", self.on_size_allocate)
-        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK |
-                        Gdk.EventMask.BUTTON_RELEASE_MASK |
-                        Gdk.EventMask.POINTER_MOTION_MASK)
-        self.connect("button-press-event", self.on_button_press)
-        self.connect("button-release-event", self.on_button_release)
-        self.connect("motion-notify-event", self.on_motion_notify)
-        self.connect("key-press-event", self.on_key_press_event)
-        self.connect("key-release-event", self.on_key_release_event)
-
-    def apply_global_styles(self):
-        """应用所有全局 CSS 样式"""
-        screen = Gdk.Screen.get_default()
-        priority = Gtk.STYLE_PROVIDER_PRIORITY_USER
-        def load_css(css_data, name):
-            if not css_data:
-                return
+    def initialize_screen_config(self):
+        logging.debug("正在初始化屏幕几何信息...")
+        # 逻辑px全局坐标
+        screen_rect = self.get_screen_geometry()
+        rect_w = screen_rect.width
+        rect_h = screen_rect.height
+        logging.debug(f"当前屏幕宽度 {rect_w} 逻辑px，高度 {rect_h} 逻辑px")
+        scale = self.overlay.get_scale_factor()
+        if IS_WAYLAND:
+            logging.info("尝试通过视频流校准真实缩放比例...")
             try:
-                provider = Gtk.CssProvider()
-                provider.load_from_data(css_data.encode('utf-8'))
-                Gtk.StyleContext.add_provider_for_screen(screen, provider, priority)
+                detected_buf_w, detected_buf_h = self.frame_grabber.wait_for_valid_frame(timeout=2.0) # 缓冲区px
+                logging.debug(f"当前屏幕宽度 {detected_buf_w} 缓冲区px，高度 {detected_buf_h} 缓冲区px")
+                if rect_w > 0:
+                    scale = detected_buf_w / rect_w
+                    logging.info(f"校准成功: 真实 scale {scale:.3f}")
+                else:
+                    logging.warning("校准失败: 宽度无效，保持默认 scale")
             except Exception as e:
-                logging.error(f"应用 {name} CSS 失败: {e}")
-        load_css(config.NOTIFICATION_CSS, "Notification")
-        load_css(config.DIALOG_CSS, "Dialog")
-        load_css(config.MASK_CSS, "Mask")
-        load_css(config.PROCESSING_DIALOG_CSS, "Processing Dialog")
-        load_css(config.INFO_PANEL_CSS, "Info Panel")
-        load_css(config.INSTRUCTION_PANEL_CSS, "Instruction Panel")
-        load_css(config.SIMULATED_WINDOW_CSS, "Simulated Window")
-        button_active_css = """
-        button.force-active-style {
-            color: @theme_fg_color;
-            background-image: image(@theme_bg_color);
-            border-color: @borders;
-            text-shadow: none;
-            -gtk-icon-shadow: none;
-        }
-        button.force-active-style:hover {
-            background-image: image(shade(@theme_bg_color, 1.05));
-            border-color: shade(@borders, 1.1);
-        }
-        button.force-active-style:active,
-        button.force-active-style:checked {
-            background-image: image(shade(@theme_bg_color, 0.95));
-        }
-        button.force-active-style:disabled {
-            color: @insensitive_fg_color;
-            background-image: image(@insensitive_bg_color);
-            border-color: @insensitive_borders;
-            opacity: 0.9;
-            text-shadow: none;
-            -gtk-icon-shadow: none;
-        }
-        """
-        load_css(button_active_css, "Button Active Style")
-        no_padding_css = """
-        .no-padding { padding: 0px; }
-        """
-        load_css(no_padding_css, "No Padding Style")
-        dir_placeholder_css = """
-        entry.dir-not-set { color: #888888; opacity: 0.8; }
-        """
-        load_css(dir_placeholder_css, "Dir Placeholder Style")
-        logging.debug("已应用所有全局 CSS 样式")
+                logging.warning(f"校准失败: {e}")
+                GLib.idle_add(send_notification, "Wayland 录制初始化异常", f"无法获取屏幕画面，截图功能不可用\n{e}", "critical", "dialog-error")
+                self.is_calibration_done = True
+        self.session.set_screen_config(rect=screen_rect, scale=scale)
+        return screen_rect, scale
 
-    def on_key_press_event(self, widget, event):
-        if self.is_dialog_open:
-            self.on_dialog_key_press(widget, event)
-            return True
-        if self.preview_panel and self.preview_panel.get_visible():
-            if self.preview_panel._on_key_press(widget, event):
-                return True
-        if self.config_panel and self.config_panel.get_visible():
-            if self.config_panel.capturing_hotkey_button:
-                return True
-        if not self.is_selection_done:
-            keyval = event.keyval
-            if keyval == Gdk.KEY_Escape:
-                logging.info("选择被 Esc 取消")
-                Gdk.Display.get_default().get_default_seat().ungrab()
-                self.destroy()
-                return True
-            state = event.state & config.GTK_MODIFIER_MASK
-            if keyval in config.HOTKEY_TOGGLE_INSTRUCTION_PANEL['gtk_keys'] and \
-               state == config.HOTKEY_TOGGLE_INSTRUCTION_PANEL['gtk_mask']:
-                self.toggle_instruction_panel()
-                return True
-            return False
+    def map_point(self, x, y, source: CoordSys, target: CoordSys):
+        # x, y: 逻辑px
+        if source == target:
+            return x, y
+        rect = self.session.screen_rect
+        mon_origin_x = rect.x if rect else 0
+        mon_origin_y = rect.y if rect else 0
+        win_origin_x = mon_origin_x + self.session.monitor_offset_x
+        win_origin_y = mon_origin_y + self.session.monitor_offset_y
+        gx, gy = x, y
+        if source == CoordSys.WINDOW:
+            gx, gy = x + win_origin_x, y + win_origin_y
+        elif source == CoordSys.MONITOR:
+            gx, gy = x + mon_origin_x, y + mon_origin_y
+        if target == CoordSys.GLOBAL:
+            return gx, gy
+        elif target == CoordSys.MONITOR:
+            return gx - mon_origin_x, gy - mon_origin_y
+        elif target == CoordSys.WINDOW:
+            return gx - win_origin_x, gy - win_origin_y
+
+    def get_valid_screen_size(self):
+        # 逻辑px
+        rect = self.session.screen_rect
+        if rect:
+            screen_w, screen_h = rect.width, rect.height
         else:
-            return self.controller.handle_key_press(event)
+            screen_w, screen_h = self.overlay.get_allocated_width(), self.overlay.get_allocated_height()
+        return self.map_point(screen_w, screen_h, source=CoordSys.MONITOR, target=CoordSys.WINDOW)
 
-    def on_key_release_event(self, widget, event):
-        if self.config_panel and self.config_panel.get_visible():
-            if self.config_panel.handle_key_release(widget, event):
-                return True
-        return False
-
-    def _grab_for_selection(self):
-        display = Gdk.Display.get_default()
-        seat = display.get_default_seat()
-        capabilities = (Gdk.SeatCapabilities.POINTER |
-                        Gdk.SeatCapabilities.KEYBOARD)
-        def _set_cursor_delayed():
-            if self.get_window():
-                self.get_window().set_cursor(self.cursors["crosshair"])
-            return False
-        GLib.timeout_add(250, _set_cursor_delayed)
-        grab_status = seat.grab(
-            self.get_window(), capabilities,
-            True, None, None, None, None
-        )
-        if grab_status != Gdk.GrabStatus.SUCCESS:
-            logging.error(f"无法抓取输入: {grab_status}")
-            GLib.idle_add(self.controller.quit_and_cleanup)
-        else:
-            self.get_window().set_cursor(self.cursors["crosshair"])
-            logging.info("窗口已映射，成功抓取输入用于区域选择")
-
-    def on_map_event(self, widget, event):
-        if self.screen_rect is None:
-            logging.debug("窗口首次映射，正在初始化屏幕几何信息...")
-            # 逻辑px全局坐标
-            self.screen_rect = WINDOW_MANAGER.get_screen_geometry(self)
-            rect_w = self.screen_rect.width
-            rect_h = self.screen_rect.height
-            logging.debug(f"当前屏幕宽度 {rect_w} 逻辑px，高度 {rect_h} 逻辑px")
-            FRAME_GRABBER.set_global_offset(self.screen_rect.x, self.screen_rect.y)
-            g_min_x, g_min_y, g_max_x, g_max_y = self.get_all_monitors_geometry()
-            if IS_WAYLAND:
-                logging.info("尝试通过视频流校准真实缩放比例...")
-                wait_start = time.time()
-                # 缓冲区px
-                detected_buf_h = 0
-                detected_buf_w = 0
-                while time.time() - wait_start < 2.0:
-                    with FRAME_GRABBER.frame_lock:
-                        if FRAME_GRABBER.latest_frame is not None:
-                            detected_buf_h, detected_buf_w, _ = FRAME_GRABBER.latest_frame.shape
-                            logging.debug(f"当前屏幕宽度 {detected_buf_w} 缓冲区px，高度 {detected_buf_h} 缓冲区px")
-                            break
-                    if getattr(FRAME_GRABBER, 'last_error', None) or \
-                       getattr(FRAME_GRABBER, 'state', 'IDLE') == "ERROR":
-                        logging.warning("校准等待期间检测到 Grabber 错误，提前中止等待")
-                        break
-                    time.sleep(0.05)
-                if detected_buf_w > 0 and rect_w > 0:
-                    self.scale = detected_buf_w / rect_w
-                    logging.info(f"校准成功: 真实Scale {self.scale:.6f}")
-                else:
-                    logging.warning("校准失败: 未能及时获取视频帧或宽度无效，保持默认 Scale")
-                    err_msg = getattr(FRAME_GRABBER, 'last_error', None)
-                    title = "Wayland 录制初始化失败"
-                    msg = "无法获取屏幕画面，无法进行截图"
-                    if err_msg:
-                        msg += f"\n{err_msg}"
-                    GLib.idle_add(lambda: send_desktop_notification(title, msg, level="critical", sound_name="dialog-error"))
-                    self.is_calibration_done = True
-            try:
-                # 逻辑px -> 缓冲区px
-                g_min_x_buf = math.ceil(g_min_x * self.scale)
-                g_min_y_buf = math.ceil(g_min_y * self.scale)
-                g_max_x_buf = int(g_max_x * self.scale)
-                g_max_y_buf = int(g_max_y * self.scale)
-                if IS_WAYLAND:
-                    logging.info("Wayland 下 'invisible_cursor' 模式不可用")
-                    self.invisible_scroller = None
-                    if EVDEV_AVAILABLE:
-                        self.evdev_wheel_scroller = EvdevWheelScroller()
-                        if rect_w > 0:
-                            self.controller.scroll_manager.evdev_abs_mouse = EvdevAbsoluteMouse(g_min_x_buf, g_min_y_buf, g_max_x_buf, g_max_y_buf)
-                        else:
-                            logging.error("无法获取图片分辨率，Wayland 下鼠标移动功能将无法工作")
-                    else:
-                        logging.error("Wayland 下 evdev 不可用，鼠标移动以及滚动功能将无法工作")
-                        self.evdev_wheel_scroller = None
-                        self.controller.scroll_manager.evdev_abs_mouse = None
-                else:
-                    if EVDEV_AVAILABLE:
-                        if config.SCROLL_METHOD == 'invisible_cursor':
-                            park_x = self.screen_rect.x + rect_w - 1 # 显示器坐标 -> 全局坐标
-                            park_y = self.screen_rect.y + rect_h - 1
-                            # 逻辑px -> 缓冲区px
-                            park_x_buf = int(park_x * self.scale)
-                            park_y_buf = int(park_y * self.scale)
-                            self.invisible_scroller = InvisibleCursorScroller(
-                                g_min_x_buf, g_min_y_buf, g_max_x_buf, g_max_y_buf, park_x_buf, park_y_buf, config
-                            )
-                            self.invisible_scroller.setup()
-                            logging.debug("InvisibleCursorScroller.setup() 正在后台线程中执行")
-                        else:
-                            self.evdev_wheel_scroller = EvdevWheelScroller()
-                    else:
-                        logging.debug("Evdev 未导入，X11 下将默认使用 XTest 进行滚动")
-                        self.evdev_wheel_scroller = None
-                        self.invisible_scroller = None
-            except Exception as err:
-                logging.error(f"创建虚拟滚动设备失败: {err}")
-                send_desktop_notification(
-                    "设备错误", f"无法创建虚拟设备: {err}，基于 evdev 的滚动功能将不可用", level="critical"
-                )
-                self.evdev_wheel_scroller = None
-                self.invisible_scroller = None
-            if not self.is_selection_done:
-                self.resize(rect_w, rect_h)
-                self.fixed_container.set_size_request(rect_w, rect_h)
-                if not IS_WAYLAND:
-                    self.move(self.screen_rect.x, self.screen_rect.y) # 全局坐标
-        if not self.is_selection_done and not self._initial_grab_done:
-            self.present_with_time(Gtk.get_current_event_time())
-            self.user_wants_instruction_panel = config.SHOW_INSTRUCTION_PANEL_ON_START
-            self.update_layout()
-            self._grab_for_selection()
-            self._initial_grab_done = True
-            if not self.is_calibration_done:
-                self._initiate_calibration()
-                
-    def _initiate_calibration(self):
-        logging.info("初始化坐标校准程序...")
-        cal_widget = CalibrationWidget()
+    def calibrate_offsets(self):
+        if self.is_running: return
+        self.is_running = True
+        logging.info("启动窗口坐标校准...")
+        cal_widget = CoordinatePatternWidget()
         target_log_x = 30
         target_log_y = 30
-        self.fixed_container.put(cal_widget, target_log_x, target_log_y) # 窗口坐标
-        cal_widget.show()
+        self.overlay.overlay_manager.show(cal_widget, anchor=(target_log_x, target_log_y), layer=OverlayManager.LAYER_TOP, mask=False)
         while Gtk.events_pending():
             Gtk.main_iteration()
         threading.Thread(target=self._run_calibration_thread, args=(cal_widget, target_log_x, target_log_y), daemon=True).start()
@@ -6911,50 +6832,49 @@ class CaptureOverlay(Gtk.Window):
         # 显示器坐标
         time.sleep(0.6)
         full_img = None
-        if IS_WAYLAND:
-            with FRAME_GRABBER.frame_lock:
-                if FRAME_GRABBER.latest_frame is not None:
-                    full_img = FRAME_GRABBER.latest_frame.copy()
-        else:
-            temp_path = config.TMP_DIR / "cal_temp.png"
-            rect = self.screen_rect
-            event = threading.Event()
-            success = [False]
-            def main_thread_capture():
-                try: success[0] = FRAME_GRABBER.capture(0, 0, rect.width, rect.height, temp_path, scale=1.0, include_cursor=False)
-                except Exception as e:
-                    logging.error(f"校准截图调用失败: {e}")
-                finally: event.set()
-                return False
-            GLib.idle_add(main_thread_capture)
-            event.wait()
-            if success[0] and temp_path.exists():
-                full_img = cv2.imread(str(temp_path))
-                try: os.remove(temp_path)
-                except: pass
+        current_scale = self.session.scale
+        temp_path = config.TEMP_DIRECTORY / "cal_temp.png"
+        rect = self.session.screen_rect
+        event = threading.Event()
+        success = [False]
+        def main_thread_capture():
+            try:
+                cap_x, cap_y = self.map_point(0, 0, source=CoordSys.MONITOR, target=self.frame_grabber.target_coords)
+                success[0] = self.frame_grabber.capture(cap_x, cap_y, rect.width, rect.height, temp_path, scale=current_scale, include_cursor=False)
+            except Exception as e:
+                logging.error(f"坐标校准截图调用失败: {e}")
+            finally:
+                event.set()
+            return False
+        GLib.idle_add(main_thread_capture)
+        event.wait()
+        if success[0] and temp_path.exists():
+            full_img = cv2.imread(str(temp_path))
+            try: os.remove(temp_path)
+            except: pass
         if full_img is None:
-            logging.warning("校准失败: 无法获取屏幕帧")
-            GLib.idle_add(widget.destroy)
-            self.is_calibration_done = True
+            logging.warning("坐标校准失败: 无法获取屏幕帧")
+            self._finish(widget)
             return
-        logic_w = 48 * widget.pixel_scale
-        logic_h = 16 * widget.pixel_scale
-        bitmap = widget.get_calibration_bitmap()
-        bg_gray = int(0.15 * 255)
+        bitmap = widget.bitmap
+        rows, cols = bitmap.shape
+        logic_w = cols * widget.pixel_scale
+        logic_h = rows * widget.pixel_scale
+        bg_gray = int(widget.bg_color_gray * 255)
         template = np.full((logic_h, logic_w), bg_gray, dtype=np.uint8)
-        for r in range(16):
-            for c in range(48):
+        for r in range(rows):
+            for c in range(cols):
                 if bitmap[r, c]:
                     template[r*widget.pixel_scale : (r+1)*widget.pixel_scale, c*widget.pixel_scale : (c+1)*widget.pixel_scale] = 255
-        if self.scale != 1.0:
-            template = cv2.resize(template, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_NEAREST) # 逻辑px -> 缓冲区px
+        if current_scale != 1.0:
+            template = cv2.resize(template, None, fx=current_scale, fy=current_scale, interpolation=cv2.INTER_NEAREST) # 逻辑px -> 缓冲区px
         screen_gray = cv2.cvtColor(full_img, cv2.COLOR_BGR2GRAY)
         # 缓冲区px
         screen_h, screen_w = screen_gray.shape
         template_h, template_w = template.shape
         # 逻辑px -> 缓冲区px
-        expected_x_buf = math.ceil((log_x + widget.padding) * self.scale)
-        expected_y_buf = math.ceil((log_y + widget.padding) * self.scale)
+        expected_x_buf = math.ceil((log_x + widget.padding) * current_scale)
+        expected_y_buf = math.ceil((log_y + widget.padding) * current_scale)
         margin = 80
         pred_x1 = max(0, int(expected_x_buf - margin))
         pred_y1 = max(0, int(expected_y_buf - margin))
@@ -6976,40 +6896,755 @@ class CaptureOverlay(Gtk.Window):
             if max_val > final_max_val:
                 final_max_val = max_val
             if max_val > 0.90:
-                logging.debug(f"校准优化: 在 [{name}] 阶段找到匹配，相似度 {max_val:.4f}")
+                logging.debug(f"在 [{name}] 阶段找到匹配，相似度 {max_val:.3f}")
                 final_match_loc = (x1 + max_loc[0], y1 + max_loc[1])
                 break
+        offset_result = None
         if final_max_val > 0.90 and final_match_loc is not None:
             # 缓冲区px
             found_x, found_y = final_match_loc
             # 缓冲区px -> 逻辑px
-            self.monitor_offset_x = math.ceil((found_x - expected_x_buf) / self.scale)
-            self.monitor_offset_y = math.ceil((found_y - expected_y_buf) / self.scale)
-            logging.info(f"坐标校准完成: 窗口坐标偏差 offset=({self.monitor_offset_x}, {self.monitor_offset_y}) 逻辑px")
+            offset_x = (found_x - expected_x_buf) / current_scale
+            offset_y = (found_y - expected_y_buf) / current_scale
+            logging.info(f"窗口坐标校准完成: offset=({offset_x:.1f}, {offset_y:.1f}) 逻辑px")
+            offset_result = (offset_x, offset_y)
         else:
-            logging.warning(f"校准失败: 未找到匹配图案 (最高相似度={final_max_val:.2f})")
+            logging.warning(f"窗口坐标校准失败: 未找到匹配图案 (最高相似度={final_max_val:.3f})")
+        GLib.idle_add(self._apply_calibration_result, offset_result)
+        self._finish(widget)
+
+    def _apply_calibration_result(self, offset_result):
         self.is_calibration_done = True
-        GLib.idle_add(widget.destroy)
-        GLib.idle_add(self.update_layout)
+        if offset_result is not None:
+            self.session.set_screen_config(offset_x=offset_result[0], offset_y=offset_result[1])
+        self.overlay.update_layout()
+        self.overlay.canvas.queue_draw()
+
+    def _finish(self, widget):
+        self.is_running = False
+        GLib.idle_add(self.overlay.overlay_manager.dismiss, widget)
+
+class OverlayManager:
+    LAYER_BASE = 0
+    LAYER_LOW = 10
+    LAYER_MEDIUM = 20
+    LAYER_MEDIUM_UP = 25
+    LAYER_HIGH = 30
+    LAYER_TOP = 40
+
+    def __init__(self, overlay_window):
+        self.overlay = overlay_window
+        self.overlay_container = overlay_window.overlay_container
+        self.overlay_container.connect("get-child-position", self._on_get_child_position)
+        self.widget_positions = {}
+        self.active_widgets = []
+        self.widget_timers = {}
+        self.widget_gestures = {}
+        self.blocking_widget = None
+        self.is_mask_visual = False
+        self.mask_layer = self._create_mask()
+        self._xlib_disp = None
+
+    def _on_get_child_position(self, overlay, widget, allocation):
+        pos = self.widget_positions.get(widget)
+        if pos is None: return False
+        allocation.x = int(pos[0])
+        allocation.y = int(pos[1])
+        req, _ = widget.get_preferred_size()
+        allocation.width = req.width
+        allocation.height = req.height
+        return True
+
+    def _create_mask(self):
+        mask = Gtk.EventBox()
+        mask.set_visible_window(True)
+        screen = mask.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual and screen.is_composited():
+            mask.set_visual(visual)
+        mask.set_app_paintable(True)
+        mask.connect("draw", self._on_draw_mask)
+        mask.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
+        mask.connect("button-press-event", self._on_mask_press)
+        mask.connect("notify::visible", lambda w, p: self.overlay.update_input_shape())
+        mask.connect("realize", lambda w: w.get_window().set_cursor(self.overlay.cursors['default']))
+        self.overlay_container.add_overlay(mask)
+        self.widget_positions[mask] = (0, 0)
+        return mask
+
+    def _on_mask_press(self, widget, event):
+        if self.blocking_widget and self.blocking_widget.get_visible():
+            SystemInteraction.play_sound(config.WARNING_SOUND)
+            self._trigger_shake(self.blocking_widget)
+        return True
+
+    def _trigger_shake(self, widget):
+        if getattr(widget, 'is_animating', False): return
+        widget.is_animating = True
+        start_x, start_y = self.get_widget_position(widget)
+        start_time = time.monotonic()
+        duration = 0.4
+        amplitude = 10
+        def frame():
+            elapsed = time.monotonic() - start_time
+            if elapsed >= duration:
+                self.move_widget(widget, start_x, start_y)
+                widget.is_animating = False
+                return False
+            progress = elapsed / duration
+            offset_x = amplitude * math.sin(progress * 6 * math.pi) * (1 - progress)
+            self.move_widget(widget, start_x + offset_x, start_y)
+            return True
+        GLib.timeout_add(16, frame)
+
+    def _on_draw_mask(self, widget, cr):
+        if not self.is_mask_visual:
+            return False
+        context = widget.get_style_context()
+        context.add_class("mask-layer")
+        width = widget.get_allocated_width()
+        height = widget.get_allocated_height()
+        Gtk.render_background(context, cr, 0, 0, width, height)
+        context.remove_class("mask-layer")
+        return True
+
+    def move_widget(self, widget, x, y):
+        self.widget_positions[widget] = (int(x), int(y))
+        widget.queue_resize()
+
+    def get_widget_position(self, widget):
+        return self.widget_positions.get(widget, (0, 0))
+
+    def add_managed_widget(self, widget, layer=LAYER_BASE):
+        if widget in [item['widget'] for item in self.active_widgets]:
+            return
+        if widget.get_parent() != self.overlay_container:
+            self.overlay_container.add_overlay(widget)
+            self.widget_positions[widget] = (0, 0)
+        self.active_widgets.append({'widget': widget, 'layer': layer, 'mask': False})
+        gesture = Gtk.GestureMultiPress.new(widget)
+        gesture.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        gesture.connect("pressed", lambda g, n, x, y, w=widget: self.bring_to_front(w))
+        self.widget_gestures[widget] = gesture
+        widget.connect("notify::visible", lambda w, p: (self.overlay.update_input_shape(), self._update_z_order()))
+        widget.connect("size-allocate", lambda w, a: self.overlay.update_input_shape())
+        self._update_z_order()
+
+    def bring_to_front(self, widget):
+        for item in self.active_widgets:
+            if item['widget'] == widget:
+                layer_items = [i for i in self.active_widgets if i['layer'] == item['layer']]
+                if layer_items and layer_items[-1] == item:
+                    return
+                self.active_widgets.remove(item)
+                self.active_widgets.append(item)
+                self._update_z_order()
+                break
+
+    def show(self, widget, anchor='center', layer=LAYER_HIGH, mask=False, auto_dismiss=0):
+        for item in self.active_widgets:
+            if item['widget'] == widget:
+                item['layer'] = layer
+                item['mask'] = mask
+                break
+        else:
+            self.overlay_container.add_overlay(widget)
+            self.widget_positions[widget] = (0, 0)
+            self.active_widgets.append({'widget': widget, 'layer': layer, 'mask': mask})
+        widget.show_all()
+        if anchor is not None:
+            self._apply_anchor(widget, anchor)
+        self.bring_to_front(widget)
+        self._update_z_order()
+        if auto_dismiss > 0:
+            timer_id = GLib.timeout_add_seconds(auto_dismiss, self.dismiss, widget)
+            self.widget_timers[widget] = timer_id
+        return None
+
+    def set_blocking(self, widget, blocking):
+        if blocking:
+            self.blocking_widget = widget
+        else:
+            if self.blocking_widget == widget:
+                self.blocking_widget = None
+        self._update_z_order()
+
+    def run_modal(self, widget, anchor='center', layer=LAYER_HIGH, mask=True):
+        self.show(widget, anchor=anchor, layer=layer, mask=mask)
+        self.set_blocking(widget, True)
+        widget.show_timestamp = time.time()
+        is_dialog = isinstance(widget, EmbeddedDialog)
+        if is_dialog:
+            self.overlay.session.push_context(Context.DIALOG)
+        loop = GLib.MainLoop()
+        result_container = {'response': Gtk.ResponseType.NONE, 'data': None}
+        def on_response(dialog, response_id):
+            result_container['response'] = response_id
+            if hasattr(dialog, 'get_result'):
+                result_container['data'] = dialog.get_result()
+            loop.quit()
+        handler_id = widget.connect('response', on_response)
+        try:
+            loop.run()
+        except Exception as e:
+            logging.error(f"阻塞循环异常: {e}")
+        finally:
+            self.blocking_widget = None
+            if is_dialog:
+                self.overlay.session.pop_context(Context.DIALOG)
+        if widget in [item['widget'] for item in self.active_widgets]:
+            if widget.handler_is_connected(handler_id):
+                widget.disconnect(handler_id)
+            self.dismiss(widget)
+        return result_container['response'], result_container['data']
+
+    def dismiss(self, widget):
+        if widget in self.widget_timers:
+            GLib.source_remove(self.widget_timers[widget])
+            del self.widget_timers[widget]
+        if widget in self.widget_gestures:
+            del self.widget_gestures[widget]
+        for item in self.active_widgets:
+            if item['widget'] == widget:
+                self.overlay_container.remove(widget)
+                self.widget_positions.pop(widget, None)
+                self.active_widgets.remove(item)
+                widget.destroy()
+                break
+        self._update_z_order()
         return False
 
+    def dismiss_by_type(self, widget_type):
+        dismissed = False
+        for item in self.active_widgets[:]:
+            if isinstance(item['widget'], widget_type):
+                self.dismiss(item['widget'])
+                dismissed = True
+        return dismissed
+
+    def _update_z_order(self):
+        target_mask_layer = -1
+        self.is_mask_visual = False
+        for item in self.active_widgets:
+            if item['widget'].get_visible() and item['mask'] and item['layer'] > target_mask_layer:
+                target_mask_layer = item['layer']
+                self.is_mask_visual = True
+        if self.blocking_widget and self.blocking_widget.get_visible():
+            for item in self.active_widgets:
+                if item['widget'] == self.blocking_widget:
+                    if item['layer'] > target_mask_layer:
+                        target_mask_layer = item['layer']
+                    break
+        target_order = []
+        for idx, item in enumerate(self.active_widgets):
+            if item['widget'].get_visible():
+                sort_layer = float(item['layer'])
+                if item['layer'] == target_mask_layer:
+                    if item['widget'] == self.blocking_widget or item['mask']:
+                        sort_layer += 0.1
+                    else:
+                        sort_layer -= 0.1
+                target_order.append((sort_layer, idx, item['widget']))
+        if target_mask_layer > -1:
+            rect = self.overlay.session.screen_rect
+            w = rect.width if rect else self.overlay.get_allocated_width()
+            h = rect.height if rect else self.overlay.get_allocated_height()
+            self.mask_layer.set_size_request(w, h)
+            self.mask_layer.show()
+            self.mask_layer.queue_draw()
+            target_order.append((float(target_mask_layer), -1, self.mask_layer))
+        else:
+            self.mask_layer.hide()
+        target_order.sort(key=lambda x: (x[0], x[1]))
+        for i, (_, _, widget) in enumerate(target_order):
+            if widget.get_parent() == self.overlay_container:
+                self.overlay_container.reorder_overlay(widget, i)
+        for _, _, widget in target_order:
+            if widget.get_has_window() and widget.get_window():
+                widget.get_window().raise_()
+
+    def _apply_anchor(self, widget, anchor):
+        valid_w, valid_h = self.overlay.coord_manager.get_valid_screen_size()
+        _, req = widget.get_preferred_size()
+        ww, wh = req.width, req.height
+        x, y = 0, 0 # 逻辑px窗口坐标
+        if isinstance(anchor, str):
+            if anchor == 'center':
+                x = (valid_w - ww) // 2
+                y = (valid_h - wh) // 2
+            elif anchor == 'top-center':
+                x = (valid_w - ww) // 2
+                y = 40
+            elif anchor == 'top-left':
+                x = 20
+                y = 20
+            elif anchor == 'mouse':
+                mouse_win_x, mouse_win_y = self.overlay.controller.scroll_manager.get_pointer_position(target=CoordSys.WINDOW)
+                target_x = mouse_win_x + 10
+                target_y = mouse_win_y + 10
+                if target_x + ww > valid_w:
+                    target_x = mouse_win_x - ww - 10
+                if target_y + wh > valid_h:
+                    target_y = mouse_win_y - wh - 10
+                x = max(0, target_x)
+                y = max(0, target_y)
+        elif isinstance(anchor, (tuple, list)) and len(anchor) == 2:
+            x, y = anchor
+        self.move_widget(widget, max(0, int(x)), max(0, int(y)))
+
+    def recalculate_input_shapes(self, base_region, base_rects):
+        final_region = cairo.Region()
+        if base_region:
+            final_region.union(base_region)
+        if self.mask_layer.get_visible():
+            rect = self.overlay.session.screen_rect
+            w = rect.width if rect else self.overlay.get_allocated_width()
+            h = rect.height if rect else self.overlay.get_allocated_height()
+            base_region.union(cairo.RectangleInt(0, 0, w, h))
+            g_x, g_y = self.overlay.coord_manager.map_point(0, 0, source=CoordSys.WINDOW, target=CoordSys.GLOBAL)
+            base_rects.append((g_x, g_y, w, h))
+        else:
+            for item in self.active_widgets:
+                widget = item['widget']
+                if widget.get_visible() and widget.get_window():
+                    alloc = widget.get_allocation()
+                    x, y = self.get_widget_position(widget)
+                    base_region.union(cairo.RectangleInt(x, y, alloc.width, alloc.height))
+                    g_x, g_y = self.overlay.coord_manager.map_point(x, y, source=CoordSys.WINDOW, target=CoordSys.GLOBAL)
+                    base_rects.append((g_x, g_y, alloc.width, alloc.height))
+        return base_region, base_rects
+
+    def sync_wm_shape(self, cairo_region):
+        if IS_WAYLAND or not self.overlay.get_window():
+            return
+        try:
+            if self._xlib_disp is None:
+                self._xlib_disp = display.Display()
+            if not self._xlib_disp.has_extension('SHAPE'):
+                return
+            win_id = self.overlay.get_window().get_xid()
+            win_obj = self._xlib_disp.create_resource_object('window', win_id)
+            root = self._xlib_disp.screen().root
+            current = win_obj
+            wm_parents = []
+            while True:
+                tree = current.query_tree()
+                if tree.parent == root or tree.parent == X.NONE:
+                    break
+                wm_parents.append(tree.parent)
+                current = tree.parent
+            for parent in wm_parents:
+                geom = parent.translate_coords(win_obj, 0, 0)
+                dx, dy = geom.x, geom.y
+                offset_rects = []
+                for i in range(cairo_region.num_rectangles()):
+                    rect = cairo_region.get_rectangle(i)
+                    offset_rects.append((rect.x + dx, rect.y + dy, rect.width, rect.height))
+                parent.shape_rectangles(shape.SO.Set, shape.SK.Input, X.Unsorted, 0, 0, offset_rects,)
+            self._xlib_disp.sync()
+        except Exception as e:
+            logging.warning(f"同步 WM 穿透形状失败: {e}")
+
+    def dispatch_dialog_key(self, response_id):
+        widget = self.blocking_widget
+        if not widget: return False
+        if time.time() - getattr(widget, 'show_timestamp', 0) < 0.2:
+            return False
+        widget.emit('response', response_id)
+        return False
+
+    def cleanup(self):
+        if self._xlib_disp:
+            try: self._xlib_disp.close()
+            except: pass
+            self._xlib_disp = None
+
+class CaptureOverlay(Gtk.Window):
+    def __init__(self, config_obj: Config, frame_grabber: FrameGrabber, log_queue: queue.Queue):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        global GLOBAL_OVERLAY
+        GLOBAL_OVERLAY = self
+        self.overlay_container = Gtk.Overlay()
+        self.add(self.overlay_container)
+        self.canvas = Gtk.DrawingArea()
+        self.canvas.connect("draw", self.on_draw)
+        self.overlay_container.add(self.canvas)
+        self.overlay_container.show_all()
+        self.cached_blocking_rects = [] # 全局坐标
+        self.rects_lock = threading.Lock()
+        self.session = CaptureSession()
+        self.session.connect('state-changed', self._on_session_state_changed)
+        self.session.connect('mode-changed', self._on_session_mode_changed)
+        self.session.connect('geometry-changed', self._on_session_geometry_changed)
+        self.session.connect('static-bars-changed', lambda s: self.canvas.queue_draw())
+        self.session.connect('grid-config-changed', lambda s: self._update_info_display())
+        self.session.connect('screen-config-changed', lambda s: (self.update_layout(), self.canvas.queue_draw()))
+        self.session.push_context(Context.BASE)
+        self.frame_grabber = frame_grabber
+        self.controller = ActionController(self.session, self, config_obj, frame_grabber)
+        self.log_queue = log_queue
+        # 窗口坐标
+        self.start_pos = None
+        self.current_pos = None
+        self.resize_edge = None
+        self.drag_start_pos = None
+        self.drag_start_geometry = None
+        self.coord_manager = CoordinateManager(self.session, self, frame_grabber)
+        self.stitch_model = self.controller.stitch_model
+        self.stitch_model.connect('model-updated', self.on_model_updated_ui)
+        self.show_side_panel = True
+        self.show_button_panel = True
+        self.side_panel_on_left = True
+        self.preview_panel = None
+        self.config_panel = None
+        self.instruction_panel = None
+        self.user_wants_instruction_panel = config_obj.SHOW_INSTRUCTION_PANEL_ON_START
+        self._pending_mod_action = None
+        self.last_hotkey_trigger_time = 0
+        self._setup_window()
+        self.css_providers = {}
+        self.apply_global_styles()
+        self.overlay_manager = OverlayManager(self)
+        self._initialize_cursors()
+        self._connect_events()
+        self.create_panels()
+        self._setup_config_handlers()
+        config_obj.connect('setting-changed', self._on_config_changed)
+        logging.info(f"覆盖层已创建")
+
+    def _setup_window(self):
+        self.set_app_paintable(True)
+        visual = self.get_screen().get_rgba_visual()
+        if visual and self.get_screen().is_composited():
+            self.set_visual(visual)
+        else:
+            logging.warning("无法设置 RGBA visual，透明度可能无法工作")
+        if IS_WAYLAND:
+            logging.info("正在检查 GtkLayerShell 支持...")
+            layer_shell_supported = True
+            if not GTK_LAYER_SHELL_AVAILABLE:
+                logging.warning("未找到 'gtk-layer-shell' 库")
+                layer_shell_supported = False
+            elif not GtkLayerShell.is_supported():
+                logging.warning("当前的 Wayland 合成器不支持 'wlr-layer-shell' 协议")
+                layer_shell_supported = False
+            if not layer_shell_supported:
+                self.set_decorated(False)
+                empty_titlebar = Gtk.Fixed()
+                self.set_titlebar(empty_titlebar)
+                send_notification("窗口未置顶", "需手动置顶", "warning")
+            else:
+                logging.debug("Wayland: 正在应用 GtkLayerShell 属性...")
+                GtkLayerShell.init_for_window(self)
+                GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+                GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.TOP, True)
+                GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.BOTTOM, True)
+                GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.LEFT, True)
+                GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.RIGHT, True)
+                GtkLayerShell.set_namespace(self, "scroll_stitch_overlay")
+                protocol_version = GtkLayerShell.get_protocol_version()
+                logging.debug(f"GtkLayerShell 协议版本: {protocol_version}")
+                if protocol_version >= 4:
+                    GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.ON_DEMAND)
+                else:
+                    logging.warning(f"Wayland 协议版本 {protocol_version} < 4，回退到独占键盘模式")
+                    GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+        else:
+            self.set_decorated(False)
+            self.set_keep_above(True)
+            self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+            self.set_skip_taskbar_hint(True)
+            self.set_skip_pager_hint(True)
+
+    def _on_session_geometry_changed(self, session, new_geometry):
+        self.update_layout()
+        self.canvas.queue_draw()
+
+    def _on_session_state_changed(self, session, key, value):
+        if key == 'is_selection_done' and value is True:
+            self.update_layout()
+            self._update_info_display()
+            self.session.pop_context(Context.SELECTING)
+            GLib.timeout_add(100, self.update_layout)
+            if IS_WAYLAND:
+                self._trigger_wayland_layout_refresh(remaining_retries=2)
+        elif key == 'is_exiting' and value is True:
+            self.session.clear_context()
+        elif key == 'is_finished' and value is True:
+            self.session.pop_context(Context.BASE)
+            self.enter_notification_mode()
+
+    def _on_session_mode_changed(self, session, mode_str):
+        self._update_info_display()
+        mode = CaptureMode(mode_str)
+        is_auto = (mode == CaptureMode.AUTO)
+        if self.show_button_panel and self.button_panel:
+            self.button_panel.update_button_state(mode)
+            if not is_auto:
+                can_undo = self.stitch_model.capture_count > 0
+                self.button_panel.set_undo_sensitive(can_undo)
+        if self.side_panel:
+            self.side_panel.function_panel.update_button_state(mode)
+        self.update_layout()
+
+    def _setup_config_handlers(self):
+        self.config_handler_map = {
+            'border_color': self.canvas.queue_draw,
+            'static_bar_color': self.canvas.queue_draw,
+            'border_width': lambda: (self.update_layout(), self.canvas.queue_draw()),
+            'enable_side_panel': lambda: (self.update_layout(), self._update_info_display()),
+            'enable_buttons': self.update_layout,
+            'side_panel_width': self._refresh_panels_and_layout,
+            'button_panel_width': self._refresh_panels_and_layout,
+            'enable_grid_action_buttons': lambda: (self.button_panel.update_button_state(self.session.current_mode), self.update_layout()),
+            'enable_auto_scroll_buttons': lambda: (self.button_panel.update_button_state(self.session.current_mode), self.update_layout()),
+            'show_capture_count': lambda: (self._update_info_display(), self.update_layout()),
+            'show_total_dimensions': lambda: (self._update_info_display(), self.update_layout()),
+            'show_current_mode': lambda: (self._update_info_display(), self.update_layout()),
+            'capture_count_format': lambda: (self._update_info_display(), self.update_layout())
+        }
+
+    def _refresh_panels_and_layout(self):
+        if self.side_panel:
+            self.side_panel.info_panel.set_size_request(config.SIDE_PANEL_WIDTH, -1)
+            self.side_panel.function_panel.set_size_request(config.SIDE_PANEL_WIDTH, -1)
+        if self.button_panel:
+            self.button_panel.set_size_request(config.BUTTON_PANEL_WIDTH, -1)
+        self.update_layout()
+
+    def reload_hotkeys(self):
+        global hotkey_manager
+        if hotkey_manager:
+            hotkey_manager.rebuild_listener()
+        if self.instruction_panel:
+            self.instruction_panel.reload_keys()
+            self.update_layout()
+
+    def _on_config_changed(self, config_obj, section, key, value):
+        if key.endswith('_css'):
+            logging.debug(f"检测到 CSS 配置 {key} 变更，正在重新应用样式...")
+            self.apply_global_styles()
+            self.queue_draw()
+            if self.preview_panel and self.preview_panel.get_visible():
+                self.preview_panel.drawing_area.queue_draw()
+            if key == 'config_panel_css' and self.config_panel:
+                self.config_panel.create_log_tags()
+                self.config_panel.redisplay_logs()
+            return
+        if section == 'Hotkeys':
+            logging.debug(f"检测到热键 {key} 变更，正在重载监听器...")
+            self.reload_hotkeys()
+            return
+        if section == 'ApplicationScrollUnits':
+            if self.session.current_mode == CaptureMode.GRID and self.session.grid_app_class == key:
+                if value is not None:
+                    unit, enabled = config.parse_string_to_value('ApplicationScrollUnits', key, value)
+                    self.session.set_grid_config(key, unit, enabled)
+                    if not enabled:
+                        self.controller.grid_mode_controller.snap_current_height()
+                else:
+                    self.session.set_grid_config(None, 0, False)
+                    self.session.set_mode(CaptureMode.FREE)
+                    GLib.idle_add(send_notification, "整格模式已关闭", f"'{key}' 滚动配置被移除，已恢复自由模式", "normal")
+            return
+        handler = self.config_handler_map.get(key)
+        if handler:
+            GLib.idle_add(handler)
+
+    def on_global_focus_changed(self, window, widget):
+        if widget:
+            managed_widgets = [item['widget'] for item in self.overlay_manager.active_widgets]
+            current = widget
+            while current:
+                if current in managed_widgets:
+                    self.overlay_manager.bring_to_front(current)
+                    break
+                current = current.get_parent()
+        global hotkey_manager
+        if not hotkey_manager or not hotkey_manager.are_hotkeys_enabled:
+            return
+        if self.config_panel and getattr(self.config_panel, 'capturing_hotkey_button', None):
+            hotkey_manager.set_paused(True)
+            return
+        input_types = (Gtk.Editable, Gtk.TextView)
+        is_input_widget = isinstance(widget, input_types) if widget else False
+        if is_input_widget:
+            hotkey_manager.set_paused(True)
+            logging.debug(f"输入控件 {type(widget).__name__} 获得焦点，暂停热键")
+            if self.config_panel and self.config_panel.get_visible():
+                self.config_panel.update_status_focus(True)
+        else:
+            hotkey_manager.set_paused(False)
+            if self.config_panel and self.config_panel.get_visible():
+                self.config_panel.update_status_focus(False)
+
+    def _initialize_cursors(self):
+        display = self.get_display()
+        cursor_names = [
+            'default', 'n-resize', 's-resize', 'w-resize', 'e-resize',
+            'nw-resize', 'se-resize', 'ne-resize', 'sw-resize', 'ns-resize',
+            'grab', 'grabbing', "crosshair"
+        ]
+        self.cursors = {}
+        try:
+            default_cursor = Gdk.Cursor.new_from_name(display, 'default')
+        except TypeError:
+            default_cursor = None
+        for name in cursor_names:
+            try:
+                cursor = Gdk.Cursor.new_from_name(display, name)
+            except TypeError:
+                logging.warning(f"无法加载光标 '{name}'，使用默认光标替代")
+                cursor = default_cursor
+            self.cursors[name] = cursor
+
+    def enter_notification_mode(self):
+        """仅显示通知：隐藏所有面板，停止绘制选框"""
+        logging.info("进入通知驻留模式")
+        self.side_panel.hide()
+        self.button_panel.hide()
+        self.instruction_panel.hide()
+        self.overlay_manager.mask_layer.hide()
+        if self.preview_panel: self.preview_panel.hide()
+        if self.config_panel: self.config_panel.hide()
+        self.canvas.queue_draw()
+        GLib.idle_add(self.update_input_shape)
+
+    def _connect_events(self):
+        self.connect("map-event", self.on_map_event)
+        self.connect("set-focus", self.on_global_focus_changed)
+        self.connect("size-allocate", lambda w, a: self.update_input_shape())
+        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK |
+                        Gdk.EventMask.BUTTON_RELEASE_MASK |
+                        Gdk.EventMask.POINTER_MOTION_MASK)
+        self.connect("button-press-event", self.on_button_press)
+        self.connect("button-release-event", self.on_button_release)
+        self.connect("motion-notify-event", self.on_motion_notify)
+        self.connect("key-press-event", self.on_key_press_event)
+        self.connect("key-release-event", self.on_key_release_event)
+        self.connect("destroy", Gtk.main_quit)
+
+    def apply_global_styles(self):
+        screen = Gdk.Screen.get_default()
+        priority = Gtk.STYLE_PROVIDER_PRIORITY_USER
+        def load_css(css_data, name):
+            if not css_data:
+                return
+            try:
+                provider = Gtk.CssProvider()
+                provider.load_from_data(css_data.encode('utf-8'))
+                if name in self.css_providers:
+                    Gtk.StyleContext.remove_provider_for_screen(screen, self.css_providers[name])
+                Gtk.StyleContext.add_provider_for_screen(screen, provider, priority)
+                self.css_providers[name] = provider
+            except Exception as e:
+                logging.warning(f"{name} CSS 语法错误，保持原样式: {e}")
+        load_css(config.INFO_PANEL_CSS, "Info Panel")
+        load_css(config.BUTTON_CSS, "Button Style")
+        load_css(config.INSTRUCTION_PANEL_CSS, "Instruction Panel")
+        load_css(config.SIMULATED_WINDOW_CSS, "Simulated Window")
+        load_css(config.PREVIEW_PANEL_CSS, "Preview Panel")
+        load_css(config.CONFIG_PANEL_CSS, "Config Panel")
+        load_css(config.NOTIFICATION_CSS, "Notification")
+        load_css(config.MASK_CSS, "Mask")
+        load_css(config.DIALOG_CSS, "Dialog")
+        load_css(config.FEEDBACK_WIDGET_CSS, "Feedback Widget")
+        no_padding_css = """
+        .no-padding { padding: 0px; }
+        """.strip()
+        load_css(no_padding_css, "No Padding Style")
+        logging.debug("已应用所有全局 CSS 样式")
+
+    def on_key_press_event(self, widget, event):
+        if self.config_panel and self.config_panel.get_visible():
+            if self.config_panel.on_key_press(widget, event):
+                return True
+        if isinstance(self.get_focus(), (Gtk.Editable, Gtk.TextView)):
+            self._pending_mod_action = None
+            return False
+        if self._pending_mod_action:
+            waiting_keyval, _ = self._pending_mod_action
+            if event.keyval != waiting_keyval:
+                self._pending_mod_action = None
+        incoming_hotkey = HotkeyDefinition.from_gdk_event(event)
+        global hotkey_manager
+        if not hotkey_manager:
+            return False
+        if hotkey_manager.is_listening:
+            return False
+        action = hotkey_manager.get_active_action(incoming_hotkey)
+        if action:
+            if incoming_hotkey.is_modifier_only():
+                self._pending_mod_action = (event.keyval, action)
+            else:
+                current_time = time.time()
+                if current_time - self.last_hotkey_trigger_time >= config.HOTKEY_DEBOUNCE_TIME:
+                    self.last_hotkey_trigger_time = current_time
+                    action()
+                self._pending_mod_action = None
+            return True
+        return False
+
+    def on_key_release_event(self, widget, event):
+        if self.config_panel and self.config_panel.get_visible():
+            if self.config_panel.handle_key_release(widget, event):
+                return True
+        if self._pending_mod_action:
+            waiting_keyval, action = self._pending_mod_action
+            if event.keyval == waiting_keyval:
+                self.last_hotkey_trigger_time = time.time()
+                action()
+                return True
+            self._pending_mod_action = None
+        return False
+
+    def on_map_event(self, widget, event):
+        if self.session.screen_rect is None:
+            screen_rect, scale = self.coord_manager.initialize_screen_config()
+            rect_w, rect_h = screen_rect.width, screen_rect.height
+            self.controller.scroll_manager.init_devices(screen_rect, scale)
+            self.session.push_context(Context.SELECTING)
+            if not self.session.is_selection_done:
+                self.resize(rect_w, rect_h)
+                self.canvas.set_size_request(rect_w, rect_h)
+                if not IS_WAYLAND:
+                    self.move(screen_rect.x, screen_rect.y) # 全局坐标
+        if not self.session.is_selection_done:
+            self.update_layout()
+            def _set_cursor_delayed():
+                if self.get_window():
+                    self.get_window().set_cursor(self.cursors["crosshair"])
+                return False
+            GLib.timeout_add(250, _set_cursor_delayed)
+            if not self.coord_manager.is_calibration_done:
+                self.coord_manager.calibrate_offsets()
+
     def on_model_updated_ui(self, model_instance):
-        """模型更新时刷新界面元素 (连接到 StitchModel 的信号)"""
-        if self.is_selection_done:
-            self.controller.update_info_panel()
+        if self.session.is_selection_done:
+            self._update_info_display()
             can_undo = model_instance.capture_count > 0 and not self.controller.is_auto_scrolling
             if self.show_button_panel:
                 self.button_panel.set_undo_sensitive(can_undo)
-            self.queue_draw()
+            self.canvas.queue_draw()
+
+    def _update_info_display(self):
+        if self.show_side_panel and self.side_panel:
+            mode_str = self.session.current_mode.value
+            if self.session.current_mode == CaptureMode.GRID and self.session.grid_app_class:
+                app_name = GLib.markup_escape_text(self.session.grid_app_class)
+                mode_str += f"\n<span size='smaller'>({app_name})</span>"
+            self.side_panel.info_panel.update_info(
+                count=self.stitch_model.capture_count,
+                width=self.stitch_model.image_width,
+                height=self.stitch_model.total_virtual_height,
+                mode_str=mode_str
+            )
 
     # 窗口坐标 {
-    def _position_and_show_preview(self):
-        """计算预览面板的位置并显示它"""
+    def _calculate_preview_position(self):
         # 逻辑px
-        if not self.preview_panel: return
-        rect = self.screen_rect
-        screen_w = rect.width if rect else self.get_allocated_width()
-        screen_h = rect.height if rect else self.get_allocated_height()
+        if not self.preview_panel: return (0, 0)
+        valid_screen_w, valid_screen_h = self.coord_manager.get_valid_screen_size()
         preview_w, preview_h = self.preview_panel.get_size_request()
         sel_geo = self.session.geometry
         sel_x, sel_y = sel_geo['x'], sel_geo['y']
@@ -7028,9 +7663,6 @@ class CaptureOverlay(Gtk.Window):
         if right_panel_w > 0:
             cluster_right_x += (right_panel_w + border)
         space_left = cluster_left_x - spacing
-        # 显示器坐标 -> 窗口坐标
-        valid_screen_w = screen_w - self.monitor_offset_x
-        valid_screen_h = screen_h - self.monitor_offset_y
         space_right = valid_screen_w - cluster_right_x - spacing
         can_place_right = space_right >= preview_w
         can_place_left = space_left >= preview_w
@@ -7045,85 +7677,7 @@ class CaptureOverlay(Gtk.Window):
             target_y -= overflow
         if target_x < 0: target_x = 0
         if target_x + preview_w > valid_screen_w: target_x = valid_screen_w - preview_w
-        self.fixed_container.move(self.preview_panel, target_x, target_y)
-        self.preview_panel.show()
-        self._update_input_shape()
-        self.preview_panel.user_has_moved = False
-        return False
-
-    def show_quit_confirmation_dialog(self):
-        """显示退出确认对话框并返回用户的响应"""
-        if self.is_dialog_open:
-            logging.debug("退出对话框已打开，忽略重复请求")
-            return Gtk.ResponseType.NONE
-        GLib.idle_add(self.present)
-        self.is_dialog_open = True
-        global hotkey_listener
-        if hotkey_listener:
-            logging.debug("打开退出对话框，进入 Dialog 快捷键模式")
-            hotkey_listener.set_dialog_mode(True)
-        if self.screen_rect:
-            target_w, target_h = self.screen_rect.width, self.screen_rect.height
-        else:
-            target_w, target_h = self.get_size()
-        self.resize(target_w, target_h)
-        dialog_container = Gtk.EventBox()
-        dialog_container.set_visible_window(False)
-        dialog_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
-        dialog_panel.get_style_context().add_class("embedded-dialog")
-        lbl_title = Gtk.Label(label=config.DIALOG_QUIT_TITLE)
-        lbl_title.get_style_context().add_class("dialog-title")
-        dialog_panel.pack_start(lbl_title, False, False, 0)
-        msg = config.DIALOG_QUIT_MESSAGE.format(count=self.stitch_model.capture_count)
-        lbl_msg = Gtk.Label(label=msg)
-        lbl_msg.get_style_context().add_class("dialog-message")
-        dialog_panel.pack_start(lbl_msg, False, False, 0)
-        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
-        btn_box.set_halign(Gtk.Align.CENTER)
-        yes_label = config.DIALOG_QUIT_BTN_YES.format(key=config.str_dialog_confirm.upper())
-        no_label = config.DIALOG_QUIT_BTN_NO.format(key=config.str_dialog_cancel.upper())
-        btn_yes = Gtk.Button(label=yes_label)
-        btn_yes.get_style_context().add_class("dialog-btn")
-        btn_yes.get_style_context().add_class("force-active-style")
-        btn_no = Gtk.Button(label=no_label)
-        btn_no.get_style_context().add_class("dialog-btn")
-        btn_no.get_style_context().add_class("force-active-style")
-        btn_box.pack_start(btn_yes, False, False, 0)
-        btn_box.pack_start(btn_no, False, False, 0)
-        dialog_panel.pack_start(btn_box, False, False, 0)
-        dialog_container.add(dialog_panel)
-        self.overlay_mask.set_size_request(target_w, target_h)
-        self.overlay_mask.show()
-        geo = self.session.geometry
-        dialog_container.show_all()
-        _, nat_size = dialog_container.get_preferred_size()
-        d_w, d_h = nat_size.width, nat_size.height
-        center_x = geo['x'] + geo['w'] // 2 - d_w // 2
-        center_y = geo['y'] + geo['h'] // 2 - d_h // 2
-        self.fixed_container.put(dialog_container, center_x, center_y)
-        self._dialog_response = Gtk.ResponseType.NONE
-        self._dialog_open_time = time.time()
-        nested_loop = GLib.MainLoop()
-        def on_yes(b):
-            self._dialog_response = Gtk.ResponseType.YES
-            nested_loop.quit()
-        def on_no(b):
-            self._dialog_response = Gtk.ResponseType.NO
-            nested_loop.quit()
-        btn_yes.connect("clicked", on_yes)
-        btn_no.connect("clicked", on_no)
-        self._current_dialog_loop = nested_loop
-        self._current_dialog_setter = lambda r: setattr(self, '_dialog_response', r)
-        nested_loop.run()
-        self._current_dialog_loop = None
-        self._current_dialog_setter = None
-        dialog_container.destroy()
-        self.overlay_mask.hide()
-        self.is_dialog_open = False
-        if hotkey_listener:
-            logging.debug("关闭退出对话框，退出 Dialog 快捷键模式")
-            hotkey_listener.set_dialog_mode(False)
-        return self._dialog_response
+        return (int(target_x), int(target_y))
 
     def toggle_instruction_panel(self):
         self.user_wants_instruction_panel = not self.user_wants_instruction_panel
@@ -7133,12 +7687,14 @@ class CaptureOverlay(Gtk.Window):
 
     def create_panels(self):
         self.side_panel = SidePanel()
-        self.fixed_container.put(self.side_panel, 0, 0)
+        self.overlay_manager.add_managed_widget(self.side_panel, OverlayManager.LAYER_BASE)
         self.side_panel.connect("toggle-grid-mode-clicked", lambda w: self.controller.grid_mode_controller.toggle())
         self.side_panel.connect("toggle-preview-clicked", lambda w: self.toggle_preview_panel())
         self.side_panel.connect("open-config-clicked", lambda w: self.toggle_config_panel())
-        self.side_panel.connect("toggle-hotkeys-clicked", lambda w: toggle_all_hotkeys())
+        self.side_panel.connect("toggle-hotkeys-clicked", lambda w: hotkey_manager.toggle_hotkeys() if hotkey_manager else None)
+        self.side_panel.hide()
         self.button_panel = ButtonPanel()
+        self.overlay_manager.add_managed_widget(self.button_panel, OverlayManager.LAYER_BASE)
         self.button_panel.connect("grid-backward-clicked", lambda w: self.controller.handle_movement_action('up', source='button'))
         self.button_panel.connect("grid-forward-clicked", lambda w: self.controller.handle_movement_action('down', source='button'))
         self.button_panel.connect("auto-scroll-start-clicked", lambda w: self.controller.start_auto_scroll(widget=w, source='button'))
@@ -7147,124 +7703,56 @@ class CaptureOverlay(Gtk.Window):
         self.button_panel.connect("undo-clicked", self.controller.delete_last_capture)
         self.button_panel.connect("finalize-clicked", self.controller.finalize_and_quit)
         self.button_panel.connect("cancel-clicked", self.controller.quit_and_cleanup)
-        self.fixed_container.put(self.button_panel, 0, 0)
+        self.button_panel.hide()
         self.instruction_panel = InstructionPanel()
-        self.fixed_container.put(self.instruction_panel, 0, 0)
-        _, nat_size = self.instruction_panel.get_preferred_size()
-        self._instr_panel_natural_w, self._instr_panel_natural_h = nat_size.width, nat_size.height
-        logging.debug(f"缓存的 InstructionPanel 自然高度: {self._instr_panel_natural_h} 逻辑px")
-        self.instruction_panel.connect("size-allocate", lambda w, a: self._update_input_shape())
+        self.overlay_manager.add_managed_widget(self.instruction_panel, OverlayManager.LAYER_BASE)
         self.instruction_panel.hide()
         self.preview_panel = PreviewPanel(self.controller.stitch_model, config, self)
-        self.fixed_container.put(self.preview_panel, 0, 0)
+        self.overlay_manager.add_managed_widget(self.preview_panel, OverlayManager.LAYER_MEDIUM)
         self.preview_panel.hide()
-        self.config_panel = ConfigPanel(config, self)
-        self.fixed_container.put(self.config_panel, 0, 0)
-        self.fixed_container.put(self.config_panel.file_chooser_panel, 0, 0)
-        self.fixed_container.put(self.config_panel.color_chooser_panel, 0, 0)
+        self.config_panel = ConfigPanel(config, self, self.log_queue)
+        self.overlay_manager.add_managed_widget(self.config_panel, OverlayManager.LAYER_MEDIUM)
+        self.overlay_manager.add_managed_widget(self.config_panel.file_chooser_panel, OverlayManager.LAYER_MEDIUM_UP)
+        self.overlay_manager.add_managed_widget(self.config_panel.color_chooser_panel, OverlayManager.LAYER_MEDIUM_UP)
         self.config_panel.hide()
 
     def toggle_config_panel(self):
-        """切换配置面板的可见性"""
         if not self.config_panel: return
         if self.config_panel.get_visible():
             logging.debug("隐藏配置面板")
             self.config_panel.hide()
-            self._update_input_shape()
         else:
             logging.debug("显示配置面板")
-            if not self.config_panel.user_has_moved:
-                if self.screen_rect:
-                    screen_w, screen_h = self.screen_rect.width, self.screen_rect.height
-                else:
-                    screen_w, screen_h = self.get_allocated_width(), self.get_allocated_height()
-                # 显示器坐标 -> 窗口坐标
-                valid_w = screen_w - self.monitor_offset_x
-                valid_h = screen_h - self.monitor_offset_y
-                req_w, req_h = self.config_panel.get_size_request()
-                x = (valid_w - req_w) // 2
-                y = (valid_h - req_h) // 2
-                self.fixed_container.move(self.config_panel, max(0, x), max(0, y))
-            self.config_panel.show()
-            self.config_panel.ensure_z_order()
-            self._update_input_shape()
+            anchor = 'center' if not self.config_panel.user_has_moved else None
+            self.overlay_manager.show(self.config_panel, anchor=anchor, layer=OverlayManager.LAYER_MEDIUM)
 
     def toggle_preview_panel(self):
-        """创建或切换预览面板的可见性"""
-        if self.preview_panel is None:
-            logging.error("PreviewPanel 尚未初始化")
-            return
+        if not self.preview_panel: return
         if self.preview_panel.get_visible():
             logging.debug("隐藏预览面板")
             self.preview_panel.hide()
-            self._update_input_shape()
         else:
             logging.debug("显示预览面板")
-            if not self.preview_panel.user_has_moved:
-                self._position_and_show_preview()
-            else:
-                self.preview_panel.show()
-                self._update_input_shape()
-            if self.config_panel and self.config_panel.get_visible():
-                self.config_panel.ensure_z_order()
-
-    def on_dialog_key_press(self, widget, event):
-        """处理确认对话框的按键事件"""
-        if not self.is_dialog_open or not getattr(self, '_current_dialog_loop', None):
-             return False
-        if time.time() - getattr(self, '_dialog_open_time', 0) < 0.2:
-            return False
-        keyval = event.keyval
-        state = event.state & config.GTK_MODIFIER_MASK
-        def is_match(hotkey_config):
-            return keyval in hotkey_config['gtk_keys'] and state == hotkey_config['gtk_mask']
-        if is_match(config.HOTKEY_DIALOG_CONFIRM):
-            self._current_dialog_setter(Gtk.ResponseType.YES)
-            self._current_dialog_loop.quit()
-            return True
-        elif is_match(config.HOTKEY_DIALOG_CANCEL):
-            self._current_dialog_setter(Gtk.ResponseType.NO)
-            self._current_dialog_loop.quit()
-            return True
-        return False
-
-    def _show_processing_panel(self):
-        if self.screen_rect:
-            target_w, target_h = self.screen_rect.width, self.screen_rect.height
-        else:
-            target_w, target_h = self.get_size()
-        self.resize(target_w, target_h)
-        self.overlay_mask.set_size_request(target_w, target_h)
-        self.fixed_container.move(self.overlay_mask, 0, 0)
-        self.overlay_mask.show()
-        panel, progress_bar = create_feedback_panel(text=config.STR_PROCESSING_TEXT, show_progress_bar=True)
-        capture_center_x = self.session.geometry['x'] + self.session.geometry['w'] // 2
-        capture_center_y = self.session.geometry['y'] + self.session.geometry['h'] // 2
-        p_w = config.PROCESSING_DIALOG_WIDTH
-        p_h = config.PROCESSING_DIALOG_HEIGHT
-        x = capture_center_x - p_w // 2
-        y = capture_center_y - p_h // 2
-        self.fixed_container.put(panel, x, y)
-        return panel, progress_bar
+            anchor = self._calculate_preview_position() if not self.preview_panel.user_has_moved else None
+            self.overlay_manager.show(self.preview_panel, anchor=anchor, layer=OverlayManager.LAYER_MEDIUM)
 
     def on_draw(self, widget, cr):
-        if self.is_finished:
+        if self.session.is_finished:
             cr.set_source_rgba(0, 0, 0, 0)
             cr.set_operator(cairo.OPERATOR_SOURCE)
             cr.paint()
             return False
-        if not self.is_selection_done:
+        if not self.session.is_selection_done:
             cr.set_source_rgba(0.0, 0.0, 0.0, 0.4)
-            if self.screen_rect:
-                cr.rectangle(0, 0, self.screen_rect.width, self.screen_rect.height)
+            rect = self.session.screen_rect
+            if rect:
+                cr.rectangle(0, 0, rect.width, rect.height)
                 cr.fill()
             else:
                 cr.paint()
-            if self.is_dragging_selection:
-                x1 = self.start_x_rel
-                y1 = self.start_y_rel
-                x2 = self.current_x_rel
-                y2 = self.current_y_rel
+            if self.start_pos is not None and self.current_pos is not None:
+                x1, y1 = self.start_pos
+                x2, y2 = self.current_pos
                 x = min(x1, x2)
                 y = min(y1, y2)
                 w = abs(x1 - x2)
@@ -7283,193 +7771,140 @@ class CaptureOverlay(Gtk.Window):
         cr.set_operator(cairo.OPERATOR_SOURCE)
         cr.paint()
         cr.set_operator(cairo.OPERATOR_OVER)
-        main_r, main_g, main_b, main_a = config.BORDER_COLOR
-        ind_r, ind_g, ind_b, ind_a = config.MATCHING_INDICATOR_COLOR
         border_width = config.BORDER_WIDTH
         cr.set_line_width(border_width)
-        selection_x_rel = self.session.geometry['x']
-        selection_y_rel = self.session.geometry['y']
-        border_x_rel = selection_x_rel - config.BORDER_WIDTH
-        border_y_rel = selection_y_rel - config.BORDER_WIDTH
-        capture_h = self.session.geometry['h']
-        capture_w = self.session.geometry['w']
+        border_x_rel = self.session.geometry['x'] - config.BORDER_WIDTH
+        border_y_rel = self.session.geometry['y'] - config.BORDER_WIDTH
         rect_x = border_x_rel + border_width / 2
         rect_y = border_y_rel + border_width / 2
-        rect_w = capture_w + border_width
-        rect_h = capture_h + border_width
-        is_grid_mode_matching = self.session.is_matching_enabled and self.session.detected_app_class is not None
-        is_free_scroll_matching = self.session.detected_app_class is None and config.ENABLE_FREE_SCROLL_MATCHING
-        draw_indicator = use_matching = is_grid_mode_matching or is_free_scroll_matching
-        if not draw_indicator:
-            cr.set_source_rgba(main_r, main_g, main_b, main_a)
-            cr.rectangle(rect_x, rect_y, rect_w, rect_h)
-            cr.stroke()
-            return
-        scale = self.scale
-        if is_grid_mode_matching:
-            overlap_height_buf = config.GRID_MATCHING_MAX_OVERLAP # 缓冲区px
-        else:
-            overlap_height_buf = config.FREE_SCROLL_MATCHING_MAX_OVERLAP # 缓冲区px
-        overlap_height_logical = int(overlap_height_buf / scale) # 缓冲区px -> 逻辑px
-        effective_overlap_h = min(overlap_height_logical, capture_h / 2)
-        cr.set_source_rgba(main_r, main_g, main_b, main_a)
-        cr.move_to(rect_x - border_width/2, rect_y)
-        cr.line_to(rect_x + rect_w + border_width/2, rect_y)
+        rect_w = self.session.geometry['w'] + border_width
+        rect_h = self.session.geometry['h'] + border_width
+        cr.set_source_rgba(*config.BORDER_COLOR)
+        cr.rectangle(rect_x, rect_y, rect_w, rect_h)
         cr.stroke()
-        cr.move_to(rect_x - border_width/2, rect_y + rect_h)
-        cr.line_to(rect_x + rect_w + border_width/2, rect_y + rect_h)
-        cr.stroke()
-        y_vertical_start = border_y_rel + border_width
-        y_vertical_end = border_y_rel + border_width + capture_h
-        y_top_end = y_vertical_start + effective_overlap_h
-        y_bottom_start = y_vertical_end - effective_overlap_h
-        if y_top_end > y_bottom_start:
-            y_top_end = y_bottom_start = y_vertical_start + (y_vertical_end - y_vertical_start) / 2
-        left_x = border_x_rel + border_width / 2
-        cr.set_source_rgba(ind_r, ind_g, ind_b, ind_a)
-        cr.move_to(left_x, y_vertical_start - border_width/2)
-        cr.line_to(left_x, y_top_end)
-        cr.stroke()
-        cr.set_source_rgba(main_r, main_g, main_b, main_a)
-        cr.move_to(left_x, y_top_end)
-        cr.line_to(left_x, y_bottom_start)
-        cr.stroke()
-        cr.set_source_rgba(ind_r, ind_g, ind_b, ind_a)
-        cr.move_to(left_x, y_bottom_start)
-        cr.line_to(left_x, y_vertical_end + border_width/2)
-        cr.stroke()
-        right_x = border_x_rel + capture_w + border_width + border_width / 2
-        cr.set_source_rgba(ind_r, ind_g, ind_b, ind_a)
-        cr.move_to(right_x, y_vertical_start - border_width/2)
-        cr.line_to(right_x, y_top_end)
-        cr.stroke()
-        cr.set_source_rgba(main_r, main_g, main_b, main_a)
-        cr.move_to(right_x, y_top_end)
-        cr.line_to(right_x, y_bottom_start)
-        cr.stroke()
-        cr.set_source_rgba(ind_r, ind_g, ind_b, ind_a)
-        cr.move_to(right_x, y_bottom_start)
-        cr.line_to(right_x, y_vertical_end + border_width/2)
-        cr.stroke()
-
-    def on_size_allocate(self, widget, allocation):
-        self._update_input_shape()
+        header_height, footer_height, left_width, right_width = self.session.static_bars
+        has_bars = any([header_height, footer_height, left_width, right_width])
+        if has_bars:
+            cr.set_source_rgba(*config.STATIC_BAR_COLOR)
+            if header_height > 0:
+                y_end = min(rect_y + rect_h, rect_y + header_height)
+                cr.move_to(rect_x, rect_y)
+                cr.line_to(rect_x, y_end)
+                cr.move_to(rect_x + rect_w, rect_y)
+                cr.line_to(rect_x + rect_w, y_end)
+                cr.stroke()
+            if footer_height > 0:
+                y_start = max(rect_y, rect_y + rect_h - footer_height)
+                cr.move_to(rect_x, rect_y + rect_h)
+                cr.line_to(rect_x, y_start)
+                cr.move_to(rect_x + rect_w, rect_y + rect_h)
+                cr.line_to(rect_x + rect_w, y_start)
+                cr.stroke()
+            if left_width > 0:
+                x_end = min(rect_x + rect_w, rect_x + left_width)
+                cr.move_to(rect_x, rect_y)
+                cr.line_to(x_end, rect_y)
+                cr.move_to(rect_x, rect_y + rect_h)
+                cr.line_to(x_end, rect_y + rect_h)
+                cr.stroke()
+            if right_width > 0:
+                x_start = max(rect_x, rect_x + rect_w - right_width)
+                cr.move_to(rect_x + rect_w, rect_y)
+                cr.line_to(x_start, rect_y)
+                cr.move_to(rect_x + rect_w, rect_y + rect_h)
+                cr.line_to(x_start, rect_y + rect_h)
+                cr.stroke()
 
     # 逻辑px {
-    def _update_input_shape(self):
-        if not self.get_window():
-            return
-        if self.screen_rect:
-            win_w, win_h = self.screen_rect.width, self.screen_rect.height
+    def is_point_in_ui(self, g_x, g_y):
+        # gx, gy: 全局坐标
+        with self.rects_lock:
+            for rx, ry, rw, rh in self.cached_blocking_rects:
+                if rx <= g_x < rx + rw and ry <= g_y < ry + rh:
+                    return True
+        return False
+
+    def update_input_shape(self):
+        if not self.get_window(): return
+        rect = self.session.screen_rect
+        if rect:
+            win_w, win_h = rect.width, rect.height
         else:
             win_w, win_h = self.get_size()
-        if self.is_finished:
-            notify_region = cairo.Region()
-            if self.current_notification_widget and self.current_notification_widget.get_visible():
-                alloc = self.current_notification_widget.get_allocation()
-                x = self.fixed_container.child_get_property(self.current_notification_widget, "x")
-                y = self.fixed_container.child_get_property(self.current_notification_widget, "y")
-                notify_region.union(cairo.RectangleInt(x, y, alloc.width, alloc.height))
-            self.get_window().input_shape_combine_region(notify_region, 0, 0)
-            return
-        if not self.is_selection_done:
+        if not self.session.is_selection_done:
             full_region = cairo.Region(cairo.RectangleInt(0, 0, win_w, win_h))
             self.get_window().input_shape_combine_region(full_region, 0, 0)
             return
         final_input_region = cairo.Region()
-        selection_x_rel = self.session.geometry.get('x', 0)
-        selection_y_rel = self.session.geometry.get('y', 0)
-        selection_w = self.session.geometry.get('w', 0)
-        selection_h = self.session.geometry.get('h', 0)
-        border_area_x_rel = selection_x_rel - config.BORDER_WIDTH
-        border_area_y_rel = selection_y_rel - config.BORDER_WIDTH
-        border_area_width = selection_w + 2 * config.BORDER_WIDTH
-        border_area_height = selection_h + 2 * config.BORDER_WIDTH
-        border_full_region = cairo.Region(
-            cairo.RectangleInt(border_area_x_rel, border_area_y_rel, border_area_width, border_area_height)
-        )
-        inner_transparent_region = cairo.Region(
-            cairo.RectangleInt(border_area_x_rel + config.BORDER_WIDTH, border_area_y_rel + config.BORDER_WIDTH, selection_w, selection_h)
-        )
-        border_full_region.subtract(inner_transparent_region)
-        final_input_region.union(border_full_region)
-        def _union_widget_region(widget):
-            if widget and widget.get_visible():
-                try:
-                    alloc = widget.get_allocation()
-                    if alloc.width > 0 and alloc.height > 0:
-                        x = self.fixed_container.child_get_property(widget, "x")
-                        y = self.fixed_container.child_get_property(widget, "y")
-                        reg = cairo.Region(cairo.RectangleInt(x, y, alloc.width, alloc.height))
-                        final_input_region.union(reg)
-                except TypeError:
-                    pass
-        widgets_to_process = [
-            self.side_panel if self.show_side_panel else None,
-            self.button_panel if self.show_button_panel else None,
-            self.instruction_panel,
-            self.preview_panel,
-            self.config_panel,
-            self.current_notification_widget
-        ]
-        if self.config_panel:
-            widgets_to_process.append(self.config_panel.file_chooser_panel)
-            widgets_to_process.append(self.config_panel.color_chooser_panel)
-        if self.controller.grid_mode_controller.calibration_state:
-            widgets_to_process.append(self.controller.grid_mode_controller.calibration_state.get("panel"))
-        for w in widgets_to_process:
-            _union_widget_region(w)
-        if hasattr(self, 'overlay_mask') and self.overlay_mask.get_visible():
-             mask_region = cairo.Region(cairo.RectangleInt(0, 0, win_w, win_h))
-             final_input_region.union(mask_region)
-        self.get_window().input_shape_combine_region(final_input_region, 0, 0)
+        new_blocking_rects = [] # 全局坐标
+        if not self.session.is_finished:
+            selection_x_rel = round(self.session.geometry.get('x', 0))
+            selection_y_rel = round(self.session.geometry.get('y', 0))
+            selection_w = round(self.session.geometry.get('w', 0))
+            selection_h = round(self.session.geometry.get('h', 0))
+            border_area_x_rel = selection_x_rel - config.BORDER_WIDTH
+            border_area_y_rel = selection_y_rel - config.BORDER_WIDTH
+            border_area_width = selection_w + 2 * config.BORDER_WIDTH
+            border_area_height = selection_h + 2 * config.BORDER_WIDTH
+            border_full_region = cairo.Region(cairo.RectangleInt(border_area_x_rel, border_area_y_rel, border_area_width, border_area_height))
+            inner_transparent_region = cairo.Region(cairo.RectangleInt(selection_x_rel, selection_y_rel, selection_w, selection_h))
+            border_full_region.subtract(inner_transparent_region)
+            final_input_region.union(border_full_region)
+        final_region, final_rects = self.overlay_manager.recalculate_input_shapes(final_input_region, new_blocking_rects)
+        self.get_window().input_shape_combine_region(final_region, 0, 0)
+        self.overlay_manager.sync_wm_shape(final_region)
+        with self.rects_lock:
+            self.cached_blocking_rects = final_rects
+        if IS_WAYLAND:
+            self._trigger_wayland_layout_refresh(remaining_retries=1)
 
     def get_cursor_edge(self, x, y):
-        rect = self.screen_rect
+        rect = self.session.screen_rect
         win_w = rect.width if rect else self.get_allocated_width()
         win_h = rect.height if rect else self.get_allocated_height()
-        handle_size = config.HANDLE_HEIGHT 
-        if not self.is_selection_done: return None
+        border_width = config.BORDER_WIDTH
+        if not self.session.is_selection_done: return None
+        selection_x_rel = self.session.geometry.get('x', 0)
         selection_y_rel = self.session.geometry.get('y', 0)
-        border_area_y_rel = selection_y_rel - config.BORDER_WIDTH
-        selection_h = self.session.geometry.get('h', 0)
-        on_top = border_area_y_rel <= y < border_area_y_rel + handle_size
-        on_bottom = border_area_y_rel + selection_h + 2 * config.BORDER_WIDTH - handle_size < y <= border_area_y_rel + selection_h + 2 * config.BORDER_WIDTH
-        edge_y = ''
-        if on_top: edge_y = 'top'
-        elif on_bottom: edge_y = 'bottom'
-        edge_x = ''
+        border_area_x_rel = selection_x_rel - border_width
+        border_area_y_rel = selection_y_rel - border_width
+        border_area_right_rel = selection_x_rel + self.session.geometry.get('w', 0) + border_width
+        border_area_bottom_rel = selection_y_rel + self.session.geometry.get('h', 0) + border_width
+        on_top = (border_area_y_rel <= y < selection_y_rel) and (border_area_x_rel <= x < border_area_right_rel)
+        on_bottom = (border_area_bottom_rel - border_width < y <= border_area_bottom_rel) and (border_area_x_rel <= x < border_area_right_rel)
+        edges = []
+        if on_top: edges.append('top')
+        elif on_bottom: edges.append('bottom')
         if not self.session.is_horizontally_locked:
-            selection_x_rel = self.session.geometry.get('x', 0)
-            border_area_x_rel = selection_x_rel - config.BORDER_WIDTH
-            selection_w = self.session.geometry.get('w', 0)
-            border_x_start = border_area_x_rel
-            border_x_end = border_x_start + selection_w + 2 * config.BORDER_WIDTH
-            on_left = border_x_start <= x < border_x_start + handle_size
-            on_right = border_x_end - handle_size < x <= border_x_end
-            if on_left: edge_x = 'left'
-            elif on_right: edge_x = 'right'
-        edge = edge_y + ('-' + edge_x if edge_x and edge_y else edge_x)
-        return edge if edge else None
+            on_left = (border_area_x_rel <= x < selection_x_rel) and (border_area_y_rel <= y < border_area_bottom_rel)
+            on_right = (border_area_right_rel - border_width < x <= border_area_right_rel) and (border_area_y_rel <= y < border_area_bottom_rel)
+            if on_left: edges.append('left')
+            elif on_right: edges.append('right')
+        result = '-'.join(edges)
+        return result if result else None
 
     def on_button_press(self, widget, event):
-        if self.current_notification_widget:
-            logging.debug("检测到点击通知外部，关闭当前通知")
-            self.dismiss_notification(self.current_notification_widget)
-        if not self.is_selection_done:
-            if event.button == 1:
-                self.is_dragging_selection = True
-                self.start_x_rel, self.start_y_rel = event.x, event.y
-                self.current_x_rel, self.current_y_rel = event.x, event.y
-                self.queue_draw()
+        if self.overlay_manager.dismiss_by_type(NotificationWidget):
+            logging.debug("检测到点击通知外部，已关闭相关通知")
+        if event.button == 1:
+            if not self.session.is_selection_done:
+                self.start_pos = (event.x, event.y)
+                self.current_pos = (event.x, event.y)
+                self.canvas.queue_draw()
                 return True
-            return False
-        else:
-            return self.controller.handle_button_press(event)
+            else:
+                self.resize_edge = self.get_cursor_edge(event.x, event.y)
+                if self.resize_edge:
+                    self.drag_start_pos = (event.x, event.y)
+                    self.drag_start_geometry = self.session.geometry.copy()
+                    return True
+                return False
+        return False
     # 逻辑px }
 
     def _trigger_wayland_layout_refresh(self, remaining_retries=0):
-        w, h = self.screen_rect.width, self.screen_rect.height
+        rect = self.session.screen_rect
+        w, h = rect.width, rect.height
         self.resize(w + 1, h + 1)
         def _restore_size():
             self.resize(w, h)
@@ -7479,194 +7914,240 @@ class CaptureOverlay(Gtk.Window):
             GLib.timeout_add(150, self._trigger_wayland_layout_refresh, remaining_retries - 1)
 
     def on_button_release(self, widget, event):
-        if not self.is_selection_done:
-            if event.button == 1 and self.is_dragging_selection:
-                self.is_dragging_selection = False
+        if not self.session.is_selection_done:
+            if event.button == 1 and self.start_pos is not None and self.current_pos is not None:
                 # 逻辑px
-                x1, y1 = self.start_x_rel, self.start_y_rel
-                x2, y2 = self.current_x_rel, self.current_y_rel
+                x1, y1 = self.start_pos
+                x2, y2 = self.current_pos
+                self.start_pos = None
+                self.current_pos = None
                 final_x = min(x1, x2)
                 final_y = min(y1, y2)
                 raw_w = abs(x1 - x2)
                 raw_h = abs(y1 - y2)
-                min_size = 2 * config.HANDLE_HEIGHT
+                min_size = config.MIN_SELECTION_SIZE
                 final_w = max(raw_w, min_size)
                 final_h = max(raw_h, min_size)
                 if raw_w < min_size or raw_h < min_size:
                     logging.info("选区太小，保持在选择阶段")
-                    self.queue_draw()
+                    self.canvas.queue_draw()
+                    self.update_layout()
                     return True
-                geometry = {'x': round(final_x), 'y': round(final_y), 'w': round(final_w), 'h': round(final_h)}
-                scale = self.scale
+                geometry = {'x': final_x, 'y': final_y, 'w': final_w, 'h': final_h}
+                scale = self.session.scale
                 buf_w, buf_h = int(geometry['w'] * scale), int(geometry['h'] * scale) # 缓冲区px
-                logging.info(f"选区完成 逻辑px: {geometry} (Scale={scale}) -> 缓冲区px: w={buf_w}, h={buf_h}")
-                self.is_selection_done = True
-                self.session.update_geometry(geometry)
-                Gdk.Display.get_default().get_default_seat().ungrab()
-                self.update_layout()
-                self.controller.update_info_panel()
-                if IS_WAYLAND:
-                    self._trigger_wayland_layout_refresh(remaining_retries=1)
-            if config.SHOW_PREVIEW_ON_START:
-                self.toggle_preview_panel()
-            else:
-                logging.debug("配置项 'show_preview_on_start' 为 false，启动时不创建预览窗口。")
+                logging.info(f"选区完成，逻辑px: { {k: round(v, 1) for k, v in geometry.items()} } (scale={scale:.3f}) -> 缓冲区px: w={buf_w}, h={buf_h}")
+                self.session.set_geometry(geometry)
+                self.session.set_selection_done(True)
+                if config.SHOW_PREVIEW_ON_START:
+                    self.toggle_preview_panel()
+                return True
             return False
         else:
-            return self.controller.handle_button_release(event)
-
-    @property
-    def left_panel_w(self):
-        if self.show_side_panel and self.side_panel_on_left:
-            return config.SIDE_PANEL_WIDTH
-        return 0
+            was_dragging = self.resize_edge is not None
+            self.resize_edge = None
+            self.drag_start_pos = None
+            self.drag_start_geometry = None
+            return was_dragging
 
     def update_layout(self):
-        """根据屏幕和选区位置，动态计算并应用窗口布局和几何属性"""
         # 逻辑px
-        if self.screen_rect:
-            screen_w = self.screen_rect.width
-            screen_h = self.screen_rect.height
+        rect = self.session.screen_rect
+        if rect:
+            screen_w = rect.width
+            screen_h = rect.height
         else:
             screen_w, screen_h = self.get_size()
-        if not self.is_selection_done:
+        if not self.session.is_selection_done:
             blocking_rects = []
-            if self.is_dragging_selection:
-                x1, y1 = self.start_x_rel, self.start_y_rel
-                x2, y2 = self.current_x_rel, self.current_y_rel
+            if self.start_pos is not None and self.current_pos is not None:
+                x1, y1 = self.start_pos
+                x2, y2 = self.current_pos
                 rect = (min(x1, x2), min(y1, y2), abs(x1 - x2), abs(y1 - y2))
                 blocking_rects.append(rect)
             self._update_instruction_panel_layout(screen_w, screen_h, blocking_rects)
             return
+        selection_h = self.session.geometry.get('h', 0)
+        border_area_x_rel = self.session.geometry.get('x', 0) - config.BORDER_WIDTH
+        border_area_y_rel = self.session.geometry.get('y', 0) - config.BORDER_WIDTH
+        border_area_width = self.session.geometry.get('w', 0) + 2 * config.BORDER_WIDTH
+        border_area_height = selection_h + 2 * config.BORDER_WIDTH
+        border_area_right_rel = border_area_x_rel + border_area_width
         side_panel_needed_w = config.SIDE_PANEL_WIDTH
         button_panel_needed_w = config.BUTTON_PANEL_WIDTH
-        should_show_side_panel_base = config.ENABLE_SIDE_PANEL
-        should_show_button_panel_base = config.ENABLE_BUTTONS
-        has_space_right_for_button_panel = (self.session.geometry['x'] + self.session.geometry['w'] + config.BORDER_WIDTH + button_panel_needed_w) <= screen_w
-        has_space_right_for_side_panel = (self.session.geometry['x'] + self.session.geometry['w'] + config.BORDER_WIDTH + side_panel_needed_w) <= screen_w
-        has_space_left_for_side_panel = (self.session.geometry['x'] - config.BORDER_WIDTH - side_panel_needed_w) >= 0
+        has_space_right_for_button_panel = (screen_w - border_area_right_rel) >= config.BUTTON_PANEL_WIDTH
+        has_space_right_for_side_panel = (screen_w - border_area_right_rel) >= config.SIDE_PANEL_WIDTH
+        has_space_left_for_side_panel = border_area_x_rel >= config.SIDE_PANEL_WIDTH
         self.show_side_panel = False
         self.show_button_panel = False
         self.side_panel_on_left = True
-        if should_show_side_panel_base and has_space_left_for_side_panel:
-            self.show_side_panel = True
-            self.side_panel_on_left = True
-            if should_show_button_panel_base and has_space_right_for_button_panel:
+        if config.ENABLE_SIDE_PANEL:
+            if has_space_left_for_side_panel:
+                self.show_side_panel = True
+            elif has_space_right_for_side_panel:
+                self.show_side_panel = True
+                self.side_panel_on_left = False
+        side_panel_occupies_right = self.show_side_panel and not self.side_panel_on_left
+        if config.ENABLE_BUTTONS and has_space_right_for_button_panel and not side_panel_occupies_right:
                 self.show_button_panel = True
-            else:
-                self.show_button_panel = False
-        elif should_show_side_panel_base and has_space_right_for_side_panel:
-            self.show_side_panel = True
-            self.side_panel_on_left = False
-            self.show_button_panel = False
-        elif should_show_button_panel_base and has_space_right_for_button_panel:
-            self.show_side_panel = False
-            self.show_button_panel = True
-        else:
-            self.show_side_panel = False
-            self.show_button_panel = False
-        left_total_w = 0
-        if self.show_side_panel and self.side_panel_on_left:
-            left_total_w = side_panel_needed_w
-        right_total_w = 0
-        if self.show_button_panel:
-            right_total_w = button_panel_needed_w
-        elif self.show_side_panel and not self.side_panel_on_left:
-            right_total_w = side_panel_needed_w
-        selection_x_rel = self.session.geometry.get('x', 0)
-        selection_y_rel = self.session.geometry.get('y', 0)
-        selection_w = self.session.geometry.get('w', 0)
-        selection_h = self.session.geometry.get('h', 0)
-        blocking_rects = []
-        blocking_rects.append((
-            selection_x_rel - config.BORDER_WIDTH,
-            selection_y_rel - config.BORDER_WIDTH,
-            selection_w + 2 * config.BORDER_WIDTH,
-            selection_h + 2 * config.BORDER_WIDTH
-        ))
+        blocking_rects = [(border_area_x_rel, border_area_y_rel, border_area_width, border_area_height)]
         # 更新子组件的可见性和位置
-        if self.show_side_panel:
-            self.side_panel.update_visibility_by_height(selection_h, self.controller.grid_mode_controller.is_active)
-            if self.side_panel_on_left:
-                panel_x_rel = selection_x_rel - left_total_w - config.BORDER_WIDTH
-            else:
-                panel_x_rel = selection_x_rel + selection_w + config.BORDER_WIDTH
-            panel_y_rel = selection_y_rel - config.BORDER_WIDTH
-            self.fixed_container.move(self.side_panel, panel_x_rel, panel_y_rel)
+        if self.show_side_panel and self.side_panel.update_visibility_by_height(selection_h):
             self.side_panel.show()
+            panel_x_rel = border_area_x_rel - config.SIDE_PANEL_WIDTH if self.side_panel_on_left else border_area_right_rel
+            self.overlay_manager.move_widget(self.side_panel, panel_x_rel, border_area_y_rel)
             _, nat_h = self.side_panel.get_preferred_height()
-            blocking_rects.append((panel_x_rel, panel_y_rel, config.SIDE_PANEL_WIDTH, nat_h))
+            blocking_rects.append((panel_x_rel, border_area_y_rel, config.SIDE_PANEL_WIDTH, nat_h))
         else:
             self.side_panel.hide()
-        is_button_panel_visible_vertically = self.button_panel.update_visibility_by_height(selection_h, self.controller.grid_mode_controller.is_active)
-        if self.show_button_panel and is_button_panel_visible_vertically:
-            panel_x_rel = selection_x_rel + selection_w + config.BORDER_WIDTH
-            panel_y_rel = selection_y_rel - config.BORDER_WIDTH
-            self.fixed_container.move(self.button_panel, panel_x_rel, panel_y_rel)
+        if self.show_button_panel and self.button_panel.update_visibility_by_height(selection_h, self.session.current_mode):
             self.button_panel.show()
+            self.overlay_manager.move_widget(self.button_panel, border_area_right_rel, border_area_y_rel)
             _, nat_h = self.button_panel.get_preferred_height()
-            blocking_rects.append((panel_x_rel, panel_y_rel, config.BUTTON_PANEL_WIDTH, nat_h))
+            blocking_rects.append((border_area_right_rel, border_area_y_rel, config.BUTTON_PANEL_WIDTH, nat_h))
         else:
             self.button_panel.hide()
         self._update_instruction_panel_layout(screen_w, screen_h, blocking_rects)
-        self._update_input_shape()
+        self.update_input_shape()
 
     def _update_instruction_panel_layout(self, screen_w, screen_h, blocking_rects):
         if not self.instruction_panel:
             return
-        if not self.user_wants_instruction_panel:
-            self.instruction_panel.hide()
-            return
-        if not self.is_calibration_done:
+        if not self.user_wants_instruction_panel or not self.coord_manager.is_calibration_done:
             self.instruction_panel.hide()
             return
         margin = 20
-        panel_w = self._instr_panel_natural_w
-        panel_h = self._instr_panel_natural_h
-        # 显示器坐标 -> 窗口坐标
-        valid_screen_w = screen_w - self.monitor_offset_x
-        valid_screen_h = screen_h - self.monitor_offset_y
+        self.instruction_panel.show()
+        _, nat_size = self.instruction_panel.get_preferred_size()
+        panel_w, panel_h = nat_size.width, nat_size.height
+        valid_screen_w, valid_screen_h = self.coord_manager.get_valid_screen_size()
         if valid_screen_h < panel_h + margin * 2 or valid_screen_w < panel_w + margin * 2:
-             self.instruction_panel.hide()
-             return
+            self.instruction_panel.hide()
+            return
         target_x = margin
         target_y = valid_screen_h - panel_h - margin
-        is_obstructed = False
         panel_rect = (target_x, target_y, panel_w, panel_h)
         def rects_intersect(r1, r2):
-            return not (r1[0] >= r2[0] + r2[2] or 
-                        r1[0] + r1[2] <= r2[0] or 
-                        r1[1] >= r2[1] + r2[3] or 
+            return not (r1[0] >= r2[0] + r2[2] or
+                        r1[0] + r1[2] <= r2[0] or
+                        r1[1] >= r2[1] + r2[3] or
                         r1[1] + r1[3] <= r2[1])
-        for r in blocking_rects:
-            if rects_intersect(panel_rect, r):
-                is_obstructed = True
-                break
+        is_obstructed = any(rects_intersect(panel_rect, r) for r in blocking_rects)
         should_be_visible = not is_obstructed
         current_visible = self.instruction_panel.get_visible()
         if current_visible != should_be_visible:
             if should_be_visible:
-                self.instruction_panel.show()
+                self.overlay_manager.show(self.instruction_panel, anchor=(target_x, target_y), layer=OverlayManager.LAYER_BASE)
             else:
                 self.instruction_panel.hide()
-                self.queue_draw_area(target_x, target_y, panel_w, panel_h)
+                self.canvas.queue_draw_area(target_x, target_y, panel_w, panel_h)
         if should_be_visible:
-            cur_x = self.fixed_container.child_get_property(self.instruction_panel, "x")
-            cur_y = self.fixed_container.child_get_property(self.instruction_panel, "y")
+            cur_x, cur_y = self.overlay_manager.get_widget_position(self.instruction_panel)
             if cur_x != target_x or cur_y != target_y:
-                self.fixed_container.move(self.instruction_panel, target_x, target_y)
+                self.overlay_manager.show(self.instruction_panel, anchor=(target_x, target_y), layer=OverlayManager.LAYER_BASE)
 
     def on_motion_notify(self, widget, event):
-        if not self.is_selection_done:
-            if self.is_dragging_selection:
-                self.current_x_rel, self.current_y_rel = event.x, event.y
+        if event.window != widget.get_window():
+            if self.get_window():
+                self.get_window().set_cursor(self.cursors.get('default'))
+            return False
+        if not self.session.is_selection_done:
+            if self.start_pos is not None:
+                self.current_pos = (event.x, event.y)
                 self.update_layout()
-                self.queue_draw()
+                self.canvas.queue_draw()
                 return True
             return False
         else:
-            if self.controller.is_dragging:
-                self.controller.handle_motion(event)
+            if self.resize_edge is not None:
+                if not self.drag_start_pos or not self.drag_start_geometry:
+                    return False
+                # 逻辑px
+                delta_x = event.x - self.drag_start_pos[0]
+                delta_y = event.y - self.drag_start_pos[1]
+                new_geo = self.drag_start_geometry.copy()
+                scale = self.session.scale
+                start_h = self.drag_start_geometry['h']
+                _, start_cap_y = self.coord_manager.map_point(
+                    self.drag_start_geometry['x'], self.drag_start_geometry['y'],
+                    source=CoordSys.WINDOW, target=self.frame_grabber.target_coords
+                )
+                # 逻辑px -> 缓冲区px
+                start_y_buf = math.ceil(start_cap_y * scale)
+                start_h_buf = int((start_cap_y + start_h) * scale) - start_y_buf
+                is_grid_mode = (self.session.current_mode == CaptureMode.GRID)
+                grid_unit_buf = self.session.grid_unit if is_grid_mode else 0 # 缓冲区px
+                is_grid_snap = grid_unit_buf > 0 and not self.session.grid_matching_enabled
+                is_dragging_top = 'top' in self.resize_edge
+                is_dragging_bottom = 'bottom' in self.resize_edge
+                is_dragging_left = 'left' in self.resize_edge
+                is_dragging_right = 'right' in self.resize_edge
+                min_h = grid_unit_buf / scale if is_grid_snap else config.MIN_SELECTION_SIZE # 缓冲区px -> 逻辑px
+                min_w = config.MIN_SELECTION_SIZE
+                if is_dragging_top:
+                    new_geo['y'] += delta_y
+                elif is_dragging_bottom:
+                    new_geo['h'] += delta_y
+                if not self.session.is_horizontally_locked:
+                    if is_dragging_left:
+                        new_geo['x'] += delta_x
+                    elif is_dragging_right:
+                        new_geo['w'] += delta_x
+                if new_geo['h'] < min_h:
+                    if is_dragging_top: new_geo['y'] -= (min_h - new_geo['h'])
+                    new_geo['h'] = min_h
+                if new_geo['w'] < min_w:
+                    if is_dragging_left: new_geo['x'] -= (min_w - new_geo['w'])
+                    new_geo['w'] = min_w
+                x_min, y_min = config.BORDER_WIDTH, config.BORDER_WIDTH
+                valid_w, valid_h = self.coord_manager.get_valid_screen_size()
+                x_max = valid_w - config.BORDER_WIDTH
+                y_max = valid_h - config.BORDER_WIDTH
+                if not self.session.is_horizontally_locked:
+                    if new_geo['x'] < x_min:
+                        if is_dragging_left: new_geo['w'] -= (x_min - new_geo['x'])
+                        new_geo['x'] = x_min
+                    if new_geo['x'] + new_geo['w'] > x_max:
+                        new_geo['w'] = x_max - new_geo['x']
+                    if new_geo['w'] < min_w:
+                        if is_dragging_left: new_geo['x'] -= (min_w - new_geo['w'])
+                        new_geo['w'] = min_w
+                if new_geo['y'] < y_min:
+                    if is_dragging_top: new_geo['h'] -= (y_min - new_geo['y'])
+                    new_geo['y'] = y_min
+                if new_geo['y'] + new_geo['h'] > y_max:
+                    new_geo['h'] = y_max - new_geo['y']
+                if new_geo['h'] < min_h:
+                    if is_dragging_top: new_geo['y'] -= (min_h - new_geo['h'])
+                    new_geo['h'] = min_h
+                if is_grid_snap:
+                    delta_h = new_geo['h'] - start_h
+                    delta_h_buf = round(delta_h * scale) # 逻辑px -> 缓冲区px
+                    units_changed = int(delta_h_buf / grid_unit_buf)
+                    target_h_buf = max(grid_unit_buf, start_h_buf + (units_changed * grid_unit_buf))
+                    if is_dragging_top:
+                        if (new_geo['h'] < start_h) and (abs(new_geo['y'] + new_geo['h'] - y_max) < 1e-5):
+                            _, cap_bottom = self.coord_manager.map_point(
+                                new_geo['x'], new_geo['y'] + new_geo['h'],
+                                source=CoordSys.WINDOW, target=self.frame_grabber.target_coords
+                            )
+                            y_buf = int(cap_bottom * scale) - target_h_buf # 逻辑px -> 缓冲区px
+                            snapped_h_logical = cap_bottom - (y_buf - 0.01) / scale # 缓冲区px -> 逻辑px
+                            new_geo['y'] = new_geo['y'] + new_geo['h'] - snapped_h_logical
+                            new_geo['h'] = snapped_h_logical
+                        else:
+                            _, new_cap_y = self.coord_manager.map_point(
+                                new_geo['x'], new_geo['y'],
+                                source=CoordSys.WINDOW, target=self.frame_grabber.target_coords
+                            )
+                            new_y_buf = math.ceil(new_cap_y * scale)
+                            snapped_h_logical = (new_y_buf + target_h_buf + 0.01) / scale - new_cap_y
+                            new_geo['h'] = snapped_h_logical
+                    elif is_dragging_bottom:
+                        snapped_h_logical = (start_y_buf + target_h_buf + 0.01) / scale - start_cap_y
+                        new_geo['h'] = snapped_h_logical
+                self.session.set_geometry(new_geo)
+                return True
             else:
                 edge = self.get_cursor_edge(event.x, event.y)
                 cursor_map = {
@@ -7679,92 +8160,138 @@ class CaptureOverlay(Gtk.Window):
                 cursor = self.cursors.get(cursor_name)
                 if self.get_window():
                     self.get_window().set_cursor(cursor)
+                return False
     # 窗口坐标 }
+
+class XlibScrollListener(threading.Thread):
+    """基于 XRecord 的滚动监听器"""
+    def __init__(self, overlay):
+        super().__init__(daemon=True)
+        self.overlay = overlay
+        self.local_dpy = display.Display()
+        self.record_dpy = display.Display()
+        self.ctx = None
+        self.scroll_accumulator = 0
+        self.lock = threading.Lock()
+        self.running = False
+
+    def get_scroll_delta(self, reset=True):
+        with self.lock:
+            val = self.scroll_accumulator
+            if reset:
+                self.scroll_accumulator = 0
+            return val
+
+    def _handler(self, reply):
+        if not self.running or reply.category != record.FromServer:
+            return
+        if reply.client_swapped or not len(reply.data) or reply.data[0] < 2:
+            return
+        data = reply.data
+        while len(data):
+            event, data = rq.EventField(None).parse_binary_value(data, self.record_dpy.display, None, None)
+            if event.type == X.ButtonPress:
+                should_record = True
+                if self.overlay:
+                    # 缓冲区px全局坐标
+                    root_x = getattr(event, 'root_x', None)
+                    root_y = getattr(event, 'root_y', None)
+                    scale = self.overlay.session.scale
+                    # 缓冲区px -> 逻辑px
+                    logic_x = root_x / scale
+                    logic_y = root_y / scale
+                    if self.overlay.is_point_in_ui(logic_x, logic_y):
+                        should_record = False
+                if should_record:
+                    with self.lock:
+                        if event.detail == 4:
+                            self.scroll_accumulator -= 1
+                        elif event.detail == 5:
+                            self.scroll_accumulator += 1
+
+    def run(self):
+        self.running = True
+        try:
+            self.ctx = self.record_dpy.record_create_context(
+                0, [record.AllClients],
+                [{
+                    'core_requests': (0, 0), 'core_replies': (0, 0),
+                    'ext_requests': (0, 0, 0, 0), 'ext_replies': (0, 0, 0, 0),
+                    'delivered_events': (0, 0),
+                    'device_events': (X.ButtonPressMask, X.ButtonReleaseMask),
+                    'errors': (0, 0), 'client_started': False, 'client_died': False,
+                }]
+            )
+            self.record_dpy.record_enable_context(self.ctx, self._handler)
+        except Exception as e:
+            logging.error(f"XRecord 监听器崩溃: {e}")
+        finally:
+            self._cleanup()
+
+    def stop(self):
+        self.running = False
+        try:
+            if self.ctx is not None and self.local_dpy is not None:
+                self.local_dpy.record_disable_context(self.ctx)
+                self.local_dpy.flush()
+        except Exception as e:
+            logging.debug(f"停止 XlibScrollListener 时异常: {e}")
+
+    def _cleanup(self):
+        try:
+            self.record_dpy.record_free_context(self.ctx)
+            self.local_dpy.close()
+            self.record_dpy.close()
+        except:
+            pass
 
 class XlibHotkeyInterceptor(threading.Thread):
     """使用 Xlib (XGrabKey) 在后台线程中拦截全局热键，并支持动态启用/禁用"""
-    def __init__(self, overlay, callbacks_map, keymap_tuples):
+    def __init__(self, hotkey_defs):
         super().__init__(daemon=True)
-        self.overlay = overlay
-        self.callbacks_map = callbacks_map
-        self.keymap_tuples = keymap_tuples
+        self.hotkey_defs = hotkey_defs
         self.running = False
         self.disp = None
         self.root = None
         self.lock = threading.Lock()
-        self.is_paused = False
-        self.in_dialog = False
-        self.monitor_mouse = False
         self.mouse_grabbed = False
+        self.mouse_click_callback = None
+        self.last_trigger_time = 0
         self.currently_grabbed = set()
-        self.debug_key_map = {}
-        self.normal_lookup = {}
-        self.dialog_lookup = {}
-        self.toggle_lookup = {}
-        for kc, mod, is_toggle, name in keymap_tuples:
-            key_id = (kc, mod)
-            if key_id not in self.debug_key_map:
-                 self.debug_key_map[key_id] = name
-            callback = self.callbacks_map.get(name)
-            if not callback:
-                continue
-            if is_toggle:
-                self.toggle_lookup[key_id] = callback
-            elif name in ('dialog_confirm', 'dialog_cancel'):
-                self.dialog_lookup[key_id] = callback
-            else:
-                self.normal_lookup[key_id] = callback
-        self.toggle_keys = [k for k in self.keymap_tuples if k[2]]
-        self.dialog_keys = [k for k in self.keymap_tuples if not k[2] and k[3] in ('dialog_confirm', 'dialog_cancel')]
-        self.normal_keys = [k for k in self.keymap_tuples if not k[2] and k[3] not in ('dialog_confirm', 'dialog_cancel')]
-        self.pending_mod_release = None
-
-    def enable_mouse_click_stop(self, enabled: bool):
-        with self.lock:
-            self.monitor_mouse = enabled
-            self._schedule_update()
-
-    def set_normal_keys_grabbed(self, grab_state: bool):
-        with self.lock:
-            self.is_paused = not grab_state
-            self._schedule_update()
-
-    def set_dialog_mode(self, active: bool):
-        with self.lock:
-            self.in_dialog = active
-            self._schedule_update()
+        self.key_registry = {}
+        self.active_keys = set()
+        self.mod_keycodes = set()
+        self.pending_mod_action = None
 
     def _schedule_update(self):
         if not self.running: return
         target_keys = []
-        target_keys.extend(self.toggle_keys)
-        if are_hotkeys_enabled and not self.is_paused:
-            if self.in_dialog:
-                target_keys.extend(self.dialog_keys)
-            else:
-                target_keys.extend(self.normal_keys)
+        for key_id, infos in self.key_registry.items():
+            for name, callback in infos:
+                if name in self.active_keys:
+                    target_keys.append(key_id)
+                    break
         threading.Thread(target=self._apply_grab_state, args=(target_keys,), daemon=True).start()
 
     def _apply_grab_state(self, target_key_tuples):
         with self.lock:
             if not self.disp or not self.root:
                 return
-            if self.monitor_mouse and not self.mouse_grabbed:
+            if self.mouse_click_callback and not self.mouse_grabbed:
                 try:
-                    self.root.grab_button(1, X.AnyModifier, 0, X.ButtonPressMask, 
-                                          X.GrabModeAsync, X.GrabModeAsync, X.NONE, X.NONE)
+                    self.root.grab_button(1, X.AnyModifier, 0, X.ButtonPressMask, X.GrabModeAsync, X.GrabModeAsync, X.NONE, X.NONE)
                     self.mouse_grabbed = True
-                    logging.debug("Xlib: 已抓取鼠标左键用于停止自动滚动")
+                    logging.debug("Xlib: 已抓取鼠标左键")
                 except Exception as e:
                     logging.warning(f"Xlib GrabButton 失败: {e}")
-            elif not self.monitor_mouse and self.mouse_grabbed:
+            elif not self.mouse_click_callback and self.mouse_grabbed:
                 try:
                     self.root.ungrab_button(1, X.AnyModifier)
                     self.mouse_grabbed = False
                     logging.debug("Xlib: 已释放鼠标左键抓取")
                 except Exception as e:
                     logging.warning(f"Xlib UngrabButton 失败: {e}")
-            target_set = set((k[0], k[1]) for k in target_key_tuples)
+            target_set = set(target_key_tuples)
             to_grab = target_set - self.currently_grabbed
             to_ungrab = self.currently_grabbed - target_set
             if not to_grab and not to_ungrab:
@@ -7800,27 +8327,64 @@ class XlibHotkeyInterceptor(threading.Thread):
             except Exception as e:
                 logging.warning(f"disp.flush() 失败: {e}")
 
+    def enable_mouse_click_monitor(self, enabled: bool, callback=None):
+        with self.lock:
+            self.mouse_click_callback = callback if enabled else None
+        self._schedule_update()
+
+    def set_active_keys(self, active_keys):
+        with self.lock:
+            self.active_keys = set(active_keys)
+        self._schedule_update()
+
+    def _rebuild_mappings(self):
+        if not self.disp: return
+        new_registry = {}
+        new_mod_keycodes = set()
+        for hotkey_def, name, callback in self.hotkey_defs:
+            x11_mask_strs, x11_keysym_strs = hotkey_def.to_x11()
+            base_mask = 0
+            for m_str in x11_mask_strs:
+                base_mask |= getattr(X, m_str, 0)
+            is_mod_only = hotkey_def.is_modifier_only()
+            processed_key_ids = set()
+            for keysym_str in x11_keysym_strs:
+                keysym = XK.string_to_keysym(keysym_str)
+                if not keysym:
+                    logging.warning(f"无法识别 keysym 字符串 '{keysym_str}'（动作: {name}）")
+                    continue
+                keycode = self.disp.keysym_to_keycode(keysym)
+                if not keycode:
+                    logging.warning(f"无法为 keysym '{keysym_str}' 获取物理 keycode（动作: {name}）")
+                    continue
+                key_id = (keycode, base_mask)
+                if key_id in processed_key_ids: continue
+                processed_key_ids.add(key_id)
+                if key_id not in new_registry:
+                    new_registry[key_id] = []
+                new_registry[key_id].append((name, callback))
+                if is_mod_only:
+                    new_mod_keycodes.add(keycode)
+        self.key_registry = new_registry
+        self.mod_keycodes = new_mod_keycodes
+
+    def update_config(self, hotkey_defs):
+        with self.lock:
+            self.hotkey_defs = hotkey_defs
+            self._rebuild_mappings()
+            self._schedule_update()
+
     def run(self):
         """线程主循环，监听 X events"""
         try:
             self.disp = display.Display()
             self.root = self.disp.screen().root
-            self.mod_keycodes = set()
-            for name in ['Shift_L', 'Shift_R', 'Control_L', 'Control_R', 
-                         'Alt_L', 'Alt_R', 'Super_L', 'Super_R', 'Meta_L', 'Meta_R']:
-                keysym = XK.string_to_keysym(name)
-                if keysym:
-                    kc = self.disp.keysym_to_keycode(keysym)
-                    if kc: self.mod_keycodes.add(kc)
+            with self.lock:
+                self._rebuild_mappings()
             self.running = True
         except Exception as e:
             logging.error(f"XlibHotkeyInterceptor 线程初始化 Display 失败: {e}")
-            GLib.idle_add(
-                send_desktop_notification,
-                "热键服务启动失败",
-                f"无法连接到 X Display (Xlib): {e}\n全局快捷键将不可用",
-                "dialog-error", "warning"
-            )
+            GLib.idle_add(send_notification, "热键服务启动失败", f"无法连接到 X Display: {e}\n全局快捷键将不可用", "warning", config.WARNING_SOUND)
             self.running = False
             return
         self._schedule_update()
@@ -7828,78 +8392,63 @@ class XlibHotkeyInterceptor(threading.Thread):
         while self.running:
             try:
                 event = self.disp.next_event()
-                if event.type == X.ButtonPress and self.running:
-                    if self.monitor_mouse and event.detail == 1:
-                        logging.debug("Xlib: 检测到鼠标左键点击，停止自动滚动")
-                        GLib.idle_add(self.overlay.controller.stop_auto_scroll, "用户点击鼠标左键停止")
-                        self.enable_mouse_click_stop(False)
-                if event.type == X.KeyPress and self.running:
+                if event.type == X.ButtonPress:
+                    if self.mouse_click_callback and event.detail == 1:
+                        logging.debug("Xlib: 检测到鼠标左键点击，执行回调")
+                        self.mouse_click_callback()
+                if event.type == X.KeyPress:
                     keycode = event.detail
+                    if self.pending_mod_action:
+                        waiting_keycode, _ = self.pending_mod_action
+                        if keycode != waiting_keycode:
+                            logging.debug("检测到组合键，取消待定的修饰键单键动作")
+                            self.pending_mod_action = None
                     clean_state = event.state & (X.ShiftMask | X.ControlMask | X.Mod1Mask | X.Mod4Mask)
                     key_id = (keycode, clean_state)
-                    key_name = self.debug_key_map.get(key_id, "UnknownKey")
-                    log_key_str = f"key='{key_name}' (kc={keycode})"
-                    if key_id in self.toggle_lookup:
-                         logging.debug(f"Xlib 拦截到切换键 ({log_key_str}, state={clean_state})")
-                         callback = self.toggle_lookup[key_id]
-                         if keycode in self.mod_keycodes:
-                             self.pending_mod_release = (keycode, callback)
-                             logging.debug("修饰键按下，等待松开...")
-                         else:
-                             if self.pending_mod_release:
-                                 self.pending_mod_release = None
-                             GLib.idle_add(lambda: (callback(), False)[1])
-                         continue
-                    if are_hotkeys_enabled:
-                        callback = None
-                        if self.in_dialog:
-                            if key_id in self.dialog_lookup:
-                                callback = self.dialog_lookup[key_id]
-                        else:
-                            if key_id in self.normal_lookup:
-                                callback = self.normal_lookup[key_id]
-                        if callback:
+                    infos = self.key_registry.get(key_id)
+                    if not infos: continue
+                    for key_name, callback in infos:
+                        if key_name in self.active_keys:
+                            log_key_str = f"key='{key_name}'（id={key_id}）"
                             if keycode in self.mod_keycodes:
-                                self.pending_mod_release = (keycode, callback)
+                                self.pending_mod_action = (keycode, callback)
                                 logging.debug(f"修饰键热键 {log_key_str} 按下，等待松开...")
                             else:
-                                if self.pending_mod_release:
-                                    logging.debug("检测到组合键，取消待定的修饰键单键动作")
-                                    self.pending_mod_release = None
-                                logging.debug(f"Xlib 拦截到热键 ({log_key_str}) 并执行回调")
-                                GLib.idle_add(lambda: (callback(), False)[1])
-                elif event.type == X.KeyRelease and self.running:
-                    if self.pending_mod_release:
-                        waiting_keycode, waiting_callback = self.pending_mod_release
+                                current_time = time.time()
+                                if current_time - self.last_trigger_time >= config.HOTKEY_DEBOUNCE_TIME:
+                                    logging.debug(f"Xlib 拦截到热键 {log_key_str} 并执行回调")
+                                    self.last_trigger_time = current_time
+                                    GLib.idle_add(lambda cb=callback: (cb(), False)[1])
+                            break
+                elif event.type == X.KeyRelease:
+                    if self.pending_mod_action:
+                        waiting_keycode, waiting_callback = self.pending_mod_action
                         if event.detail == waiting_keycode:
                             logging.debug("修饰键松开且未被组合使用，执行动作")
+                            self.last_trigger_time = time.time()
                             GLib.idle_add(lambda: (waiting_callback(), False)[1])
-                            self.pending_mod_release = None
+                            self.pending_mod_action = None
             except Exception as e:
                 if self.running:
                     logging.error(f"Xlib 事件循环错误: {e}")
                     time.sleep(0.1)
         logging.debug("Xlib 热键拦截线程正在停止...")
         with self.lock:
-            self._apply_grab_state([])
+            self.active_keys = set()
+        self._schedule_update()
         if self.disp:
             try:
                 self.disp.close()
             except Exception as e:
-                 logging.error(f"关闭 X Display 连接时出错: {e}")
+                logging.error(f"关闭 X Display 连接时出错: {e}")
         logging.debug("Xlib 热键拦截线程已停止")
 
     def stop(self):
-        """请求线程停止"""
         logging.debug("收到停止 Xlib 拦截线程的请求...")
         self.running = False
         if self.disp and self.root:
             try:
-                client_event = protocol.event.ClientMessage(
-                    window=self.root,
-                    client_type=self.disp.intern_atom("_STOP_THREAD"),
-                    data=(8, [0] * 20)
-                )
+                client_event = protocol.event.ClientMessage(window=self.root, client_type=self.disp.intern_atom("_STOP_THREAD"), data=(8, [0] * 20))
                 self.disp.send_event(self.root, client_event, event_mask=X.NoEventMask)
                 self.disp.flush()
                 logging.debug("已发送 ClientMessage 事件以唤醒 Xlib 事件循环")
@@ -7908,134 +8457,131 @@ class XlibHotkeyInterceptor(threading.Thread):
         else:
             logging.warning("无法发送唤醒事件，Display 尚未初始化或已关闭")
 
-class EvdevHotkeyListener(threading.Thread):
-    """在 Wayland/Console 环境下使用 evdev 直接读取输入设备实现全局热键"""
-    def __init__(self, overlay, config_obj, callback_map):
+class EvdevListener(threading.Thread):
+    """使用 evdev 直接读取输入设备实现全局热键和滚动监听"""
+    def __init__(self, overlay, hotkey_defs):
         super().__init__(daemon=True)
         self.overlay = overlay
-        self.config = config_obj
-        self.callback_map = callback_map
+        self.hotkey_defs = hotkey_defs
         self.running = False
         self.devices = []
-        self.key_map = {}
-        self.active_mods = set()
-        self.listening_active = True
-        self.in_dialog = False
-        self.mouse_click_stop_enabled = False
+        self._needs_refresh = False
+        self.key_registry = {}
+        self.active_keys = set()
+        self.active_mods = HotkeyModifiers.NONE
+        self.scroll_accumulator = 0
+        self.scroll_lock = threading.Lock()
+        self.mouse_click_callback = None
         self.last_trigger_time = 0
-        self.mod_codes = {
-            'shift': {e.KEY_LEFTSHIFT, e.KEY_RIGHTSHIFT},
-            'ctrl': {e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL},
-            'control': {e.KEY_LEFTCTRL, e.KEY_RIGHTCTRL},
-            'alt': {e.KEY_LEFTALT, e.KEY_RIGHTALT},
-            'super': {e.KEY_LEFTMETA, e.KEY_RIGHTMETA},
-            'win': {e.KEY_LEFTMETA, e.KEY_RIGHTMETA},
-            'meta': {e.KEY_LEFTMETA, e.KEY_RIGHTMETA},
-        }
-        self.code_to_mod_name = {}
-        for name, codes in self.mod_codes.items():
-            for code in codes:
-                self.code_to_mod_name[code] = name
+        self.code_to_mod_flag = {}
+        for evdev_code_str, mod_flag in HotkeyDefinition.EVDEV_CODE_TO_MODIFIER.items():
+            if hasattr(e, evdev_code_str):
+                self.code_to_mod_flag[getattr(e, evdev_code_str)] = mod_flag
+        self.mod_keycodes = set()
         self.pending_mod_action = None
-        self._parse_config()
+        self._rebuild_mappings()
 
-    def enable_mouse_click_stop(self, enabled: bool):
-        self.mouse_click_stop_enabled = enabled
-        logging.debug(f"Evdev: 鼠标点击停止功能已 {'启用' if enabled else '禁用'}")
+    def _sync_initial_modifiers(self):
+        self.active_mods = HotkeyModifiers.NONE
+        for dev in self.devices:
+            try:
+                active_codes = dev.active_keys()
+                for code in active_codes:
+                    mod_flag = self.code_to_mod_flag.get(code)
+                    if mod_flag is not None:
+                        self.active_mods |= mod_flag
+            except OSError:
+                pass
+        logging.debug(f"Evdev: 初始修饰键状态 {self.active_mods} 已同步")
 
-    def _parse_config(self):
-        """解析 Config 对象中的字符串到 evdev codes"""
-        logging.debug(f"Evdev 正在注册热键...")
-        for action_name, _ in self.callback_map:
-            hotkey_str = self.config.parser.get('Hotkeys', action_name, fallback='')
-            if not hotkey_str: continue
-            parts = [p.strip().lower().replace('<','').replace('>','') for p in hotkey_str.split('+')]
-            mods = set()
-            main_key = None
-            if len(parts) == 1 and parts[0] in self.mod_codes:
-                main_key = parts[0]
-                if main_key == 'control': main_key = 'ctrl'
-                if main_key == 'win' or main_key == 'meta': main_key = 'super'
-                mods.add(main_key)
-            else:
-                for part in parts:
-                    if part in self.mod_codes:
-                        if part == 'control': part = 'ctrl'
-                        if part == 'win' or part == 'meta': part = 'super'
-                        mods.add(part)
-                    else:
-                        main_key = part
-            if main_key:
-                key_codes = []
-                if main_key in self.mod_codes:
-                    key_codes.extend(self.mod_codes[main_key])
-                else:
-                    key_code = None
-                    candidate = f"KEY_{main_key.upper()}"
-                    if hasattr(e, candidate):
-                        key_code = getattr(e, candidate)
-                    if key_code is None:
-                        special_map = {
-                            'enter': e.KEY_ENTER, 'return': e.KEY_ENTER,
-                            'esc': e.KEY_ESC, 'escape': e.KEY_ESC,
-                            'minus': e.KEY_MINUS, 'equal': e.KEY_EQUAL,
-                            'backspace': e.KEY_BACKSPACE, 'space': e.KEY_SPACE,
-                            'left': e.KEY_LEFT, 'right': e.KEY_RIGHT, 'up': e.KEY_UP, 'down': e.KEY_DOWN,
-                            'pageup': e.KEY_PAGEUP, 'pagedown': e.KEY_PAGEDOWN
-                        }
-                        key_code = special_map.get(main_key)
-                    if key_code:
-                        key_codes.append(key_code)
-                if key_codes:
-                    for kc in key_codes:
-                        key_combo = (frozenset(mods), kc)
-                        if key_combo not in self.key_map:
-                            self.key_map[key_combo] = []
-                        self.key_map[key_combo].append(action_name)
-                else:
-                    logging.warning(f"Evdev 无法解析按键: {main_key} (完整串: {hotkey_str})")
+    def _rebuild_mappings(self):
+        new_registry = {}
+        new_mod_keycodes = set()
+        for hotkey_def, name, callback in self.hotkey_defs:
+            base_mask = hotkey_def.modifiers
+            evdev_code_strs = hotkey_def.to_evdev()
+            is_mod_only = hotkey_def.is_modifier_only()
+            processed_key_ids = set()
+            for code_str in evdev_code_strs:
+                if not hasattr(e, code_str):
+                    logging.warning(f"Evdev: 无法识别按键 {code_str}（动作: {name}）")
+                    continue
+                keycode = getattr(e, code_str)
+                key_id = (base_mask, keycode)
+                if key_id in processed_key_ids: continue
+                processed_key_ids.add(key_id)
+                if key_id not in new_registry:
+                    new_registry[key_id] = []
+                new_registry[key_id].append((name, callback))
+                if is_mod_only:
+                    new_mod_keycodes.add(keycode)
+        self.key_registry = new_registry
+        self.mod_keycodes = new_mod_keycodes
 
-    def set_normal_keys_grabbed(self, grab_state: bool):
-        if self.listening_active == grab_state:
-            return
-        self.listening_active = grab_state
-        logging.debug(f"Evdev 内部监听状态已设置为: {'活动' if grab_state else '暂停'}")
+    def update_config(self, hotkey_defs):
+        self.hotkey_defs = hotkey_defs
+        self.pending_mod_action = None
+        self._rebuild_mappings()
 
-    def set_dialog_mode(self, active: bool):
-        self.in_dialog = active
-        logging.debug(f"Evdev 内部对话框模式: {active}")
+    def enable_mouse_click_monitor(self, enabled: bool, callback=None):
+        self.mouse_click_callback = callback if enabled else None
+        logging.debug(f"Evdev: 鼠标点击监听已 {'启用' if enabled else '禁用'}")
+
+    def set_active_keys(self, active_keys):
+        self.active_keys = set(active_keys)
+
+    def get_scroll_delta(self, reset=True):
+        with self.scroll_lock:
+            val = self.scroll_accumulator
+            if reset:
+                self.scroll_accumulator = 0
+            return val
 
     def _find_input_devices(self):
         """查找所有具有键盘特性或鼠标左键的设备"""
-        devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
         valid_devices = []
-        for dev in devices:
+        for path in evdev.list_devices():
+            dev = evdev.InputDevice(path)
             caps = dev.capabilities()
+            is_valid = False
             if e.EV_KEY in caps:
                 keys = caps[e.EV_KEY]
-                if e.KEY_ENTER in keys or e.BTN_LEFT in keys:
-                    valid_devices.append(dev)
+                has_rel = e.EV_REL in caps and e.REL_WHEEL in caps[e.EV_REL]
+                if e.KEY_ENTER in keys or e.BTN_LEFT in keys or has_rel:
+                    is_valid = True
+            if is_valid:
+                valid_devices.append(dev)
+            else:
+                dev.close()
         return valid_devices
 
+    def refresh_devices(self):
+        self._needs_refresh = True
+
     def run(self):
-        if not EVDEV_AVAILABLE:
-            logging.error("缺少 evdev 库，无法启动 EvdevHotkeyListener")
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        if not EVDEV_AVAILABLE or not INPUT_AVAILABLE:
             return
         try:
             self.devices = self._find_input_devices()
             if not self.devices:
                 logging.warning("未检测到输入设备，Evdev 监听器无法工作")
-                GLib.idle_add(
-                    send_desktop_notification,
-                    "热键服务启动失败",
-                    "未检测到可用的输入设备，全局快捷键可能无法工作",
-                    "dialog-warning", "warning"
-                )
+                GLib.idle_add(send_notification, "热键服务启动失败", "未检测到可用的输入设备，全局快捷键可能无法工作", "warning", config.WARNING_SOUND)
                 return
             fds = {dev.fd: dev for dev in self.devices}
+            self._sync_initial_modifiers()
             self.running = True
             logging.debug(f"Evdev 监听器启动，监控 {len(self.devices)} 个设备")
             while self.running:
+                if self._needs_refresh:
+                    self._needs_refresh = False
+                    new_devs = self._find_input_devices()
+                    current_paths = {d.path for d in self.devices}
+                    for dev in new_devs:
+                        if dev.path not in current_paths:
+                            self.devices.append(dev)
+                            fds[dev.fd] = dev
+                            logging.debug(f"Evdev: 动态加入新设备 {dev.name} 监听 ({dev.path})")
                 r, w, x = select.select(fds, [], [], 0.5)
                 for fd in r:
                     dev = fds[fd]
@@ -8043,10 +8589,23 @@ class EvdevHotkeyListener(threading.Thread):
                         for event in dev.read():
                             if event.type == e.EV_KEY:
                                 self._process_key_event(event)
+                            elif event.type == e.EV_REL and event.code == e.REL_WHEEL:
+                                with self.scroll_lock:
+                                    should_record = True
+                                    try:
+                                        pos = self.overlay.controller.scroll_manager.get_pointer_position(target=CoordSys.GLOBAL)
+                                        if self.overlay.is_point_in_ui(pos[0], pos[1]):
+                                            should_record = False
+                                    except Exception:
+                                        pass
+                                    if should_record:
+                                        self.scroll_accumulator -= event.value
                     except OSError:
                         del fds[fd]
+                        if dev in self.devices:
+                            self.devices.remove(dev)
         except Exception as err:
-            logging.error(f"Evdev 监听循环发生错误: {e}")
+            logging.error(f"Evdev 监听循环发生错误: {err}")
         finally:
             for dev in self.devices:
                 try: dev.close()
@@ -8054,47 +8613,35 @@ class EvdevHotkeyListener(threading.Thread):
 
     def _process_key_event(self, event):
         if event.value == 1 or event.value == 2:
-            if event.code == e.BTN_LEFT and self.mouse_click_stop_enabled:
-                logging.debug("Evdev: 检测到鼠标左键点击，停止自动滚动")
-                GLib.idle_add(self.overlay.controller.stop_auto_scroll, "用户点击鼠标左键停止")
-                self.mouse_click_stop_enabled = False
+            if event.code == e.BTN_LEFT and self.mouse_click_callback:
+                logging.debug("Evdev: 检测到鼠标左键点击，执行回调")
+                self.mouse_click_callback()
                 return
-            is_modifier_key = event.code in self.code_to_mod_name
-            if event.code in self.code_to_mod_name:
-                mod_name = self.code_to_mod_name[event.code]
-                if mod_name in ['control', 'ctrl']: self.active_mods.add('ctrl')
-                if mod_name == 'shift': self.active_mods.add('shift')
-                if mod_name == 'alt': self.active_mods.add('alt')
-                if mod_name in ['super', 'win', 'meta']: self.active_mods.add('super')
-            if not is_modifier_key and self.pending_mod_action:
-                self.pending_mod_action = None
-            if self.listening_active:
-                current_trigger = (frozenset(self.active_mods), event.code)
-                current_time = time.time()
-                if current_time - self.last_trigger_time < 0.25:
-                    return
-                if current_trigger in self.key_map:
-                    possible_actions = self.key_map[current_trigger]
-                    for action_name in possible_actions:
-                        allow = False
-                        if action_name == 'toggle_hotkeys_enabled':
-                            allow = True
-                        elif are_hotkeys_enabled:
-                            if self.in_dialog:
-                                if action_name in ('dialog_confirm', 'dialog_cancel'): allow = True
-                            else:
-                                if action_name not in ('dialog_confirm', 'dialog_cancel'): allow = True
-                        if allow:
-                            for name, callback in setup_hotkey_listener.callback_list:
-                                if name == action_name:
-                                    if is_modifier_key:
-                                        self.pending_mod_action = (event.code, callback)
-                                        logging.debug(f"Evdev: 修饰键 {action_name} 按下，等待松开")
-                                    else:
-                                        logging.debug(f"Evdev 触发热键: {action_name}")
-                                        self.last_trigger_time = current_time
-                                        GLib.idle_add(lambda: (callback(), False)[1])
-                                    return
+            mod_flag = self.code_to_mod_flag.get(event.code)
+            is_modifier_key = mod_flag is not None
+            if self.pending_mod_action:
+                waiting_code, _ = self.pending_mod_action
+                if event.code != waiting_code:
+                    self.pending_mod_action = None
+            search_mods = self.active_mods
+            key_id = (search_mods, event.code)
+            infos = self.key_registry.get(key_id)
+            if infos:
+                for key_name, callback in infos:
+                    if key_name in self.active_keys:
+                        if event.code in self.mod_keycodes:
+                            if event.value == 1:
+                                self.pending_mod_action = (event.code, callback)
+                                logging.debug(f"Evdev: 修饰键 {key_name} 按下，等待松开")
+                        else:
+                            current_time = time.time()
+                            if current_time - self.last_trigger_time >= config.HOTKEY_DEBOUNCE_TIME:
+                                logging.debug(f"Evdev 触发热键: {key_name} (value={event.value})")
+                                self.last_trigger_time = current_time
+                                GLib.idle_add(lambda cb=callback: (cb(), False)[1])
+                        break
+            if is_modifier_key and event.value == 1:
+                self.active_mods |= mod_flag
         elif event.value == 0:
             if self.pending_mod_action:
                 waiting_code, waiting_cb = self.pending_mod_action
@@ -8103,292 +8650,238 @@ class EvdevHotkeyListener(threading.Thread):
                     self.last_trigger_time = time.time()
                     GLib.idle_add(lambda: (waiting_cb(), False)[1])
                 self.pending_mod_action = None
-            if event.code in self.code_to_mod_name:
-                mod_name = self.code_to_mod_name[event.code]
-                if mod_name in ['control', 'ctrl'] and 'ctrl' in self.active_mods: self.active_mods.remove('ctrl')
-                if mod_name == 'shift' and 'shift' in self.active_mods: self.active_mods.remove('shift')
-                if mod_name == 'alt' and 'alt' in self.active_mods: self.active_mods.remove('alt')
-                if mod_name in ['super', 'win', 'meta'] and 'super' in self.active_mods: self.active_mods.remove('super')
-    
+            mod_flag = self.code_to_mod_flag.get(event.code)
+            if mod_flag is not None:
+                self.active_mods &= ~mod_flag
+
     def stop(self):
         self.running = False
 
-def toggle_all_hotkeys():
-    """切换快捷键（包括全局和窗口焦点）的启用状态"""
-    global are_hotkeys_enabled
-    are_hotkeys_enabled = not are_hotkeys_enabled
-    state_str = "启用" if are_hotkeys_enabled else "禁用"
-    if hotkey_listener and hasattr(hotkey_listener, '_schedule_update'):
-        hotkey_listener._schedule_update()
-    title = "快捷键状态"
-    message = f"截图会话的快捷键当前已{state_str}"
-    GLib.idle_add(send_desktop_notification, title, message)
-    logging.debug(f"快捷键状态已切换为: {state_str}")
-
-def setup_hotkey_listener(overlay):
-    global hotkey_listener
-    def global_dialog_confirm():
-        if overlay.is_dialog_open and hasattr(overlay, '_current_dialog_setter') and overlay._current_dialog_setter:
-            logging.debug("全局热键触发: 确认退出")
-            GLib.idle_add(overlay._current_dialog_setter, Gtk.ResponseType.YES)
-            if hasattr(overlay, '_current_dialog_loop') and overlay._current_dialog_loop:
-                GLib.idle_add(overlay._current_dialog_loop.quit)
-
-    def global_dialog_cancel():
-        if overlay.is_dialog_open and hasattr(overlay, '_current_dialog_setter') and overlay._current_dialog_setter:
-            logging.debug("全局热键触发: 取消退出")
-            GLib.idle_add(overlay._current_dialog_setter, Gtk.ResponseType.NO)
-            if hasattr(overlay, '_current_dialog_loop') and overlay._current_dialog_loop:
-                GLib.idle_add(overlay._current_dialog_loop.quit)
-    hotkey_key_callback_list = [
-        ('capture', overlay.controller.take_capture),
-        ('finalize', overlay.controller.finalize_and_quit),
-        ('undo', overlay.controller.delete_last_capture),
-        ('cancel', overlay.controller.quit_and_cleanup),
-        ('grid_backward', lambda: overlay.controller.handle_movement_action('up', source='hotkey')),
-        ('grid_forward', lambda: overlay.controller.handle_movement_action('down', source='hotkey')),
-        ('auto_scroll_start', lambda: overlay.controller.start_auto_scroll(source='hotkey')),
-        ('auto_scroll_stop', lambda: overlay.controller.stop_auto_scroll()),
-        ('toggle_grid_mode', overlay.controller.grid_mode_controller.toggle),
-        ('configure_scroll_unit', overlay.controller.grid_mode_controller.start_calibration),
-        ('toggle_preview', overlay.toggle_preview_panel),
-        ('open_config_editor', overlay.toggle_config_panel),
-        ('toggle_instruction_panel', overlay.toggle_instruction_panel),
-        ('toggle_hotkeys_enabled', toggle_all_hotkeys),
-        ('preview_zoom_in', lambda: overlay.preview_panel._zoom_in() if overlay.preview_panel and overlay.preview_panel.get_visible() else None),
-        ('preview_zoom_out', lambda: overlay.preview_panel._zoom_out() if overlay.preview_panel and overlay.preview_panel.get_visible() else None),
-        ('dialog_confirm', global_dialog_confirm),
-        ('dialog_cancel', global_dialog_cancel),
-    ]
-    setup_hotkey_listener.callback_list = hotkey_key_callback_list
-    if IS_WAYLAND:
-        logging.info("检测到 Wayland 会话，尝试使用 Evdev 启动全局热键监听...")
-        if not EVDEV_AVAILABLE:
-            logging.error("未检测到 evdev 模块，Wayland 下无法使用全局快捷键。请安装 python-evdev")
-            return
-        try:
-            hotkey_listener = EvdevHotkeyListener(overlay, config, hotkey_key_callback_list)
-            hotkey_listener.start()
-        except Exception as e:
-            logging.error(f"启动 Evdev 监听器失败: {e}")
-            GLib.idle_add(
-                send_desktop_notification,
-                "热键服务启动失败",
-                f"无法启动 Evdev 监听: {e}\n全局快捷键将不可用",
-                "dialog-error", "warning"
-            )
-        return
-        
-    def gdk_mask_to_x_mask(gdk_mask):
-        x_mask = 0
-        if gdk_mask & Gdk.ModifierType.CONTROL_MASK: x_mask |= X.ControlMask
-        if gdk_mask & Gdk.ModifierType.SHIFT_MASK: x_mask |= X.ShiftMask
-        if gdk_mask & Gdk.ModifierType.MOD1_MASK: x_mask |= X.Mod1Mask
-        if gdk_mask & Gdk.ModifierType.SUPER_MASK: x_mask |= X.Mod4Mask
-        return x_mask
-
-    def get_keycode_from_keyval(keyval):
-            try:
-                gdk_disp = Gdk.Display.get_default()
-                keymap = Gdk.Keymap.get_for_display(gdk_disp)
-                found, keys = keymap.get_entries_for_keyval(keyval)
-                if found and keys and len(keys) > 0:
-                    keycode = keys[0].keycode
-                    return keycode
-                else:
-                    lower_keyval = Gdk.keyval_to_lower(keyval)
-                    if lower_keyval != keyval:
-                        found, keys = keymap.get_entries_for_keyval(lower_keyval)
-                        if found and keys and len(keys) > 0:
-                            return keys[0].keycode
-                logging.warning(f"Gdk.Keymap 无法为 keyval {keyval} (名称: {Gdk.keyval_name(keyval)}) 找到 keycode")
-                return 0
-            except Exception as e:
-                logging.error(f"通过 Gdk.Keymap 获取 keycode 失败 (keyval={keyval}): {e}")
-                try:
-                     tmp_disp = display.Display()
-                     keysym = XK.string_to_keysym(Gdk.keyval_name(keyval))
-                     keycode = tmp_disp.keysym_to_keycode(keysym) if keysym else 0
-                     tmp_disp.close()
-                     if keycode:
-                          logging.warning(f"GDK 获取 keycode 失败，回退到 Xlib 获取 keycode {keycode} for keyval {keyval}")
-                          return keycode
-                     else:
-                          logging.error(f"Xlib 也无法为 keyval {keyval} 获取 keycode")
-                          return 0
-                except Exception as ex:
-                     logging.error(f"Xlib 回退获取 keycode 时出错: {ex}")
-                     return 0
-
-    toggle_key_config_keys = ['toggle_hotkeys_enabled']
-    callbacks_map = dict(hotkey_key_callback_list)
-    keymap_tuples = []
-    def get_key_mode(name):
-        if name in toggle_key_config_keys: return 'toggle'
-        if name in ('dialog_confirm', 'dialog_cancel'): return 'dialog'
-        return 'normal'
-    registered_keys = {}
-    for key_name, callback in hotkey_key_callback_list:
-        hotkey_config_attr_name = f"HOTKEY_{key_name.upper()}"
-        hotkey_config = getattr(config, hotkey_config_attr_name, None)
-        if not hotkey_config or not hotkey_config.get('gtk_keys'):
-            logging.warning(f"跳过无效或未找到的热键配置: {key_name}")
-            continue
-        for keyval in hotkey_config['gtk_keys']:
-            keycode = get_keycode_from_keyval(keyval)
-            if keycode == 0:
-                logging.error(f"无法为 '{key_name}' (Keyval: {keyval}, Name: {Gdk.keyval_name(keyval)}) 找到 keycode，跳过此特定 keyval")
-                continue
-            x_mask = gdk_mask_to_x_mask(hotkey_config['gtk_mask'])
-            key_id = (keycode, x_mask)
-            is_toggle_key_flag = key_name in toggle_key_config_keys
-            mode = get_key_mode(key_name)
-            if key_id in registered_keys:
-                for existing_mode, existing_name in registered_keys[key_id]:
-                    conflict = False
-                    if mode == 'toggle' or existing_mode == 'toggle': conflict = True
-                    elif mode == existing_mode: conflict = True
-                    if conflict:
-                         logging.warning(f"热键冲突: {key_name} 与 {existing_name} 使用相同的键组合 (kc={keycode}, mask={x_mask}) 且模式冲突 ({mode} vs {existing_mode})")
-            if key_id not in registered_keys:
-                registered_keys[key_id] = []
-            registered_keys[key_id].append((mode, key_name))
-            keymap_tuples.append((keycode, x_mask, is_toggle_key_flag, key_name))
-    if not any(k[2] for k in keymap_tuples):
-         logging.warning("配置中未找到有效的切换键 (如 toggle_hotkeys_enabled)，热键启用/禁用功能可能无法通过键盘触发")
-    try:
-        hotkey_listener = XlibHotkeyInterceptor(overlay, callbacks_map, keymap_tuples)
-        hotkey_listener.start()
-    except Exception as e:
-        logging.error(f"启动 XlibHotkeyInterceptor 线程失败: {e}")
-        GLib.idle_add(
-            send_desktop_notification,
-            "热键服务启动失败",
-            f"无法启动 Xlib 监听: {e}\n全局快捷键将不可用",
-            "dialog-error", "warning"
-        )
-
-def cleanup_stale_temp_dirs(config):
-    """在启动时清理由已退出的旧进程留下的临时目录"""
-    try:
-        raw_template = config.parser.get('System', 'temp_directory_base', fallback='/tmp/scroll_stitch_{pid}')
-        template_path = Path(raw_template)
-        parent_dir = template_path.parent
-        name_template = template_path.name
-        if not parent_dir.is_dir() or '{pid}' not in name_template:
-            logging.warning("临时目录模板配置无效，跳过旧目录清理")
-            return
-        prefix, suffix = name_template.split('{pid}')
-        current_pid = os.getpid()
-        logging.debug(f"正在扫描 {parent_dir} 中匹配 '{prefix}*{suffix}' 的残留目录...")
-        for item in parent_dir.glob(f'{prefix}*{suffix}'):
-            if not item.is_dir():
-                continue
-            try:
-                pid_str = item.name[len(prefix):-len(suffix) if suffix else None]
-                pid = int(pid_str)
-            except (ValueError, IndexError):
-                continue
-            if pid == current_pid:
-                continue
-            # 检查旧PID对应的进程是否存在
-            if not Path(f"/proc/{pid}").exists():
-                logging.debug(f"发现残留目录 {item} (来自已退出的进程 {pid})，正在清理...")
-                try:
-                    shutil.rmtree(item)
-                except OSError as e:
-                    logging.error(f"清理目录 {item} 失败: {e}")
-            else:
-                logging.debug(f"发现来自另一正在运行的实例(PID:{pid})的目录 {item}，予以保留")
-    except Exception as e:
-        logging.error(f"执行残留目录清理时发生未知错误: {e}")
-
-def check_dependencies():
-    """在脚本启动时检查所有必需和可选的命令行依赖项"""
-    optional_deps = {
-        'paplay': '用于播放截图、撤销和完成时的音效',
-        'xdg-open': '用于在截图完成后从通知中打开文件或目录',
+class HotkeyManager:
+    CONTEXT_ACTION_WHITELIST = {
+        Context.BASE: {
+            'capture', 'finalize', 'undo', 'cancel',
+            'auto_scroll_start', 'auto_scroll_stop', 'grid_forward', 'grid_backward',
+            'configure_scroll_unit', 'toggle_grid_mode',
+            'toggle_config_panel', 'toggle_preview', 'toggle_instruction_panel',
+            'preview_zoom_in', 'preview_zoom_out'
+        },
+        Context.SELECTING: {
+            'cancel', 'toggle_instruction_panel'
+        },
+        Context.DIALOG: {
+            'dialog_confirm', 'dialog_cancel'
+        }
     }
-    if not IS_WAYLAND:
-        optional_deps['xinput'] = '用于 X11 下“隐形光标”滚动模式，提供无干扰的滚动体验'
-    missing_optional = []
-    for dep, reason in optional_deps.items():
-        if not shutil.which(dep):
-            missing_optional.append(f"可选依赖 '{dep}' 缺失: {reason}")
-    if missing_optional:
-        logging.warning("警告：检测到缺少可选依赖项，部分功能可能无法使用或表现异常")
-        GLib.idle_add(
-            send_desktop_notification,
-            "功能受限警告",
-            f"检测到可选依赖缺失，部分功能可能表现异常或不可用",
-            "dialog-information", "warning", 2
-        )
-        for item in missing_optional:
-            logging.warning(item)
+
+    def __init__(self, config_obj):
+        self.config = config_obj
+        self.listener = None
+        self.is_paused = False
+        self.are_hotkeys_enabled = True
+        self.overlay = None
+        self.active_keys = set()
+        self.registered_hotkeys = []
+        self._action_callbacks = []
+
+    @property
+    def is_listening(self):
+        return self.listener is not None and getattr(self.listener, 'running', False)
+
+    @property
+    def backend(self):
+        if self.listener:
+            if isinstance(self.listener, EvdevListener):
+                return 'evdev'
+            elif isinstance(self.listener, XlibHotkeyInterceptor):
+                return 'xlib'
+        return None
+
+    def setup(self, overlay):
+        self.overlay = overlay
+        self.overlay.session.connect('context-changed', lambda s: self.update_active_keys())
+        def dialog_confirm():
+            logging.debug("全局热键触发: 确认对话框")
+            GLib.idle_add(self.overlay.overlay_manager.dispatch_dialog_key, Gtk.ResponseType.OK)
+        def dialog_cancel():
+            logging.debug("全局热键触发: 取消对话框")
+            GLib.idle_add(self.overlay.overlay_manager.dispatch_dialog_key, Gtk.ResponseType.CANCEL)
+        self._action_callbacks = [
+            ('capture', self.overlay.controller.take_capture),
+            ('finalize', self.overlay.controller.finalize_and_quit),
+            ('undo', self.overlay.controller.delete_last_capture),
+            ('cancel', self.overlay.controller.quit_and_cleanup),
+            ('auto_scroll_start', lambda: self.overlay.controller.start_auto_scroll(source='hotkey')),
+            ('auto_scroll_stop', lambda: self.overlay.controller.stop_auto_scroll()),
+            ('grid_forward', lambda: self.overlay.controller.handle_movement_action('down', source='hotkey')),
+            ('grid_backward', lambda: self.overlay.controller.handle_movement_action('up', source='hotkey')),
+            ('configure_scroll_unit', self.overlay.controller.grid_mode_controller.start_calibration),
+            ('toggle_grid_mode', self.overlay.controller.grid_mode_controller.toggle),
+            ('toggle_config_panel', self.overlay.toggle_config_panel),
+            ('toggle_preview', self.overlay.toggle_preview_panel),
+            ('toggle_hotkeys_enabled', self.toggle_hotkeys),
+            ('toggle_instruction_panel', self.overlay.toggle_instruction_panel),
+            ('preview_zoom_in', lambda: self.overlay.preview_panel.adjust_zoom('in') if self.overlay.preview_panel and self.overlay.preview_panel.get_visible() else None),
+            ('preview_zoom_out', lambda: self.overlay.preview_panel.adjust_zoom('out') if self.overlay.preview_panel and self.overlay.preview_panel.get_visible() else None),
+            ('dialog_confirm', dialog_confirm),
+            ('dialog_cancel', dialog_cancel),
+        ]
+        self.rebuild_listener()
+
+    def rebuild_listener(self):
+        hotkey_defs = []
+        reported_conflicts = set()
+        for key_name, callback in self._action_callbacks:
+            hotkey_def = getattr(config, f"HOTKEY_{key_name.upper()}", None)
+            if not hotkey_def or not hotkey_def.is_valid():
+                logging.warning(f"跳过无效或未找到的热键定义: {key_name}")
+                continue
+            conflicts = self.get_hotkey_conflicts(key_name, hotkey_def)
+            for conflicting_key in conflicts:
+                conflict_pair = frozenset([key_name, conflicting_key])
+                if conflict_pair not in reported_conflicts:
+                    logging.warning(f"热键冲突: {key_name} 与 {conflicting_key} 使用相同的组合 {hotkey_def.to_string()} 且位于同一上下文")
+                    reported_conflicts.add(conflict_pair)
+            hotkey_defs.append((hotkey_def, key_name, callback))
+        self.registered_hotkeys = hotkey_defs
+        if self.listener and self.listener.is_alive():
+            self.listener.update_config(hotkey_defs)
+            logging.debug(f"{self.backend} 监听器已动态更新配置")
+            return
+        can_evdev_monitor_input = EVDEV_AVAILABLE and INPUT_AVAILABLE
+        if not can_evdev_monitor_input:
+            missing = []
+            if not EVDEV_AVAILABLE: missing.append("未安装 evdev 库")
+            if not INPUT_AVAILABLE: missing.append("缺少 /dev/input 读取权限")
+            evdev_mon_err_msg = "、".join(missing)
+        if IS_WAYLAND:
+            logging.info("尝试使用 Evdev 监听全局热键...")
+            if not can_evdev_monitor_input:
+                logging.error(f"{evdev_mon_err_msg}，Wayland 下无法使用全局快捷键")
+                return
+            try:
+                self.listener = EvdevListener(self.overlay, hotkey_defs)
+                self.listener.start()
+            except Exception as e:
+                logging.error(f"启动 Evdev 监听器失败: {e}")
+                GLib.idle_add(send_notification, "热键服务启动失败", f"无法启动 Evdev 监听: {e}\n全局快捷键将不可用", "warning", config.WARNING_SOUND)
+        else:
+            logging.info("尝试使用 Xlib 拦截全局热键...")
+            try:
+                self.listener = XlibHotkeyInterceptor(hotkey_defs)
+                self.listener.start()
+            except Exception as e:
+                logging.warning(f"Xlib 启动失败: {e}，尝试回退到 Evdev...")
+                fallback_success = False
+                if can_evdev_monitor_input:
+                    try:
+                        self.listener = EvdevListener(self.overlay, hotkey_defs)
+                        self.listener.start()
+                        logging.info("已成功回退到 Evdev 全局热键监听")
+                        fallback_success = True
+                    except Exception as e2:
+                        logging.error(f"Evdev 回退启动失败: {e2}")
+                else:
+                    logging.warning(f"{evdev_mon_err_msg}，无法进行回退")
+                if not fallback_success:
+                    logging.error("所有热键监听方式均启动失败")
+                    GLib.idle_add(send_notification, "热键服务启动失败", f"Xlib 错误，且无法回退到 Evdev\n全局快捷键将不可用", "warning", config.WARNING_SOUND)
+
+    def set_paused(self, paused: bool):
+        self.is_paused = paused
+        self.update_active_keys()
+
+    def toggle_hotkeys(self):
+        self.are_hotkeys_enabled = not self.are_hotkeys_enabled
+        self.update_active_keys()
+        state_str = "启用" if self.are_hotkeys_enabled else "禁用"
+        GLib.idle_add(send_notification, "快捷键状态", f"截图会话的快捷键当前已{state_str}")
+        logging.debug(f"快捷键状态已切换为: {state_str}")
+
+    def update_active_keys(self):
+        if self.is_paused:
+            self.active_keys = set()
+            if self.listener: self.listener.set_active_keys(set())
+        else:
+            active_keys = {'toggle_hotkeys_enabled'}
+            if self.are_hotkeys_enabled and self.overlay:
+                ctx = self.overlay.session.get_current_context()
+                if ctx in self.CONTEXT_ACTION_WHITELIST:
+                    active_keys.update(self.CONTEXT_ACTION_WHITELIST[ctx])
+            self.active_keys = active_keys
+            if self.listener:
+                self.listener.set_active_keys(active_keys)
+        if self.overlay and self.overlay.instruction_panel:
+            GLib.idle_add(self.overlay.instruction_panel.reload_keys)
+
+    def get_active_action(self, incoming_hotkey: HotkeyDefinition):
+        if not incoming_hotkey or not incoming_hotkey.is_valid():
+            return None
+        for hotkey_def, key_name, callback in self.registered_hotkeys:
+            if incoming_hotkey == hotkey_def and key_name in self.active_keys:
+                return callback
+        return None
+
+    def get_hotkey_conflicts(self, target_key: str, hotkey_def: HotkeyDefinition) -> list:
+        if not hotkey_def or not hotkey_def.is_valid():
+            return []
+        def get_ctxs(action):
+            if action == 'toggle_hotkeys_enabled': return set(Context)
+            return {c for c, acts in self.CONTEXT_ACTION_WHITELIST.items() if action in acts}
+        conflicts = []
+        for key in self.config.CONFIG_SCHEMA.get('Hotkeys', {}).keys():
+            if key == target_key: continue
+            existing_def = getattr(self.config, f"HOTKEY_{key.upper()}", None)
+            if existing_def and existing_def == hotkey_def:
+                if get_ctxs(target_key) & get_ctxs(key):
+                    conflicts.append(key)
+        return conflicts
+
+    def enable_mouse_click_monitor(self, enabled: bool, callback=None):
+        if self.listener and hasattr(self.listener, 'enable_mouse_click_monitor'):
+            self.listener.enable_mouse_click_monitor(enabled, callback)
+
+    def stop(self):
+        if self.listener and self.listener.is_alive():
+            self.listener.stop()
 
 def main():
     parser = argparse.ArgumentParser(description="一个自动/辅助式长截图工具")
-    parser.add_argument(
-        '-c', '--config',
-        type=Path,
-        help="指定一个自定义配置文件的路径"
-    )
+    parser.add_argument('-c', '--config', type=Path, help="指定一个自定义配置文件的路径")
     args = parser.parse_args()
     global config
-    config = Config(custom_path=args.config) 
-    global log_queue
-    log_queue = queue.Queue()
-    cleanup_stale_temp_dirs(config)
-    root_logger = logging.getLogger()
-    if root_logger.hasHandlers():
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-    root_logger.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler = logging.FileHandler(config.LOG_FILE, mode='w')
-    file_handler.setFormatter(formatter)
-    root_logger.addHandler(file_handler)
-    queue_handler = QueueHandler(log_queue)
-    queue_handler.setFormatter(formatter)
-    root_logger.addHandler(queue_handler)
-    stdout_logger = logging.getLogger('STDOUT')
-    sys.stdout = StreamToLoggerRedirector(stdout_logger, logging.INFO)
-    stderr_logger = logging.getLogger('STDERR')
-    sys.stderr = StreamToLoggerRedirector(stderr_logger, logging.ERROR)
-    logging.debug("标准输出和标准错误已被重定向到日志系统")
-    check_dependencies()
-    global WINDOW_MANAGER, FRAME_GRABBER
+    config = Config(custom_path=args.config)
+    log_queue = SystemInteraction.setup_logging(config)
+    SystemInteraction.cleanup_temp_dirs(config)
+    frame_grabber = None
     if IS_WAYLAND:
-        logging.info("检测到 Wayland 会话。正在检查 GtkLayerShell 支持...")
-        if not GTK_LAYER_SHELL_AVAILABLE:
-            logging.warning("未找到 'gtk-layer-shell' 库")
-        elif not GtkLayerShell.is_supported():
-            logging.warning("当前的 Wayland 合成器不支持 'wlr-layer-shell-unstable-v1' 协议")
-        WINDOW_MANAGER = WaylandWindowManager()
-        FRAME_GRABBER = WaylandFrameGrabber()
-        if not FRAME_GRABBER.prepare_sync():
+        logging.info("检测到 Wayland 会话，加载 Wayland 后端")
+        frame_grabber = WaylandFrameGrabber()
+        if not frame_grabber.prepare():
             logging.info("用户取消了屏幕录制授权，程序静默退出")
             sys.exit(0)
     else:
         logging.info("检测到 X11 会话，加载 X11 后端")
-        WINDOW_MANAGER = X11WindowManager()
-        FRAME_GRABBER = X11FrameGrabber()
         try:
-            X11 = ctypes.cdll.LoadLibrary('libX11.so.6')
-            X11.XInitThreads()
-            logging.debug("已调用 XInitThreads() 以确保多线程安全")
+            libx11 = SystemInteraction.load_library(['libX11.so.6', 'libX11.so'], 'X11')
+            if libx11:
+                libx11.XInitThreads()
+                logging.debug("已调用 XInitThreads() 以确保多线程安全")
         except Exception as e:
             logging.warning(f"无法调用 XInitThreads(): {e}。应用可能不稳定")
+        frame_grabber = X11FrameGrabber()
     display = Gdk.Display.get_default()
     if display is None:
         logging.error("无法获取 GDK Display，程序无法运行")
         sys.exit(1)
     logging.info("启动全屏覆盖窗口，等待用户选择区域...")
-    config.TMP_DIR.mkdir(parents=True, exist_ok=True)
-    overlay = CaptureOverlay(config, WINDOW_MANAGER, FRAME_GRABBER)
-    overlay.connect("destroy", Gtk.main_quit)
+    SystemInteraction.ensure_temp_directory(config.TEMP_DIRECTORY)
+    overlay = CaptureOverlay(config, frame_grabber, log_queue)
     overlay.show()
-    setup_hotkey_listener(overlay)
+    global hotkey_manager
+    hotkey_manager = HotkeyManager(config)
+    hotkey_manager.setup(overlay)
+    SystemInteraction.check_dependencies()
     Gtk.main()
 
 if __name__ == "__main__":

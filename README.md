@@ -4,18 +4,14 @@
 - [特性](#特性)
 - [功能概览](#功能概览)
     - [截图框界面](#截图框界面)
-    - [误差修正](#误差修正)
+    - [静态栏指示](#静态栏指示)
     - [预览面板](#预览面板)
-    - [截图模式](#截图模式)
-        - [自由模式](#自由模式)
-        - [自动模式](#自动模式)
-        - [整格模式](#整格模式)
-    - [核心操作](#核心操作)
     - [提示面板](#提示面板)
-    - [默认快捷键](#默认快捷键)
+    - [截图模式](#截图模式)
+    - [界面操作](#界面操作)
+    - [快捷键](#快捷键)
     - [配置介绍](#配置介绍)
 - [快速开始](#快速开始)
-- [限制](#限制)
 - [安装](#安装)
     - [python 依赖](#python-依赖)
     - [外部依赖](#外部依赖)
@@ -32,11 +28,11 @@
 
 X11 演示：
 
-[X11 拼长图演示](assets/X11拼长图演示.gif)
+![拼长图 X11 演示](assets/拼长图X11演示.gif)
 
 Wayland 演示：
 
-![Wayland 拼长图演示](assets/Wayland拼长图演示.gif)
+![拼长图 Wayland 演示](assets/拼长图Wayland演示.gif)
 
 ## 特性
 
@@ -44,112 +40,87 @@ Wayland 演示：
 - **截图与拼接**：具有自由、自动、整格三种截图模式，实现自动/辅助截图
 - **长图预览**：通过交互式预览面板可以实时预览拼接效果并编辑
 - **系统集成**：支持通知、操作音效、打开文件或目录以及自动复制到剪贴板
-- **高度自定义化**：从热键、界面、输出，到布局和交互，大多可以通过图形化界面配置
+- **高度自定义化**：从热键、输出、交互，到布局和外观，大多可以通过图形化界面或配置文件配置
 
 ## 功能概览
 
 以下为拼长图界面与行为默认配置的简单介绍，如果想更加详细的了解，请看[详细介绍](docs/详细介绍.md)文档。
 
+![界面总览](assets/界面总览.png)
+
 ### 截图框界面
 
-![截图框界面](assets/截图框界面.png)
+截图框的界面布局是动态的（[动态布局演示](assets/动态布局演示.gif)），以确保不影响截图区域选择。
 
-截图框的界面布局是动态的，以确保不影响截图区域选择。
+### 静态栏指示
 
-[动态布局演示](assets/动态布局演示.gif)
+如果启用误差修正，截图时程序会对比前后两张图片，检测边缘是否存在固定区域（如顶部栏、底部栏或侧边栏），并在截图框对应边框上用蓝色指示其范围（[静态栏指示演示](assets/静态栏指示演示.gif)）。
 
-### 误差修正
-
-[误差修正演示](assets/误差修正演示.gif)
-
-启用误差修正后，左右边框上面的蓝色部分高度即为误差范围，拼接时只需将下边框附近内容移动到蓝色区域内即可（不能移过头），范围内的误差会被修正
-
-整格模式下，误差基本只有几个逻辑像素，有些应用则没有误差，不建议对没有误差的应用启用误差修正。
-
-![整格模式滚动误差](assets/整格模式滚动误差.png)
+这些识别出的区域也有可能只是纯色背景或凑巧相同的界面内容（小范围内无影响），不支持固定区域过大（程序可能会误认为界面没有滚动）。
 
 ### 预览面板
 
-![预览面板](assets/预览面板.png)
+预览面板可以查看图片拼接效果，支持交互。能够调整面板大小，拖动/滚动、放大/缩小图片，并会实时更新图片，自动滚动到图片底部（如果没有手动干预）。
 
-预览面板可以查看图片拼接效果，支持交互。能够调整面板大小，拖动/滚动、放大/缩小图片，并会实时更新图片，自动滚动到图片底部（如果没有手动干预）
-
-此外，还可以进入选择模式，对长图进行删除（删除选区，用来修复内容重复）、恢复（恢复选区内的接缝，配合删除用来修复内容缺失）
-
-![预览面板选择模式演示](assets/预览面板选择模式演示.gif)
-
-### 截图模式
-
-#### 自由模式
-
-[自由模式演示](assets/自由模式演示.gif)
-
-自由模式是程序启用时默认的模式。
-
-自由模式下截图框边框可以自由拖动，截图框的高度也可以是任意的。
-
-#### 自动模式
-
-![自动模式演示](assets/自动模式演示.gif)
-
-开启自动模式后，程序会自动滚动并拼接，可以通过快捷键或按下鼠标左键停止。
-
-当程序检测到界面内容无太大变化时，会认为到达页面底部而自动停止。
-
-#### 整格模式
-
-![整格模式演示](assets/整格模式演示.gif)
-
-要对一个应用窗口启用整格模式，必须先配置它的滚动单位（在这个应用窗口中鼠标滚轮滚动一格时，屏幕滚动的距离的缓冲区像素数，可以使用快捷键开启自动配置）。
-
-在整格模式下，截图框的高度只能是滚动单位的整数倍，前进/后退的行为分别是先截图再前进一个截图区域的高度、撤销并后退一个截图区域的高度。
-
-Wayland 下在自动校准的时候需要手动输入该应用的标识符，而在启用整格模式前需要选择下方窗口的标识符（如果没有要先配置）。
-
-### 核心操作
-
-- **区域选择与调整**：截图框边框在没有截图的时侯可以自由拖动
-
-  [区域选择与调整演示](assets/区域选择与调整演示.gif)
-
-  在有截图的时候，截图框的宽度和左右边框的位置是锁死的
-- **按钮功能**
-    - **开始/停止**：开启/停止自动模式
-    - **截图**：截取截图区域内容（不包括边框）
-    - **撤销**：尝试删除截取的最后一张图片
-    - **完成**：将截图拼接成一张图片并保存（完成后会有通知）
-    - **取消**：退出程序（退出前会有确认对话框，如果没有截图则直接退出）
-    - **前进/后退**：整格模式下截图/撤销并将窗口滚动一个截图区域的高度
-    - **整格模式**：切换整格模式
-    - **预览面板**：激活/隐藏预览面板
-    - **配置窗口**：激活/隐藏配置窗口
-    - **热键开关**：启用/禁用快捷键
+此外，还可以进入选择模式（[预览面板选择模式演示](assets/预览面板选择模式演示.gif)），对长图进行删除（删除选区，用来修复内容重复）、恢复（恢复选区内的接缝，配合删除用来修复内容缺失）。
 
 ### 提示面板
 
-[提示面板](assets/提示面板.png)
+提示面板位于屏幕左下角，它上面会显示有关快捷键的说明和当前可用的快捷键，可以手动显示/隐藏它，如果显示的话会根据选框和面板的位置自动显/隐。
 
-提示面板位于屏幕左下角，它上面会显示有关快捷键的说明，可以手动显示/隐藏它，如果显示的话会根据选区和面板的位置自动显/隐
+### 截图模式
 
-### 默认快捷键
+- **自由模式**：
 
-默认快捷键可以在提示面板上看到，X11 下是独占了全局快捷键，而 Wayland 下只是监听全局快捷键（所以最好避免和别的窗口的快捷键冲突或者不要让别的窗口获得焦点）
+  自由模式是程序启用时默认的模式。  
+  自由模式下截图框边框可以自由拖动，截图框的高度也可以是任意的（[自由模式演示](assets/自由模式演示.gif)）。
+- **自动模式**：
+
+  开启自动模式后，程序会自动滚动并截图拼接，可以通过快捷键或按下鼠标左键停止（[自动模式演示](assets/自动模式演示.gif)）。  
+  当程序检测到界面内容无太大变化时，会认为到达页面底部而自动停止。
+- **整格模式**：
+
+  要对一个应用窗口启用整格模式，必须先配置它的滚动单位（在这个应用窗口中鼠标滚轮滚动一格时，屏幕内容滚动的距离的缓冲区像素数，可以使用快捷键开启自动配置）。
+
+  在整格模式下，如果不启用误差修正的话，截图框的高度只能是滚动单位的整数倍，前进/后退的行为分别是先截图再前进一个截图区域的高度、撤销并后退一个截图区域的高度；如果启用了，截图框的高度则没有这个限制，前进/后退也只会滚动大部分高度（[整格模式演示](assets/整格模式演示.gif)）。
+
+  Wayland 下在自动校准的时候需要手动输入该应用的标识符，而在启用整格模式前需要选择下方窗口的标识符（如果没有要先配置）。
+
+### 界面操作
+
+- **区域选择与调整**：截图框边框在没有截图的时侯可以自由拖动  
+  在有截图的时候，截图框的宽度和左右边框的位置是锁死的
+- **按钮功能**
+    - 开始/停止：开启/停止自动模式
+    - 截图：截取截图区域内容（不包括边框）
+    - 撤销：尝试删除截取的最后一张图片
+    - 完成：将截图拼接成一张图片并保存（完成后会有通知）
+    - 取消：退出程序（没有截图则直接退出否则会有退出对话框）
+    - 前进/后退：整格模式下截图/撤销并滚动窗口内容
+    - 整格模式：切换整格模式
+    - 预览面板：显示/隐藏预览面板
+    - 配置面板：显示/隐藏配置面板
+    - 热键开关：启用/禁用快捷键
+
+### 快捷键
+
+大部分快捷键可以在提示面板上看到，X11 下是独占了全局快捷键，而 Wayland 下只是监听全局快捷键（所以最好避免和别的窗口的快捷键冲突或者不要让别的窗口获得焦点）
 
 ### 配置介绍
 
-拼长图提供了图形化配置窗口，可以通过它查看与自定义程序行为和界面。当鼠标悬浮在配置窗口的大部分配置项上面都会有提示文字，如果想进一步了解，可以看[详细介绍/配置指南](docs/详细介绍.md#配置指南)一节。
+拼长图提供了图形化配置面板，可以通过它查看与自定义程序行为和界面，也可以直接编辑配置文件。当鼠标悬浮在配置面板的大部分配置项上面都会有提示文字，如果想进一步了解，可以看[详细介绍/配置指南](docs/详细介绍.md#配置指南)一节。
 
 ## 快速开始
 
-1. **启动程序**：在终端运行命令或通过快捷键启动拼长图 （启动方法见[运行程序](#运行程序)这一部分）
+1. **启动程序**：在终端运行命令或通过快捷键启动拼长图（启动方法见[运行程序](#运行程序)这一部分）
 2. **选择区域**：等待提示面板出现后，用鼠标选择初始截图区域（Wayland 下需要先选择当前显示器并同意录制）
 3. **调整区域**：按住并拖动边框调整截图框的初始大小和位置
 4. **滚动并截图**：
     - 自动模式：开始后按快捷键或点击鼠标左键停止
-    - 自由模式：需要记住上一张截图底部区域的位置
-        - 启用误差修正：将下边框附近的内容滚动到上边框蓝色区域内，范围内的误差会自动被修正
+    - 自由模式：需要大概记住上一张截图底部（或底部栏上方）区域的位置，手动滚动并截图
+        - 启用误差修正：滚动时，该位置附近的内容不要超过上边框（或顶部栏下方）以确保前后两张图片有重叠区域（并且不是太小）
         - 不启用误差修正：将截图区域的底部恰好滚动到顶部（至少不能滚过头），让图片在空白区域拼接
-    - 整格模式：通过前进/后退来滚动界面，默认的前进动作是截图后滚动，目标结束位置进入截图区域不代表截取到了这部分
+    - 整格模式：通过前进/后退来滚动界面，长按快捷键可以连续触发，默认的前进动作是截图后滚动，目标结束位置进入截图区域不代表截取到了这部分
 5. **预览并编辑**：在预览面板中预览拼接效果，删除底部多余内容，如果有内容重复则删除，如果有内容缺失则恢复后删除
 6. **完成**：按下回车，完成拼接后会有通知，可以点击按钮查看图片或打开目录（初次使用时程序会要求选择保存目录）
 
@@ -157,20 +128,19 @@ Wayland 下在自动校准的时候需要手动输入该应用的标识符，而
 
 ### `python` 依赖
 
-`python` 版本要求 3.7.4+
+`python` 版本要求 3.6.0+
 
 `python` 包版本要求：
 
 ```txt
-Pillow>=3.0.0
 python-xlib>=0.16 # 只有 X11 下需要安装
-evdev>=0.6.0
-numpy>=1.14.5
+evdev>=1.0.0
 opencv-python>=3.4.2.17
+numpy>=1.14.5
 pycairo>=1.13.1
-PyGObject>=3.31.2
+PyGObject>=3.31.1
 # 对于某些 Linux 发行版（如 Ubuntu 22.04, openSUSE Leap 15.6 等）可能需要限制 PyGObject 最高版本：
-# PyGObject>=3.31.2,<3.51
+# PyGObject>=3.31.1,<3.51
 ```
 
 安装 `python` 包可以使用 Python 虚拟环境安装，也可以使用系统包管理器安装。
@@ -238,17 +208,17 @@ pip install --upgrade pip
 
 最后在虚拟环境中安装 `python` 包：
 
-X11:
+- **X11**：
 
-```shell
-pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
-```
+  ```shell
+  pip install 'python-xlib>=0.16' 'evdev>=1.0.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.1'
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-pip install 'Pillow>=3.0.0' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
-```
+  ```shell
+  pip install 'evdev>=1.0.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.1'
+  ```
 
 安装完成后可以在终端输入
 
@@ -264,10 +234,10 @@ deactivate
 sudo apt install libgirepository1.0-dev
 ```
 
-并保证 `PyGObject>=3.31.2,<3.51`
+并保证 `PyGObject>=3.31.1,<3.51`
 
 ```shell
-pip install 'PyGObject>=3.31.2,<3.51'
+pip install 'PyGObject>=3.31.1,<3.51'
 ```
 
 ---
@@ -276,17 +246,17 @@ pip install 'PyGObject>=3.31.2,<3.51'
 
 安装命令：
 
-X11:
+- **X11**：
 
-```shell
-sudo apt install python3-pil python3-xlib python3-evdev python3-numpy python3-opencv python3-gi python3-gi-cairo libgtk-3-dev
-```
+  ```shell
+  sudo apt install python3-xlib python3-evdev python3-opencv python3-numpy python3-gi-cairo libgtk-3-dev python3-gi
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-sudo apt install python3-pil python3-evdev python3-numpy python3-opencv python3-gi python3-gi-cairo libgtk-3-dev gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-pipewire gir1.2-gtklayershell-0.1
-```
+  ```shell
+  sudo apt install python3-evdev python3-opencv python3-numpy python3-gi-cairo libgtk-3-dev python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-pipewire gir1.2-gtklayershell-0.1
+  ```
 
 </details>
 
@@ -306,13 +276,13 @@ sudo dnf install python3 python3-pip
 先安装系统依赖：
 
 ```shell
-sudo dnf install gcc python3-devel cairo-gobject-devel gtk3
+sudo dnf install gcc python3-devel libSM cairo-gobject-devel gtk3
 ```
 
 Wayland 需额外安装以下依赖：
 
 ```shell
-sudo dnf install gstreamer1  gstreamer1-plugins-base pipewire-gstreamer gtk-layer-shell
+sudo dnf install gstreamer1 gstreamer1-plugins-base pipewire-gstreamer gtk-layer-shell
 ```
 
 没有虚拟环境的话，需要创建一个（以 .venv 为例）：
@@ -335,17 +305,17 @@ pip install --upgrade pip
 
 最后在虚拟环境中安装 `python` 包：
 
-X11:
+- **X11**：
 
-```shell
-pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
-```
+  ```shell
+  pip install 'python-xlib>=0.16' 'evdev>=1.0.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.1'
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-pip install 'Pillow>=3.0.0' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
-```
+  ```shell
+  pip install 'evdev>=1.0.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.1'
+  ```
 
 安装完成后可以在终端输入
 
@@ -364,7 +334,7 @@ sudo dnf install gobject-introspection-devel
 然后安装 `PyGObject` 的命令改为：
 
 ```shell
-pip install 'PyGObject>=3.31.2,<3.51'
+pip install 'PyGObject>=3.31.1,<3.51'
 ```
 
 ---
@@ -373,17 +343,17 @@ pip install 'PyGObject>=3.31.2,<3.51'
 
 安装命令：
 
-X11:
+- **X11**：
 
-```shell
-sudo dnf install python3-xlib python3-pillow python3-evdev python3-numpy python3-opencv gtk3 python3-gobject
-```
+  ```shell
+  sudo dnf install python3-xlib python3-evdev python3-opencv python3-numpy gtk3 python3-gobject
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-sudo dnf install python3-pillow python3-evdev python3-numpy python3-opencv gtk3 python3-gobject gstreamer1  gstreamer1-plugins-base pipewire-gstreamer gtk-layer-shell
-```
+  ```shell
+  sudo dnf install python3-evdev python3-opencv python3-numpy gtk3 python3-gobject gstreamer1 gstreamer1-plugins-base pipewire-gstreamer gtk-layer-shell
+  ```
 
 </details>
 
@@ -409,7 +379,7 @@ sudo pacman -Syu --needed python python-pip
 安装系统依赖：
 
 ```shell
-sudo pacman -Syu --needed gcc pkgconf gtk3 gobject-introspection-runtime
+sudo pacman -Syu --needed gcc pkgconf libsm gtk3 gobject-introspection-runtime
 ```
 
 Wayland 需额外安装以下依赖：
@@ -438,17 +408,17 @@ pip install --upgrade pip
 
 最后在虚拟环境中安装 `python` 包：
 
-X11:
+- **X11**：
 
-```shell
-pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
-```
+  ```shell
+  pip install 'python-xlib>=0.16' 'evdev>=1.0.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.1'
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-pip install 'Pillow>=3.0.0' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
-```
+  ```shell
+  pip install 'evdev>=1.0.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.1'
+  ```
 
 安装完成后可以在终端输入
 
@@ -464,17 +434,17 @@ deactivate
 
 安装命令：
 
-X11:
+- **X11**：
 
-```shell
-sudo pacman -Syu --needed python-xlib python-pillow python-evdev python-numpy python-opencv python-gobject python-cairo gtk3
-```
+  ```shell
+  sudo pacman -Syu --needed python-xlib python-evdev python-opencv python-numpy python-cairo gtk3 python-gobject
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-sudo pacman -Syu --needed python-pillow python-evdev python-numpy python-opencv python-gobject python-cairo gtk3 gstreamer gst-plugins-base-libs gst-plugin-pipewire gtk-layer-shell
-```
+  ```shell
+  sudo pacman -Syu --needed python-evdev python-opencv python-numpy python-cairo gtk3 python-gobject gstreamer gst-plugins-base-libs gst-plugin-pipewire gtk-layer-shell
+  ```
 
 </details>
 
@@ -483,7 +453,7 @@ sudo pacman -Syu --needed python-pillow python-evdev python-numpy python-opencv 
 <details>
 <summary>Tumbleweed 安装命令</summary>
 
-（这里的安装命令用 `python313` 举例，如果需要安装别的 `python` 版本的则更换安装命令中的 `python` 版本号）  
+（这里的安装命令用 `python313` 举例，如果需要安装别的 `python` 版本的则更换安装命令中的 `python` 版本号）
 
 如果没有 `python` 的话，先安装 `python`：
 
@@ -496,12 +466,12 @@ sudo zypper install --no-recommends python313 python313-pip
 安装系统依赖：
 
 ```shell
-sudo zypper install --no-recommends python313-devel gcc cairo-devel typelib-1_0-Gtk-3_0 Mesa-libGL1
+sudo zypper install --no-recommends gcc python313-devel Mesa-libGL1 libSM6 cairo-devel typelib-1_0-Gtk-3_0
 ```
 
 > [!NOTE]
 > 
-> 在安装 `cairo-devel` 的过程中会因为依赖而安装系统默认的 `python` 版本，并且在 `/usr/bin/` 下创建 `python3` 的链接（如果原来有则会被覆盖）
+> 如果之前没有安装过 `python313-base` 的话，在安装 `cairo-devel` 和 `gobject-introspection-devel` 的过程中它会作为依赖而被安装，安装时会在 `/usr/bin/` 下创建 `python3` 的链接（如果原来有则会被覆盖）
 > 
 > 如果不想这样的话，可以删除这个链接：
 > 
@@ -541,17 +511,17 @@ python3.13 -m pip install --upgrade pip
 
 最后在虚拟环境中安装 `python` 包：
 
-X11:
+- **X11**：
 
-```shell
-python3.13 -m pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
-```
+  ```shell
+  python3.13 -m pip install 'python-xlib>=0.16' 'evdev>=1.0.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.1'
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-python3.13 -m pip install 'Pillow>=3.0.0' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2'
-```
+  ```shell
+  python3.13 -m pip install 'evdev>=1.0.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.1'
+  ```
 
 安装完成后可以在终端输入
 
@@ -570,26 +540,26 @@ sudo zypper install --no-recommends gobject-introspection-devel
 然后安装 `PyGObjcet` 的命令改为：
 
 ```shell
-python3.13 -m pip install 'PyGObject>=3.31.2,<3.51'
+python3.13 -m pip install 'PyGObject>=3.31.1,<3.51'
 ```
 
 ---
 
 **方法二：使用系统包管理器安装**
 
-`python31x-numpy1` 是指 `numpy` 版本 1.x，`python31x-numpy` 是指 `numpy` 版本 2.x（但是官方仓库里 `python313` 只有 `numpy`，没有 `numpy1`），可以根据 numpy 版本需要安装
+`python31x-numpy1` 是指 `numpy` 版本 1.x，`python31x-numpy` 是指 `numpy` 版本 2.x，可以根据 numpy 版本需要安装
 
-X11:
+- **X11**：
 
-```shell
-sudo zypper install --no-recommends python313-python-xlib python313-Pillow python313-evdev python313-numpy python313-opencv python313-gobject python313-pycairo typelib-1_0-Gtk-3_0
-```
+  ```shell
+  sudo zypper install --no-recommends python313-python-xlib python313-evdev python313-opencv python313-numpy python313-pycairo typelib-1_0-Gtk-3_0 python313-gobject
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-sudo zypper install --no-recommends python313-Pillow python313-evdev python313-numpy python313-opencv python313-gobject python313-pycairo typelib-1_0-Gtk-3_0 typelib-1_0-Gst-1_0 typelib-1_0-GstVideo-1_0 gstreamer-plugin-pipewire typelib-1_0-GtkLayerShell-0_1
-```
+  ```shell
+  sudo zypper install --no-recommends python313-evdev python313-opencv python313-numpy python313-pycairo typelib-1_0-Gtk-3_0 python313-gobject typelib-1_0-Gst-1_0 typelib-1_0-GstVideo-1_0 gstreamer-plugin-pipewire typelib-1_0-GtkLayerShell-0_1
+  ```
 
 </details>
 
@@ -598,7 +568,7 @@ sudo zypper install --no-recommends python313-Pillow python313-evdev python313-n
 
 **方法一：使用 Python 虚拟环境**
 
-（这里的安装命令用 `python312` 举例，如果需要安装别的 `python` 版本的则更换安装命令中的 `python` 版本号）  
+（这里的安装命令用 `python312` 举例，如果需要安装别的 `python` 版本的则更换安装命令中的 `python` 版本号）
 
 如果没有 `python` 的话，先安装 `python`：
 
@@ -606,21 +576,15 @@ sudo zypper install --no-recommends python313-Pillow python313-evdev python313-n
 sudo zypper install --no-recommends python312 python312-pip
 ```
 
-可选：
-
-```shell
-python3.12 -m pip install --upgrade pip
-```
-
 安装系统依赖：
 
 ```shell
-sudo zypper install --no-recommends python312-devel gcc cairo-devel typelib-1_0-Gtk-3_0 gobject-introspection-devel Mesa-libGL1
+sudo zypper install --no-recommends gcc python312-devel Mesa-libGL1 cairo-devel typelib-1_0-Gtk-3_0 gobject-introspection-devel
 ```
 
 > [!NOTE]
 > 
-> 在安装 `cairo-devel` 的过程中会因为依赖而安装系统默认的 `python` 版本（Leap 15.x 系列默认版本为 `python3.6`），并且在 `/usr/bin/` 下创建 `python3` 的链接（如果原来有则会被覆盖）
+> 如果之前没有安装过 `python3-base`（Leap 15.x 系列版本为 `python3.6`）的话，在安装 `cairo-devel` 和 `gobject-introspection-devel` 的过程中它会作为依赖而被安装，安装时会在 `/usr/bin/` 下创建 `python3` 的链接（如果原来有则会被覆盖）
 > 
 > 如果不想这样的话，可以删除这个链接：
 > 
@@ -660,17 +624,17 @@ python3.12 -m pip install --upgrade pip
 
 最后在虚拟环境中安装 `python` 包：
 
-X11:
+- **X11**：
 
-```shell
-python3.12 -m pip install 'Pillow>=3.0.0' 'python-xlib>=0.16' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
-```
+  ```shell
+  python3.12 -m pip install 'python-xlib>=0.16' 'evdev>=1.0.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.1,<3.51'
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-python3.12 -m pip install 'Pillow>=3.0.0' 'evdev>=0.6.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.2,<3.51'
-```
+  ```shell
+  python3.12 -m pip install 'evdev>=1.0.0' 'opencv-python>=3.4.2.17' 'numpy>=1.14.5' 'pycairo>=1.13.1' 'PyGObject>=3.31.1,<3.51'
+  ```
 
 安装完成后可以在终端输入
 
@@ -692,125 +656,113 @@ sudo zypper install --no-recommends python3 python3-pip
 
 Leap 15.4 以下 `python3-pycairo` 在仓库里叫 `python3-cairo`，但是不影响实际安装
 
-X11:
+- **X11**：
 
-```shell
-sudo zypper install --no-recommends python3-python-xlib python3-Pillow python3-evdev python3-numpy python3-opencv python3-gobject python3-pycairo typelib-1_0-Gtk-3_0
-```
+  ```shell
+  sudo zypper install --no-recommends python3-python-xlib python3-evdev python3-opencv python3-numpy python3-pycairo typelib-1_0-Gtk-3_0 python3-gobject
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-sudo zypper install --no-recommends python3-Pillow python3-evdev python3-numpy python3-opencv python3-gobject python3-pycairo typelib-1_0-Gtk-3_0 typelib-1_0-Gst-1_0 typelib-1_0-GstVideo-1_0 gstreamer-plugin-pipewire typelib-1_0-GtkLayerShell-0_1
-```
+  ```shell
+  sudo zypper install --no-recommends python3-evdev python3-opencv python3-numpy python3-pycairo typelib-1_0-Gtk-3_0 python3-gobject typelib-1_0-Gst-1_0 typelib-1_0-GstVideo-1_0 gstreamer-plugin-pipewire typelib-1_0-GtkLayerShell-0_1
+  ```
 
 </details>
 
 ### 外部依赖
 
-程序的外部依赖有 `xdg-open`、`sound-theme-freedesktop`、`paplay`、`xinput`
+#### 基础依赖
+
+X11：由于程序需要窗口透明度支持，如果使用的是不内置合成器的独立 WM，需要额外安装并运行外部合成器
+
+Wayland：录屏需要安装 `xdg-desktop-portal` 以及对应的 portal 后端（DE 通常自带，独立 WM 可能需要单独安装）
+
+#### 可选依赖安装
+
+程序的外部可选依赖有 `xdg-open`、`sound-theme-freedesktop`、`paplay`、`xinput`
 
 `xdg-open` 用来打开文件或目录，`sound-theme-freedesktop` 提供音效，`paplay` 播放音效，`xinput` 用来在 X11 下启用隐形光标模式，可以根据需要安装。
 
-Wayland 下还需要安装 `xdg-desktop-portal` 以及 对应的 portal 后端（DE 通常自带，独立 WM 可能需要单独安装）
-
-#### `Ubuntu/Debian` 外部依赖安装
-
 <details>
-<summary>安装命令</summary>
+<summary>Ubuntu/Debian 可选依赖安装</summary>
 
-X11:
+- **X11**：
 
-```shell
-sudo apt install xdg-utils sound-theme-freedesktop pulseaudio-utils xinput
-```
+  ```shell
+  sudo apt install xdg-utils sound-theme-freedesktop pulseaudio-utils xinput
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-sudo apt install xdg-utils sound-theme-freedesktop pulseaudio-utils
-```
+  ```shell
+  sudo apt install xdg-utils sound-theme-freedesktop pulseaudio-utils
+  ```
 
 </details>
 
-#### `Fedora` 外部依赖安装
-
 <details>
-<summary>安装命令</summary>
+<summary>Fedora 可选依赖安装</summary>
 
-X11:
+- **X11**：
 
-```shell
-sudo dnf install xdg-utils sound-theme-freedesktop pulseaudio-utils xinput
-```
+  ```shell
+  sudo dnf install xdg-utils sound-theme-freedesktop pulseaudio-utils xinput
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-sudo dnf install xdg-utils sound-theme-freedesktop pulseaudio-utils
-```
+  ```shell
+  sudo dnf install xdg-utils sound-theme-freedesktop pulseaudio-utils
+  ```
 
 </details>
 
-#### `Arch Linux` 外部依赖安装
-
 <details>
-<summary>安装命令</summary>
+<summary>Arch Linux 可选依赖安装</summary>
 
-X11:
+- **X11**：
 
-```shell
-sudo pacman -S --needed xdg-utils sound-theme-freedesktop pipewire-pulse xorg-xinput
-```
+  ```shell
+  sudo pacman -Syu --needed xdg-utils sound-theme-freedesktop libpulse xorg-xinput
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-sudo pacman -S --needed xdg-utils sound-theme-freedesktop pipewire-pulse
-```
+  ```shell
+  sudo pacman -Syu --needed xdg-utils sound-theme-freedesktop libpulse
+  ```
 
 </details>
 
-#### `openSUSE` 外部依赖安装
-
 <details>
-<summary>安装命令</summary>
+<summary>openSUSE 可选依赖安装</summary>
 
-X11:
+- **X11**：
 
-```shell
-sudo zypper install --no-recommends xdg-utils sound-theme-freedesktop pipewire-pulseaudio xinput
-```
+  ```shell
+  sudo zypper install --no-recommends xdg-utils sound-theme-freedesktop pulseaudio-utils xinput
+  ```
 
-Wayland:
+- **Wayland**：
 
-```shell
-sudo zypper install --no-recommends xdg-utils sound-theme-freedesktop pipewire-pulseaudio
-```
+  ```shell
+  sudo zypper install --no-recommends xdg-utils sound-theme-freedesktop pulseaudio-utils
+  ```
 
 </details>
 
 ### 权限要求
 
-程序在 Wayland 下滚动界面以及监听全局热键和在 X11 下使用隐形光标的功能需要 `sudo` 权限运行或者将用户加入 `input` 组（推荐）才能使用隐形光标功能，但是即使不提供 `sudo` 权限或未将用户加入 `input` 组，程序的核心功能仍然可用。
+程序在 Wayland 下监听全局热键需要 `/dev/input` 的读取权限，在 Wayland 下自动滚动界面和在 X11 下使用隐形光标的功能需要 `/dev/uinput` 的读写权限，但是即使未授予这些权限，程序的核心功能仍然可用。
 
-使用命令：
-
-```shell
-groups $USER
-```
-
-查看当前用户是否在 `input` 组里面  
-
-运行命令
+将当前用户加入到 `input` 组（如果已经在组内了，执行也没有影响）：
 
 ```shell
 sudo usermod -aG input $USER
 ```
 
-将当前用户加入到 `input` 组
-
-然后在文件 `/etc/udev/rules.d/99-scroll_stitch.rules` 中写入内容：  
+加入后再配置 `udev` 规则：
 
 ```shell
 echo 'KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"' | sudo tee /etc/udev/rules.d/99-scroll_stitch.rules
@@ -852,7 +804,7 @@ chmod +x scroll_stitch.sh
 ./scroll_stitch.sh -e ./.venv -c ~/.config/scroll_stitch/config.ini
 ```
 
-如果没有传入配置文件目录，则默认会先检查当前目录下是否有配置文件，其次是 `~/.config/scroll_stitch` 目录。在配置窗口中修改的是传入的配置文件。
+如果没有传入配置文件目录，则默认会先检查脚本所在目录下是否有配置文件，其次是 `~/.config/scroll_stitch` 目录。在配置面板中修改的是传入的配置文件。
 
 </details>
 
@@ -873,62 +825,56 @@ python3 scroll_stitch.py
 python3 scroll_stitch.py -c ~/.config/scroll_stitch/config.ini
 ```
 
-如果没有传入配置文件目录，则默认会先检查当前目录下是否有配置文件，其次是 `~/.config/scroll_stitch` 目录。在配置窗口中修改的是传入的配置文件。
+如果没有传入配置文件目录，则默认会先检查当前目录下是否有配置文件，其次是 `~/.config/scroll_stitch` 目录。在配置面板中修改的是传入的配置文件。
 
 </details>
 
 ### 设置快捷键
 
-图形化界面设置自定义快捷键（如果支持的话）的大体流程是：设置->键盘->快捷键->自定义快捷键->添加->键入命令->按下快捷键。  
+图形化界面设置自定义快捷键（如果支持的话）的大体流程是：设置->键盘->快捷键->自定义快捷键->添加->键入命令->按下快捷键。
 
 键入的命令就是上面启动程序的命令，`scroll_stitch.sh` 或者 `scroll_stitch.py` 最好写成绝对路径的形式。
 
 如果想用不同快捷键唤出不同配置的程序，可以在命令中传入不同配置文件的位置。
 
 不同发行版和桌面环境之间设置自定义快捷键的方式可能有差异，可以查看下面的部分文档进行配置  
+[https://help.gnome.org/gnome-help/keyboard-shortcuts-set](https://help.gnome.org/gnome-help/keyboard-shortcuts-set)  
 [https://wiki.debian.org/Keyboard/MultimediaKeys](https://wiki.debian.org/Keyboard/MultimediaKeys)  
 [https://www.suse.com/support/kb/doc/?id=000019319](https://www.suse.com/support/kb/doc/?id=000019319)  
+[https://doc.opensuse.org/documentation/tumbleweed/kde/#adding-custom-shortcuts](https://doc.opensuse.org/documentation/tumbleweed/kde/#adding-custom-shortcuts)  
 [https://docs.fedoraproject.org/zh_CN/quick-docs/gnome-setting-key-shortcut/](https://docs.fedoraproject.org/zh_CN/quick-docs/gnome-setting-key-shortcut/)
 
 ## 常见问题
 
 - 图像拼接可能会有部分内容重复，部分内容缺失
-- 预览窗口的图片有细黑线
- 
-   这是因为缩放导致的问题，实际图片并没有，不放心可以重置图片缩放比或完成后查看
-- Wayland 下选区结束后有时无法滚动或点击下方窗口
-
-   可以尝试取消后再重新启动程序
-- 如果预览窗口最大化之后无法滚动界面，可以尝试缩放一下预览后再滚动
 - Wayland 下窗口无法置顶
 
-   可以手动置顶或者避免点击其他窗口
-- 整格模式下截图时偶然截取到红框
+  可以手动置顶或者避免点击其他窗口
+- X11 下快捷键 `<super>` 加主键可能无效
 
-   删除截图然后将下边框稍微往下拉一点（不需要拉动一格）
-- X11 下快捷键 `<super>` 加主键，第一次按可能无效
-   
-   按住 `<super>` 键，连按两次才能生效，X11 下不建议将快捷键设置为 `<super>` 加主键的形式
-- X11 下使用隐形光标由于多指针的焦点问题，很多时候可能需要点击一下才能达到想要的效果
-- 如果图片非常大的话，点击通知后因为渲染时间过长导致等待超时了，可能不会打开图片，需要自行在保存目录中查看
+  可能需要按住 `<super>` 键，连按两次主键才生效，X11 下不建议将快捷键设置为 `<super>` 加主键的形式
+- X11 下使用隐形光标由于多指针的焦点问题，可能造成某些应用无法输入或者无法滚动界面（可能需要点击聚焦后才能滚动）
 - X11 隐形光标模式下不复用设备的情况下程序退出时整个系统界面会卡顿较久或者退出登录
-   
-   这是因为在此时程序退出时会删除另一个鼠标主设备，可以使用默认的移动用户光标
-- （以防万一）如果启用了隐形光标模式并且不复用，程序中途崩溃退出，屏幕右下角留下一个光标  
-   
-   注销后重新登录光标会自然消失，也可以终端输入 
 
-   ```shell
-   xinput list
-   ```
+  这是因为在此时程序退出时会删除另一个鼠标主设备，可以使用默认的移动用户光标
+- <details>
+  <summary>如果启用了隐形光标模式并且不复用，程序异常退出，屏幕右下角留下一个光标</summary>
 
-   记下 `scroll-stitch-cursor pointer` 的 `id`（行尾有 `master pointer` 字样），然后在终端输入 
+  注销后重新登录光标会自然消失，也可以终端输入
 
-   ```shell
-   sudo xinput remove-master
-   ```
+  ```shell
+  xinput list
+  ```
 
-   后面跟刚刚记下的 `id`，然后回车
+  记下 `scroll-stitch-cursor pointer` 的 `id`（行尾有 `master pointer` 字样），然后在终端输入
+
+  ```shell
+  xinput remove-master
+  ```
+
+  后面跟刚刚记下的 `id`，然后回车
+
+  </details>
 - 本项目为个人开发和维护，虽经测试，仍可能存在未发现的错误。
 
 ## 贡献

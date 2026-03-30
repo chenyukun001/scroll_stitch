@@ -1,9 +1,8 @@
-Pillow>=3.0.0
 python-xlib>=0.16 # 只有 X11 下需要安装
-evdev>=0.6.0
-numpy>=1.14.5
+evdev>=1.0.0
 opencv-python>=3.4.2.17
+numpy>=1.14.5
 pycairo>=1.13.1
-PyGObject>=3.31.2
+PyGObject>=3.31.1
 # 对于某些 Linux 发行版（如 Ubuntu 22.04, openSUSE Leap 15.6 等）可能需要限制 PyGObject 最高版本：
-# PyGObject>=3.31.2,<3.51
+# PyGObject>=3.31.1,<3.51
